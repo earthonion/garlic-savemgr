@@ -5,7 +5,7 @@ PS5 save decrypt/encrypt/browse with embedded web UI.
 ## Usage
 
 1. Send `garlic-savemgr.elf` to elfldr
-2. Open `http://<ps5-ip>:8082` in your browser
+2. Open `http://<ps5-ip>:8082` in your browser on your PC
 3. Drag and drop files into the browse tab to add/replace files
 
 > Click browse twice to make it ungrey out.
