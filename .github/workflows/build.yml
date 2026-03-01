@@ -11,8 +11,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone PS5 Payload SDK
-        run: git clone --depth 1 https://github.com/ps5-payload-dev/sdk.git /tmp/ps5-payload-sdk
+      - name: Download PS5 Payload SDK
+        run: |
+          gh release download --repo ps5-payload-dev/sdk --pattern 'ps5-payload-sdk.zip' --dir /tmp
+          unzip /tmp/ps5-payload-sdk.zip -d /tmp/ps5-payload-sdk
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Build
         run: make PS5_PAYLOAD_SDK=/tmp/ps5-payload-sdk
