@@ -1,7 +1,19 @@
-send to elfldr.elf
+# Garlic SaveMgr for PS5
 
-in your browser head to http://<ps5ip>:8082
+PS5 save decrypt/encrypt/browse with embedded web UI.
 
-drag and drop files into the browse tab to add/replace files
+## Usage
 
-click browse twice to make it ungrey out
+1. Send `garlic-savemgr.elf` to elfldr
+2. Open `http://<ps5-ip>:8082` in your browser
+3. Drag and drop files into the browse tab to add/replace files
+
+> Click browse twice to make it ungrey out.
+
+## Building
+
+Requires the [PS5 Payload SDK](https://github.com/ps5-payload-dev/sdk).
+
+```sh
+make PS5_PAYLOAD_SDK=/path/to/ps5-payload-sdk
+```
