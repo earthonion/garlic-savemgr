@@ -687,6 +687,81 @@ static void handle_request(int sock) {
         return;
     }
 
+    /* GET /api/download_file?name=<path> -> download single file from mounted save */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/download_file", 18) == 0) {
+        if (!g_mounted) { http_json(sock, "{\"error\":\"No save mounted\"}"); return; }
+        char fname[512] = {0};
+        char *np = strstr(url, "name=");
+        if (np) {
+            strncpy(fname, np + 5, sizeof(fname) - 1);
+            char *r = fname, *w = fname;
+            while (*r && *r != '&') {
+                if (*r == '%' && r[1] && r[2]) {
+                    char hex[3] = {r[1], r[2], 0};
+                    *w++ = (char)strtol(hex, NULL, 16);
+                    r += 3;
+                } else { *w++ = *r++; }
+            }
+            *w = 0;
+        }
+        if (!fname[0]) { http_json(sock, "{\"error\":\"Missing name\"}"); return; }
+        char filepath[MAX_PATH_LEN];
+        snprintf(filepath, sizeof(filepath), "%s/%s", g_mount_point, fname);
+        struct stat st;
+        if (stat(filepath, &st) < 0 || !S_ISREG(st.st_mode)) {
+            http_json(sock, "{\"error\":\"File not found\"}"); return;
+        }
+        int fd = open(filepath, O_RDONLY);
+        if (fd < 0) { http_json(sock, "{\"error\":\"Cannot read file\"}"); return; }
+        /* Use just the filename for download */
+        const char *basename = strrchr(fname, '/');
+        basename = basename ? basename + 1 : fname;
+        char hdr[1024];
+        int hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            "Content-Disposition: attachment; filename=\"%s\"\r\n"
+            "Content-Length: %lld\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n\r\n", basename, (long long)st.st_size);
+        send(sock, hdr, hlen, 0);
+        char *buf = g_iobuf;
+        ssize_t nr;
+        while ((nr = read(fd, buf, BUF_SIZE)) > 0)
+            send(sock, buf, nr, 0);
+        close(fd);
+        return;
+    }
+
+    /* GET /api/delete_file?name=<path> -> delete file from mounted save */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/delete_file", 16) == 0) {
+        if (!g_mounted) { http_json(sock, "{\"error\":\"No save mounted\"}"); return; }
+        char fname[512] = {0};
+        char *np = strstr(url, "name=");
+        if (np) {
+            strncpy(fname, np + 5, sizeof(fname) - 1);
+            char *r = fname, *w = fname;
+            while (*r && *r != '&') {
+                if (*r == '%' && r[1] && r[2]) {
+                    char hex[3] = {r[1], r[2], 0};
+                    *w++ = (char)strtol(hex, NULL, 16);
+                    r += 3;
+                } else { *w++ = *r++; }
+            }
+            *w = 0;
+        }
+        if (!fname[0]) { http_json(sock, "{\"error\":\"Missing name\"}"); return; }
+        char filepath[MAX_PATH_LEN];
+        snprintf(filepath, sizeof(filepath), "%s/%s", g_mount_point, fname);
+        if (unlink(filepath) < 0) {
+            http_json(sock, "{\"error\":\"Delete failed\"}"); return;
+        }
+        sync();
+        printf("[GarlicMgr] Deleted %s\n", fname);
+        http_json(sock, "{\"ok\":true}");
+        return;
+    }
+
     /* GET /api/files → file listing of mounted save */
     if (strcmp(method, "GET") == 0 && strcmp(url, "/api/files") == 0) {
         if (!g_mounted) { http_json(sock, "{\"files\":[]}"); return; }
@@ -1390,6 +1465,86 @@ static void handle_request(int sock) {
         return;
     }
 
+    /* GET /api/create_pfs?size=<bytes> -> create fresh PFS image, mount it */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/create_pfs", 15) == 0) {
+        if (g_mounted) unmount_save();
+        kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
+
+        /* Parse optional size (default 256MB) */
+        uint64_t img_size = 256 * 1024 * 1024;
+        char *sp = strstr(url, "size=");
+        if (sp) {
+            uint64_t req_size = strtoull(sp + 5, NULL, 10);
+            if (req_size > 0) {
+                /* Add 25% overhead + 4MB, min 32MB */
+                img_size = req_size + (req_size / 4) + (4 * 1024 * 1024);
+                if (img_size < 32 * 1024 * 1024)
+                    img_size = 32 * 1024 * 1024;
+            }
+        }
+        img_size = ((img_size + 32767) / 32768) * 32768;
+
+        mkdir("/data/save_files", 0777);
+        const char *tmp = "/data/save_files/_tmp_enc";
+        unlink(tmp);
+
+        int imgfd = open(tmp, O_CREAT | O_TRUNC | O_RDWR, 0777);
+        if (imgfd < 0) {
+            http_json(sock, "{\"error\":\"Cannot create temp file\"}"); return;
+        }
+        int ret = sceFsUfsAllocateSaveData(imgfd, img_size, 0, 0);
+        if (ret < 0) {
+            printf("[GarlicMgr] UfsAllocate failed (0x%x), using ftruncate\n", ret);
+            if (ftruncate(imgfd, img_size) < 0) {
+                close(imgfd); unlink(tmp);
+                http_json(sock, "{\"error\":\"Cannot allocate image\"}"); return;
+            }
+        }
+        close(imgfd);
+        printf("[GarlicMgr] create_pfs: image %llu bytes\n", (unsigned long long)img_size);
+
+        CreateOpt copt;
+        memset(&copt, 0, sizeof(copt));
+        sceFsInitCreatePfsSaveDataOpt(&copt);
+        copt.flags[1] = 0x02;
+        uint8_t ckey[0x20] = {0};
+        if (!g_pprCreate) {
+            unlink(tmp);
+            http_json(sock, "{\"error\":\"PprCreate not available\"}"); return;
+        }
+        ret = g_pprCreate(&copt, tmp, 0, img_size, ckey);
+        if (ret < 0) {
+            unlink(tmp);
+            char json[128];
+            snprintf(json, sizeof(json), "{\"error\":\"Format PFS failed: 0x%x\"}", ret);
+            http_json(sock, json); return;
+        }
+        printf("[GarlicMgr] create_pfs: formatted OK\n");
+
+        snprintf(g_mount_point, sizeof(g_mount_point), "/data/mount_sd");
+        mkdir(g_mount_point, 0777);
+        MountOpt emopt;
+        memset(&emopt, 0, sizeof(emopt));
+        sceFsInitMountSaveDataOpt(&emopt);
+        emopt.budgetid = "system";
+        signal(SIGPIPE, SIG_DFL);
+        ret = sceFsMountSaveData(&emopt, tmp, g_mount_point, ckey);
+        signal(SIGPIPE, SIG_IGN);
+        if (ret < 0) {
+            unlink(tmp);
+            char json[128];
+            snprintf(json, sizeof(json), "{\"error\":\"Mount failed: 0x%x\"}", ret);
+            http_json(sock, json); return;
+        }
+        snprintf(g_mounted_path, sizeof(g_mounted_path), "%s", tmp);
+        g_local_copy[0] = 0;
+        g_mounted = 1;
+        printf("[GarlicMgr] create_pfs: mounted at %s\n", g_mount_point);
+
+        http_json(sock, "{\"ok\":true}");
+        return;
+    }
+
     /* GET /api/mount_copy?idx=N -> copy save, mount, clear contents */
     if (strcmp(method, "GET") == 0 && strncmp(url, "/api/mount_copy", 15) == 0) {
         if (g_mounted) unmount_save();
@@ -1488,14 +1643,29 @@ static void handle_request(int sock) {
             unlink(tmp_path);
             http_json(sock, "{\"error\":\"Cannot read file\"}"); return;
         }
-        char hdr[512];
+        char dlname[512] = "new_save";
+        char *np = strstr(url, "name=");
+        if (np) {
+            strncpy(dlname, np + 5, sizeof(dlname) - 1);
+            dlname[sizeof(dlname) - 1] = 0;
+            char *r = dlname, *w = dlname;
+            while (*r && *r != '&') {
+                if (*r == '%' && r[1] && r[2]) {
+                    char hex[3] = {r[1], r[2], 0};
+                    *w++ = (char)strtol(hex, NULL, 16);
+                    r += 3;
+                } else { *w++ = *r++; }
+            }
+            *w = 0;
+        }
+        char hdr[1024];
         int hlen = snprintf(hdr, sizeof(hdr),
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/octet-stream\r\n"
-            "Content-Disposition: attachment; filename=\"new_save\"\r\n"
+            "Content-Disposition: attachment; filename=\"%s\"\r\n"
             "Content-Length: %lld\r\n"
             "Access-Control-Allow-Origin: *\r\n"
-            "Connection: close\r\n\r\n", (long long)st.st_size);
+            "Connection: close\r\n\r\n", dlname, (long long)st.st_size);
         send(sock, hdr, hlen, 0);
         char *buf = g_iobuf;
         ssize_t nr;

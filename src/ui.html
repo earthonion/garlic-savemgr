@@ -213,6 +213,19 @@
     .modal .mbtn-s { background: var(--bd); color: var(--tx) }
     .modal .mbtn-s:hover { background: var(--dm) }
 
+    /* ── Context menu ────────────────────────────────── */
+    .ctx-menu {
+      position: fixed; background: var(--s1); border: 1px solid var(--bd);
+      border-radius: 8px; padding: 4px 0; min-width: 140px;
+      box-shadow: 0 4px 16px rgba(0,0,0,.5); z-index: 200;
+    }
+    .ctx-menu div {
+      padding: 7px 14px; font-size: 12px; cursor: pointer;
+      transition: background .1s;
+    }
+    .ctx-menu div:hover { background: rgba(255,255,255,.05) }
+    .ctx-menu .ctx-del { color: var(--er) }
+
     /* ── Progress bar ────────────────────────────────── */
     .prog {
       width: 100%; height: 4px; background: var(--bd);
@@ -338,6 +351,74 @@ function setupDZ(id, fn) {
   };
 }
 
+/* ── Folder drag & drop zone setup ────────────────── */
+function setupFolderDZ(id, fn) {
+  const el = $(id);
+  if (!el) return;
+  el.ondragover = e => { e.preventDefault(); el.classList.add('over') };
+  el.ondragleave = e => { e.preventDefault(); el.classList.remove('over') };
+  el.ondrop = async e => {
+    e.preventDefault(); el.classList.remove('over');
+    const items = e.dataTransfer.items;
+    if (!items || !items.length) return;
+    const files = [];
+    const entries = [];
+    for (let i = 0; i < items.length; i++) {
+      const entry = items[i].webkitGetAsEntry ? items[i].webkitGetAsEntry() : null;
+      if (entry) entries.push(entry);
+    }
+    if (entries.length && entries[0].isDirectory) {
+      const all = await readEntryRecursive(entries[0], '');
+      if (all.length) fn(all, entries[0].name);
+    } else if (e.dataTransfer.files.length) {
+      fn(Array.from(e.dataTransfer.files));
+    }
+  };
+  const b = el.querySelector('.bbtn');
+  if (b) b.onclick = e => {
+    e.stopPropagation();
+    const i = document.createElement('input');
+    i.type = 'file'; i.webkitdirectory = true;
+    i.onchange = () => {
+      if (i.files.length) {
+        const prefix = i.files[0].webkitRelativePath.split('/')[0];
+        fn(Array.from(i.files), prefix);
+      }
+    };
+    i.click();
+  };
+}
+
+/* ── Recursively read folder entries ──────────────── */
+function readEntryRecursive(entry, basePath) {
+  return new Promise(resolve => {
+    if (entry.isFile) {
+      entry.file(f => {
+        f._path = basePath + f.name;
+        resolve([f]);
+      });
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      const all = [];
+      const readBatch = () => {
+        reader.readEntries(entries => {
+          if (!entries.length) {
+            Promise.all(all).then(arrs => resolve(arrs.flat()));
+            return;
+          }
+          for (const e of entries) {
+            all.push(readEntryRecursive(e, basePath + entry.name + '/'));
+          }
+          readBatch();
+        });
+      };
+      readBatch();
+    } else {
+      resolve([]);
+    }
+  });
+}
+
 /* ── Tab switching ─────────────────────────────────── */
 function switchTab(t) {
   tab = t;
@@ -402,9 +483,9 @@ function renderCt() {
       + 'style="background:var(--bg);border:1px solid var(--bd);color:var(--tx);padding:6px 10px;border-radius:8px;font-family:monospace;font-size:13px;width:170px">'
       + '</div>'
       + '<div class="drop" id="dz">'
-      + '<div class="dlbl">Drag & drop <b>.zip</b> to encrypt into save</div>'
-      + '<button class="bbtn">Browse Files</button></div>';
-    setupDZ('dz', encDrop);
+      + '<div class="dlbl">Drag & drop a <b>folder</b> to encrypt into a save</div>'
+      + '<button class="bbtn">Browse Folder</button></div>';
+    setupFolderDZ('dz', encDrop);
 
   } else if (tab === 'resign') {
     c.className = 'ct ctr';
@@ -425,7 +506,7 @@ function renderCt() {
       renderF();
     } else {
       c.className = 'ct ctr';
-      c.innerHTML = '<div class="drop"><div class="dlbl">Select a save to browse</div></div>';
+      c.innerHTML = '<div class="drop"><div class="dlbl">Select a save to browse<br><br>Tip: Drag & drop files onto a mounted save to add or replace them</div></div>';
     }
   }
 }
@@ -497,29 +578,57 @@ async function decDrop(files) {
 }
 
 /* ── Encrypt drop ──────────────────────────────────── */
-async function encDrop(files) {
-  const file = files[0];
-  if (bsy || !file) return;
+async function encDrop(files, folderName) {
+  if (bsy || !files || !files.length) return;
   const aidv = document.getElementById('eaid') ? document.getElementById('eaid').value.trim() : '';
   bsy = true;
-  $('ct').innerHTML = '<div class="drop"><div class="dlbl">Uploading for encrypt...</div></div>';
+
   try {
-    log('Uploading ' + file.name + ' (' + fmtB(file.size) + ')...');
-    let u = '/api/encrypt_upload';
-    if (aidv) u += '?aid=' + encodeURIComponent(aidv);
-    const xhr = await upload(u, file, (loaded, total) => {
-      const pct = Math.round(loaded * 100 / total);
-      showProgress(pct, loaded, total);
-    });
-    const d = JSON.parse(xhr.responseText);
+    /* Calculate total size for PFS image sizing */
+    let totalSize = 0;
+    for (const f of files) totalSize += f.size;
+
+    /* Step 1: create fresh PFS image and mount it */
+    log('Creating PFS image (' + fmtB(totalSize) + ' of files)...');
+    $('ct').innerHTML = '<div class="drop"><div class="dlbl">Creating PFS image...</div></div>';
+    let r = await fetch('/api/create_pfs?size=' + totalSize);
+    let d = await r.json();
     if (d.error) throw new Error(d.error);
-    log('Encrypted ' + fmtB(d.size) + ', starting download...', 'ok');
-    const name = file.name.replace(/\.[^.]+$/, '');
+    log('PFS image created and mounted', 'ok');
+
+    /* Step 2: upload each file */
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      const path = f._path || f.webkitRelativePath || f.name;
+      /* Strip leading folder name */
+      const parts = path.split('/');
+      const relPath = parts.length > 1 ? parts.slice(1).join('/') : parts[0];
+
+      log('Uploading (' + (i + 1) + '/' + files.length + ') ' + relPath + ' (' + fmtB(f.size) + ')...');
+      $('ct').innerHTML = '<div class="drop" id="dz"><div class="dlbl">Uploading ' + esc(relPath)
+        + '<br>(' + (i + 1) + '/' + files.length + ')</div></div>';
+
+      const xhr = await upload('/api/upload_file?name=' + encodeURIComponent(relPath), f, (loaded, total) => {
+        const pct = Math.round(loaded * 100 / total);
+        showProgress(pct, loaded, total);
+      });
+      const rd = JSON.parse(xhr.responseText);
+      if (!rd.ok) throw new Error(rd.error || 'Upload failed for ' + relPath);
+    }
+    log('All ' + files.length + ' files uploaded', 'ok');
+
+    /* Step 3: patch AID if provided, unmount, download encrypted */
+    log('Encrypting and downloading...');
+    $('ct').innerHTML = '<div class="drop"><div class="dlbl">Encrypting save...</div></div>';
+    const name = folderName || 'encrypted_save';
+    let dlUrl = '/api/download_new?name=' + encodeURIComponent(name);
+    if (aidv) dlUrl += '&aid=' + encodeURIComponent(aidv);
     const a = document.createElement('a');
-    a.href = '/api/encrypt_download?name=' + encodeURIComponent(name); a.download = name;
+    a.href = dlUrl; a.download = name;
     document.body.appendChild(a); a.click(); a.remove();
+    log('Encrypted save download started', 'ok');
     $('ct').innerHTML =
-      '<div class="drop"><div class="dlbl">' + esc(name) + '<br>' + fmtB(d.size) + '</div>'
+      '<div class="drop"><div class="dlbl">' + esc(name) + '</div>'
       + '<div style="color:#0f0">Download started</div></div>';
   } catch (e) {
     log('Error: ' + e.message, 'err');
@@ -606,13 +715,87 @@ function renderF() {
       h += '<div class="fi dir" style="padding-left:' + (16 + d * 16) + 'px" onclick="tog(' + i + ')">';
       h += (o ? '\u25BE \u{1F4C1} ' : '\u25B8 \u{1F4C1} ') + esc(nm) + '</div>';
     } else {
-      h += '<div class="fi" style="padding-left:' + (16 + d * 16) + 'px">';
+      h += '<div class="fi" style="padding-left:' + (16 + d * 16) + 'px" oncontextmenu="showCtxMenu(event,\'' + esc(f.name).replace(/'/g, "\\'") + '\')">';
       h += '\u{1F4C4} ' + esc(nm) + '<span class="sz">' + fmtB(f.size) + '</span></div>';
     }
   });
-  h += '<div class="dh">Drop files here to add to save</div>';
+  h += '<div class="dh" style="opacity:1;font-size:12px">Tip: Drag & drop files here to add or replace them</div>';
   $('ct').innerHTML = h || '<div class="empty">Empty</div>';
+  $('ct').oncontextmenu = e => {
+    if (!e.target.closest('.fi:not(.dir)')) { e.preventDefault(); showCtxMenu(e, null); }
+  };
   setupDZ('ct', handleBrw);
+}
+
+/* ── Context menu for files ────────────────────────── */
+function closeCtxMenu() {
+  const m = document.getElementById('ctxmenu');
+  if (m) m.remove();
+}
+
+function showCtxMenu(e, fname) {
+  e.preventDefault();
+  closeCtxMenu();
+  const m = document.createElement('div');
+  m.className = 'ctx-menu';
+  m.id = 'ctxmenu';
+  let items = '';
+  if (fname) {
+    const fn = esc(fname).replace(/'/g, "\\'");
+    items += '<div onclick="ctxDownload(\'' + fn + '\')">Download</div>';
+  }
+  items += '<div onclick="ctxUpload()">Upload File</div>';
+  if (fname) {
+    const fn = esc(fname).replace(/'/g, "\\'");
+    items += '<div class="ctx-del" onclick="ctxDelete(\'' + fn + '\')">Delete</div>';
+  }
+  m.innerHTML = items;
+  m.style.left = e.clientX + 'px';
+  m.style.top = e.clientY + 'px';
+  document.body.appendChild(m);
+  /* Keep menu within viewport */
+  const r = m.getBoundingClientRect();
+  if (r.right > window.innerWidth) m.style.left = (window.innerWidth - r.width - 4) + 'px';
+  if (r.bottom > window.innerHeight) m.style.top = (window.innerHeight - r.height - 4) + 'px';
+}
+
+document.addEventListener('click', closeCtxMenu);
+
+function ctxDownload(name) {
+  closeCtxMenu();
+  const a = document.createElement('a');
+  a.href = '/api/download_file?name=' + encodeURIComponent(name);
+  a.download = name.split('/').pop();
+  document.body.appendChild(a); a.click(); a.remove();
+  log('Downloading ' + name, 'ok');
+}
+
+function ctxUpload() {
+  closeCtxMenu();
+  const i = document.createElement('input');
+  i.type = 'file'; i.multiple = true;
+  i.onchange = () => { if (i.files.length) handleBrw(i.files) };
+  i.click();
+}
+
+async function ctxDelete(name) {
+  closeCtxMenu();
+  if (!confirm('Delete ' + name + '?')) return;
+  try {
+    const r = await fetch('/api/delete_file?name=' + encodeURIComponent(name));
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    log('Deleted ' + name, 'ok');
+    /* Refresh file list */
+    const r2 = await fetch('/api/files');
+    const d2 = await r2.json();
+    cf = d2.files || [];
+    ex = new Set();
+    cf.forEach(f => { if (f.dir) ex.add(f.name) });
+    renderF();
+  } catch (e) {
+    log('Error: ' + e.message, 'err');
+  }
 }
 
 /* ── Toggle folder ─────────────────────────────────── */
