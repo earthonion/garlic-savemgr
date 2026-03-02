@@ -10,10 +10,13 @@ LIBS := -lkernel_sys -lkernel -lSceSystemService -lSceUserService -lSceFsInterna
 
 all: garlic-savemgr.elf
 
-garlic-savemgr.elf: src/main.c
+src/ui.h: src/ui.html
+	xxd -i $< > $@
+
+garlic-savemgr.elf: src/main.c src/ui.h
 	$(PS5_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
 
 clean:
-	rm -f garlic-savemgr.elf
+	rm -f garlic-savemgr.elf src/ui.h
 
 .PHONY: all clean
