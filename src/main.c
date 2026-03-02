@@ -47,10 +47,11 @@ int sceKernelSendNotificationRequest(int, notify_request_t*, size_t, int);
 /* ── Constants ──────────────────────────────────────────────────── */
 #define PORT            8082
 #define MOUNT_BASE      "/data/save_mnt"
-#define MAX_SAVES       256
-#define BUF_SIZE        65536
+#define BUF_SIZE        (512 * 1024)
 #define MAX_REQ         8192
 #define MAX_PATH_LEN    1024
+
+static char g_iobuf[BUF_SIZE];
 
 /* ── Save entry ─────────────────────────────────────────────────── */
 typedef struct {
@@ -60,8 +61,20 @@ typedef struct {
     char dir_name[256];          /* for mount point naming */
 } save_entry_t;
 
-static save_entry_t g_saves[MAX_SAVES];
+static save_entry_t *g_saves = NULL;
 static int g_save_count = 0;
+static int g_save_cap = 0;
+
+static save_entry_t *save_alloc(void) {
+    if (g_save_count >= g_save_cap) {
+        int newcap = g_save_cap ? g_save_cap * 2 : 64;
+        save_entry_t *p = realloc(g_saves, newcap * sizeof(save_entry_t));
+        if (!p) return NULL;
+        g_saves = p;
+        g_save_cap = newcap;
+    }
+    return &g_saves[g_save_count++];
+}
 static char g_mounted_path[MAX_PATH_LEN] = {0};
 static char g_mount_point[MAX_PATH_LEN] = {0};
 static int g_mounted = 0;
@@ -84,7 +97,7 @@ static void scan_title_dir(const char *title_path, const char *title_id) {
     if (!d) return;
 
     struct dirent *ent;
-    while ((ent = readdir(d)) && g_save_count < MAX_SAVES) {
+    while ((ent = readdir(d))) {
         if (ent->d_name[0] == '.') continue;
 
         char filepath[MAX_PATH_LEN];
@@ -92,12 +105,12 @@ static void scan_title_dir(const char *title_path, const char *title_id) {
 
         struct stat st;
         if (stat(filepath, &st) == 0 && S_ISREG(st.st_mode)) {
-            save_entry_t *s = &g_saves[g_save_count];
+            save_entry_t *s = save_alloc();
+            if (!s) break;
             snprintf(s->path, sizeof(s->path), "%s", filepath);
             snprintf(s->title_id, sizeof(s->title_id), "%s", title_id);
             snprintf(s->save_name, sizeof(s->save_name), "%s", ent->d_name);
             snprintf(s->dir_name, sizeof(s->dir_name), "%s_%s", title_id, ent->d_name);
-            g_save_count++;
         }
     }
     closedir(d);
@@ -108,7 +121,7 @@ static void scan_savedata_prospero(const char *prospero_path) {
     if (!d) return;
 
     struct dirent *ent;
-    while ((ent = readdir(d)) && g_save_count < MAX_SAVES) {
+    while ((ent = readdir(d))) {
         if (ent->d_name[0] == '.') continue;
 
         char title_path[MAX_PATH_LEN];
@@ -141,18 +154,18 @@ static void scan_saves(void) {
     DIR *d = opendir("/data/save_files");
     if (d) {
         struct dirent *ent;
-        while ((ent = readdir(d)) && g_save_count < MAX_SAVES) {
+        while ((ent = readdir(d))) {
             if (ent->d_name[0] == '.') continue;
             char filepath[MAX_PATH_LEN];
             snprintf(filepath, sizeof(filepath), "/data/save_files/%s", ent->d_name);
             struct stat st;
             if (stat(filepath, &st) == 0 && S_ISREG(st.st_mode)) {
-                save_entry_t *s = &g_saves[g_save_count];
+                save_entry_t *s = save_alloc();
+                if (!s) break;
                 snprintf(s->path, sizeof(s->path), "%s", filepath);
                 snprintf(s->title_id, sizeof(s->title_id), "manual");
                 snprintf(s->save_name, sizeof(s->save_name), "%s", ent->d_name);
                 snprintf(s->dir_name, sizeof(s->dir_name), "manual_%s", ent->d_name);
-                g_save_count++;
             }
         }
         closedir(d);
@@ -186,9 +199,9 @@ static int copy_file(const char *src, const char *dst) {
     if (sfd < 0) return -1;
     int dfd = open(dst, O_CREAT | O_WRONLY | O_TRUNC, 0755);
     if (dfd < 0) { close(sfd); return -2; }
-    char buf[BUF_SIZE];
+    char *buf = g_iobuf;
     ssize_t n;
-    while ((n = read(sfd, buf, sizeof(buf))) > 0)
+    while ((n = read(sfd, buf, BUF_SIZE)) > 0)
         write(dfd, buf, n);
     close(sfd);
     close(dfd);
@@ -568,18 +581,31 @@ static int json_list_dir(char *out, size_t max, const char *base, const char *pr
         else
             snprintf(relpath, sizeof(relpath), "%s", ent->d_name);
 
-        if (!first && pos < (int)max - 1) out[pos++] = ',';
+        if (!first) {
+            if (out && pos < (int)max - 1) out[pos] = ',';
+            pos++;
+        }
         first = 0;
-        pos += snprintf(out + pos, max - pos,
+        pos += snprintf(out ? out + pos : NULL, out ? max - pos : 0,
             "{\"name\":\"%s\",\"dir\":%s,\"size\":%lld}",
             relpath, S_ISDIR(st.st_mode) ? "true" : "false", (long long)st.st_size);
         if (S_ISDIR(st.st_mode)) {
-            if (pos < (int)max - 1) out[pos++] = ',';
-            pos += json_list_dir(out + pos, max - pos, base, relpath);
+            if (out && pos < (int)max - 1) out[pos] = ',';
+            pos++;
+            pos += json_list_dir(out ? out + pos : NULL, out ? max - pos : 0, base, relpath);
         }
     }
     closedir(d);
     return pos;
+}
+
+/* ── Robust recv (retries on EINTR) ─────────────────────────────── */
+static ssize_t recv_all(int sock, void *buf, size_t len) {
+    while (1) {
+        ssize_t r = recv(sock, buf, len, 0);
+        if (r < 0 && errno == EINTR) continue;
+        return r;
+    }
 }
 
 /* ── HTTP helpers ───────────────────────────────────────────────── */
@@ -605,295 +631,8 @@ static void http_json(int sock, const char *json) {
     http_send(sock, "200 OK", "application/json", json, strlen(json));
 }
 
-/* ── Embedded Web UI ────────────────────────────────────────────── */
-static const char HTML_PAGE[] =
-"<!DOCTYPE html><html><head><meta charset=\"UTF-8\">"
-"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-"<title>GarlicMgr</title><style>"
-"*{margin:0;padding:0;box-sizing:border-box}"
-":root{--bg:#06060e;--s1:#0c0c1a;--bd:#1a1a35;"
-"--ac:#0070ff;--ac2:#00bbff;--gl:rgba(0,112,255,.15);"
-"--tx:#d0d0e4;--dm:#505068;"
-"--ok:#00dd77;--er:#ff2244;--lb:#040408}"
-"body{font-family:-apple-system,system-ui,sans-serif;"
-"background:radial-gradient(ellipse at 10% 40%,#0c1424,var(--bg) 65%);"
-"color:var(--tx);height:100vh;display:flex;flex-direction:column;overflow:hidden}"
-"::-webkit-scrollbar{width:5px}"
-"::-webkit-scrollbar-track{background:transparent}"
-"::-webkit-scrollbar-thumb{background:var(--bd);border-radius:3px}"
-"nav{height:48px;background:var(--s1);border-bottom:1px solid var(--bd);"
-"display:flex;align-items:center;padding:0 20px;gap:6px;flex-shrink:0;position:relative}"
-"nav::after{content:'';position:absolute;bottom:0;left:0;right:0;height:1px;"
-"background:linear-gradient(90deg,transparent,var(--ac),transparent);opacity:.3}"
-".logo{font-size:14px;font-weight:800;letter-spacing:3px;text-transform:uppercase;"
-"margin-right:20px;background:linear-gradient(135deg,var(--ac),var(--ac2));"
-"-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}"
-".tab{background:none;border:1px solid transparent;color:var(--dm);font-size:11px;"
-"font-weight:600;padding:5px 14px;cursor:pointer;border-radius:16px;transition:all .2s;"
-"letter-spacing:.5px;text-transform:uppercase}"
-".tab:hover{color:var(--tx);border-color:var(--bd)}"
-".tab.active{color:#fff;background:var(--ac);border-color:var(--ac);box-shadow:0 0 12px var(--gl)}"
-".spacer{flex:1}"
-".shut{background:none;border:1px solid var(--er);color:var(--er);padding:5px 12px;"
-"border-radius:16px;cursor:pointer;font-size:10px;font-weight:700;"
-"letter-spacing:.5px;text-transform:uppercase;transition:all .2s}"
-".shut:hover{background:var(--er);color:#fff}"
-".main{flex:1;display:flex;overflow:hidden}"
-".main.full .left{display:none}.main.full .right{border-left:none}"
-".left{width:300px;min-width:220px;display:flex;flex-direction:column;"
-"border-right:1px solid var(--bd);background:var(--s1)}"
-".shdr{padding:10px 16px;font-size:10px;font-weight:700;color:var(--dm);"
-"text-transform:uppercase;letter-spacing:1.5px;border-bottom:1px solid var(--bd);flex-shrink:0}"
-".svs{flex:1;overflow-y:auto}"
-".sv{padding:10px 14px;border-bottom:1px solid rgba(26,26,53,.5);cursor:pointer;"
-"transition:all .15s;border-left:2px solid transparent}"
-".sv:hover{background:rgba(255,255,255,.02)}"
-".sv.sel{background:rgba(0,112,255,.08);border-left-color:var(--ac);"
-"box-shadow:inset 3px 0 8px -3px var(--gl)}"
-".sv .tid{font-size:12px;font-weight:600;color:var(--tx);letter-spacing:.3px}"
-".sv .sn{font-size:11px;color:var(--dm);margin-top:2px;"
-"overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
-".right{flex:1;display:flex;flex-direction:column;overflow:hidden}"
-".tb{padding:10px 16px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;"
-"border-bottom:1px solid var(--bd);background:var(--s1);flex-shrink:0;min-height:40px}"
-".btn{background:var(--ac);color:#fff;border:none;padding:6px 16px;border-radius:16px;"
-"cursor:pointer;font-size:11px;font-weight:700;letter-spacing:.4px;"
-"text-transform:uppercase;transition:all .2s}"
-".btn:hover{box-shadow:0 0 12px var(--gl);filter:brightness(1.1)}"
-".btn:disabled{opacity:.25;cursor:not-allowed;box-shadow:none;filter:none}"
-".btn.red{background:var(--er)}.btn.grn{background:var(--ok);color:#000}"
-".ct{flex:1;overflow-y:auto;display:flex;flex-direction:column}"
-".ct.ctr{align-items:center;justify-content:center}"
-".drop{border:2px dashed var(--bd);border-radius:12px;display:flex;flex-direction:column;"
-"align-items:center;justify-content:center;padding:32px 48px;transition:all .2s;gap:10px;max-width:380px;width:90%}"
-".drop.over{border-color:var(--ac);background:rgba(0,112,255,.06)}"
-".dico{font-size:32px;opacity:.5}"
-".dlbl{color:var(--dm);font-size:12px;text-align:center;line-height:1.6}"
-".dlbl b{color:var(--tx)}"
-".bbtn{background:var(--ac);color:#fff;border:none;padding:8px 24px;border-radius:16px;"
-"cursor:pointer;font-size:11px;font-weight:700;letter-spacing:.4px;"
-"text-transform:uppercase;transition:all .2s;margin-top:4px}"
-".bbtn:hover{box-shadow:0 0 12px var(--gl);filter:brightness(1.1)}"
-".dlnk{display:inline-block;padding:10px 24px;background:var(--ok);color:#000;border-radius:16px;"
-"text-decoration:none;font-weight:700;font-size:12px;letter-spacing:.4px;"
-"text-transform:uppercase;transition:all .2s;margin-top:8px}"
-".dlnk:hover{filter:brightness(1.1);box-shadow:0 0 12px rgba(0,221,119,.3)}"
-".fi{padding:6px 16px;font-size:14px;color:var(--tx);display:flex;align-items:center}"
-".fi.dir{color:var(--ac2);font-weight:600;cursor:pointer}"
-".fi .sz{color:var(--dm);font-size:12px;margin-left:auto}"
-".empty{padding:40px;text-align:center;color:var(--dm);font-size:12px;letter-spacing:.3px}"
-".dh{padding:16px;text-align:center;color:var(--dm);font-size:11px;opacity:.4;margin-top:auto}"
-".logw{height:150px;border-top:1px solid var(--bd);display:flex;flex-direction:column;"
-"flex-shrink:0;background:var(--lb);position:relative}"
-".logw::before{content:'';position:absolute;inset:0;"
-"background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,20,10,.04) 2px,rgba(0,20,10,.04) 4px);"
-"pointer-events:none;z-index:1}"
-".log{flex:1;overflow-y:auto;padding:6px 14px;"
-"font-family:'SF Mono',Consolas,monospace;font-size:11px;line-height:1.7}"
-".ll{color:#4a6a5a;animation:fadeIn .2s ease}"
-".ll.err{color:var(--er)}.ll.ok{color:var(--ok)}"
-".ll .t{opacity:.35;margin-right:8px}"
-"@keyframes fadeIn{from{opacity:0;transform:translateY(2px)}to{opacity:1;transform:none}}"
-".modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;"
-"justify-content:center;z-index:100;backdrop-filter:blur(4px)}"
-".modal{background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:24px;max-width:380px;"
-"width:90%;box-shadow:0 8px 32px rgba(0,0,0,.5)}"
-".modal h3{font-size:14px;color:var(--tx);margin-bottom:8px}"
-".modal p{font-size:12px;color:var(--dm);margin-bottom:20px;word-break:break-all}"
-".modal .btns{display:flex;gap:8px;justify-content:flex-end}"
-".modal .btns button{padding:8px 20px;border:none;border-radius:16px;font-size:11px;font-weight:700;"
-"letter-spacing:.4px;text-transform:uppercase;cursor:pointer;transition:all .2s}"
-".modal .mbtn-r{background:var(--er);color:#fff}"
-".modal .mbtn-r:hover{filter:brightness(1.2)}"
-".modal .mbtn-s{background:var(--bd);color:var(--tx)}"
-".modal .mbtn-s:hover{background:var(--dm)}"
-"</style></head><body>"
-"<nav><span class=\"logo\">GARLICMGR</span>"
-"<button class=\"tab active\" onclick=\"switchTab('browse')\">Browse</button>"
-"<button class=\"tab\" onclick=\"switchTab('decrypt')\">Decrypt</button>"
-"<button class=\"tab\" onclick=\"switchTab('encrypt')\">Encrypt</button>"
-"<button class=\"tab\" onclick=\"switchTab('resign')\">Resign</button>"
-"<span class=\"spacer\"></span>"
-"<button class=\"shut\" onclick=\"shutdown()\">Kill GarlicMgr</button></nav>"
-"<div class=\"main\" id=\"mn\">"
-"<div class=\"left\"><div class=\"shdr\">Saves</div>"
-"<div class=\"svs\" id=\"svs\"><div class=\"empty\">Loading...</div></div></div>"
-"<div class=\"right\"><div class=\"tb\" id=\"tb\"></div>"
-"<div class=\"ct\" id=\"ct\"></div></div></div>"
-"<div class=\"logw\"><div class=\"shdr\">Terminal</div><div class=\"log\" id=\"log\"></div></div>"
-"<script>"
-"let S=[],si=-1,tab='browse',mt=false,bsy=false,cf=[],ex=new Set(),aid='',stitle='',mtid='';"
-"function $(id){return document.getElementById(id)}"
-"function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;')}"
-"function log(m,c){const d=$('log'),t=new Date().toLocaleTimeString();"
-"d.innerHTML+='<div class=\"ll'+(c?' '+c:'')+'\"><span class=\"t\">'+t+'</span>'+esc(m)+'</div>';"
-"d.scrollTop=d.scrollHeight}"
-"function fmtB(b){if(b<1024)return b+'B';if(b<1048576)return(b/1024).toFixed(1)+'K';return(b/1048576).toFixed(1)+'M'}"
-"function setupDZ(id,fn){const el=$(id);if(!el)return;"
-"el.ondragover=e=>{e.preventDefault();el.classList.add('over')};"
-"el.ondragleave=e=>{e.preventDefault();el.classList.remove('over')};"
-"el.ondrop=e=>{e.preventDefault();el.classList.remove('over');if(e.dataTransfer.files.length)fn(e.dataTransfer.files)};"
-"const b=el.querySelector('.bbtn');if(b)b.onclick=e=>{e.stopPropagation();"
-"const i=document.createElement('input');i.type='file';i.multiple=true;i.onchange=()=>{if(i.files.length)fn(i.files)};i.click()}}"
-"function switchTab(t){tab=t;document.querySelectorAll('.tab').forEach((b,i)=>{"
-"b.className='tab'+((['browse','decrypt','encrypt','resign'][i]===t)?' active':'')});"
-"$('mn').className=t==='browse'?'main':'main full';"
-"if(t==='browse')load();"
-"renderTB();renderCt()}"
-"async function load(){try{const r=await fetch('/api/saves');const d=await r.json();"
-"S=d.saves||[];renderL();log('Loaded '+S.length+' saves','ok')}"
-"catch(e){log('Failed: '+e.message,'err');S=[];renderL()}}"
-"function renderL(){if(!S.length){$('svs').innerHTML='<div class=\"empty\">No saves found</div>';return}"
-"let h='';S.forEach((s,i)=>{h+='<div class=\"sv'+(i===si?' sel':'')+'\" onclick=\"sel('+i+')\">';"
-"h+='<div class=\"tid\">'+esc(s.title_id)+'</div><div class=\"sn\">'+esc(s.save_name)+'</div></div>'});"
-"$('svs').innerHTML=h}"
-"function renderCt(){const c=$('ct');"
-"if(tab==='decrypt'){c.className='ct ctr';"
-"c.innerHTML='<div class=\"drop\" id=\"dz\">"
-"<div class=\"dlbl\">Drag & drop encrypted save file</div>"
-"<button class=\"bbtn\">Browse Files</button></div>';"
-"setupDZ('dz',decDrop)}"
-"else if(tab==='encrypt'){c.className='ct ctr';"
-"c.innerHTML='<div style=\"display:flex;align-items:center;gap:8px;margin-bottom:16px\">"
-"<label style=\"font-size:12px;color:var(--dm);font-weight:600;text-transform:uppercase;letter-spacing:.5px\">Account ID:</label>"
-"<input id=\"eaid\" type=\"text\" maxlength=\"16\" placeholder=\"optional\" "
-"style=\"background:var(--bg);border:1px solid var(--bd);color:var(--tx);padding:6px 10px;border-radius:8px;font-family:monospace;font-size:13px;width:170px\">"
-"</div>"
-"<div class=\"drop\" id=\"dz\">"
-"<div class=\"dlbl\">Drag & drop <b>.zip</b> to encrypt into save</div>"
-"<button class=\"bbtn\">Browse Files</button></div>';"
-"setupDZ('dz',encDrop)}"
-"else if(tab==='resign'){c.className='ct ctr';"
-"c.innerHTML='<div style=\"display:flex;align-items:center;gap:8px;margin-bottom:16px\">"
-"<label style=\"font-size:12px;color:var(--dm);font-weight:600;text-transform:uppercase;letter-spacing:.5px\">New Account ID:</label>"
-"<input id=\"raid\" type=\"text\" maxlength=\"16\" placeholder=\"0000000000000000\" "
-"style=\"background:var(--bg);border:1px solid var(--bd);color:var(--tx);padding:6px 10px;border-radius:8px;font-family:monospace;font-size:13px;width:170px\">"
-"</div>"
-"<div class=\"drop\" id=\"dz\">"
-"<div class=\"dlbl\">Drag & drop encrypted save to resign</div>"
-"<button class=\"bbtn\">Browse Files</button></div>';"
-"setupDZ('dz',resignDrop)}"
-"else{c.className='ct';if(mt){renderF()}else{c.className='ct ctr';"
-"c.innerHTML='<div class=\"drop\">"
-"<div class=\"dlbl\">Select a save to browse</div></div>'}}}"
-"function renderTB(){let h='';"
-"if(tab==='browse'&&mt){"
-"h+='<img src=\"/api/icon?t='+Date.now()+'\" style=\"width:100px;height:56px;border-radius:6px;object-fit:cover\" onerror=\"this.style.display=\\'none\\'\">';"
-"h+='<div style=\"flex:1;min-width:0\"><div style=\"font-size:16px;font-weight:700;color:var(--tx);white-space:nowrap;overflow:hidden;text-overflow:ellipsis\">'+(stitle?esc(stitle):'Untitled')+'</div>';"
-"h+='<div style=\"font-size:13px;color:var(--dm);margin-top:2px\">'+(mtid?'Title ID: <b style=\"color:var(--tx)\">'+esc(mtid)+'</b>  ':'')+(aid?'Account ID: <b style=\"color:var(--tx)\">'+esc(aid)+'</b>':'')+'</div></div>';"
-"h+='<button class=\"btn grn\" onclick=\"dlZip()\" '+(bsy?'disabled':'')+'>Download .zip</button>';"
-"h+='<button class=\"btn\" onclick=\"dlBin()\" '+(bsy?'disabled':'')+'>Download Encrypted</button>';"
-"h+='<button class=\"btn red\" onclick=\"um()\" '+(bsy?'disabled':'')+'>Unmount</button>'}"
-"$('tb').innerHTML=h}"
-"async function sel(i){if(bsy||tab!=='browse')return;si=i;renderL();await mountBrw(i)}"
-"async function decDrop(files){const file=files[0];if(bsy||!file)return;bsy=true;"
-"$('ct').innerHTML='<div class=\"drop\"><div class=\"dlbl\">Decrypting...</div></div>';"
-"try{log('Uploading '+file.name+' ('+fmtB(file.size)+')...');"
-"const r=await fetch('/api/decrypt_upload',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file});"
-"if(!r.ok){const d=await r.json();throw new Error(d.error||'Failed')}"
-"const blob=await r.blob();const name=file.name.replace(/\\.[^.]+$/,'')+'.zip';"
-"const url=URL.createObjectURL(blob);log('Decrypted '+fmtB(blob.size),'ok');"
-"$('ct').innerHTML='<div class=\"drop\">"
-"<div class=\"dlbl\">'+esc(name)+'<br>'+fmtB(blob.size)+'</div>"
-"<a class=\"dlnk\" href=\"'+url+'\" download=\"'+esc(name)+'\">Download .zip</a></div>'"
-"}catch(e){log('Error: '+e.message,'err');renderCt()}bsy=false}"
-"async function encDrop(files){const file=files[0];if(bsy||!file)return;"
-"const aidv=document.getElementById('eaid')?document.getElementById('eaid').value.trim():'';"
-"bsy=true;$('ct').innerHTML='<div class=\"drop\"><div class=\"dlbl\">Encrypting...</div></div>';"
-"try{log('Uploading '+file.name+' ('+fmtB(file.size)+')...');"
-"let u='/api/encrypt_upload';if(aidv)u+='?aid='+encodeURIComponent(aidv);"
-"const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file});"
-"const d=await r.json();"
-"if(d.error)throw new Error(d.error);"
-"log('Encrypted '+fmtB(d.size)+', starting download...','ok');"
-"const name=file.name.replace(/\\.[^.]+$/,'')+'_encrypted';"
-"const a=document.createElement('a');a.href='/api/encrypt_download';a.download=name;document.body.appendChild(a);a.click();a.remove();"
-"$('ct').innerHTML='<div class=\"drop\">"
-"<div class=\"dlbl\">'+esc(name)+'<br>'+fmtB(d.size)+'</div>"
-"<div style=\"color:#0f0\">Download started</div></div>'"
-"}catch(e){log('Error: '+e.message,'err');renderCt()}bsy=false}"
-"async function resignDrop(files){const file=files[0];if(bsy||!file)return;"
-"const aidv=document.getElementById('raid').value.trim();"
-"if(!aidv){log('Enter new Account ID first','err');return}"
-"bsy=true;$('ct').innerHTML='<div class=\"drop\"><div class=\"dlbl\">Resigning...</div></div>';"
-"try{log('Uploading '+file.name+' ('+fmtB(file.size)+') for resign...');"
-"const r=await fetch('/api/resign?aid='+encodeURIComponent(aidv),{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file});"
-"const d=await r.json();"
-"if(d.error)throw new Error(d.error);"
-"log('Resigned '+fmtB(d.size)+', starting download...','ok');"
-"const name=file.name.replace(/\\.[^.]+$/,'')+'_resigned';"
-"const a=document.createElement('a');a.href='/api/resign_download';a.download=name;document.body.appendChild(a);a.click();a.remove();"
-"$('ct').innerHTML='<div class=\"drop\">"
-"<div class=\"dlbl\">'+esc(name)+'<br>'+fmtB(d.size)+'</div>"
-"<div style=\"color:#0f0\">Download started</div></div>'"
-"}catch(e){log('Error: '+e.message,'err');renderCt()}bsy=false}"
-"async function mountBrw(i){if(bsy)return;bsy=true;const s=S[i];"
-"try{log('Mounting '+s.title_id+'/'+s.save_name+'...');"
-"let r=await fetch('/api/mount?idx='+i);let d=await r.json();"
-"if(d.error){log('Mount failed: '+d.error,'err');bsy=false;renderCt();return}"
-"mt=true;cf=d.files||[];aid=d.account_id||'';stitle=d.save_title||'';mtid=d.title_id||'';ex=new Set();cf.forEach(f=>{if(f.dir)ex.add(f.name)});"
-"log('Mounted '+(mtid?mtid+' ':'')+(stitle?stitle+' ':'')+(aid?'['+aid+']':''),'ok');renderTB();renderF()"
-"}catch(e){log('Error: '+e.message,'err')}bsy=false}"
-"function renderF(){$('ct').className='ct';let h='';cf.forEach((f,i)=>{const ps=f.name.split('/');ps.pop();"
-"let pp='',vis=true;for(let j=0;j<ps.length;j++){pp=j?pp+'/'+ps[j]:ps[j];"
-"if(!ex.has(pp)){vis=false;break}}if(!vis)return;"
-"const d=f.name.split('/').length-1,nm=f.name.split('/').pop();"
-"if(f.dir){const o=ex.has(f.name);"
-"h+='<div class=\"fi dir\" style=\"padding-left:'+(16+d*16)+'px\" onclick=\"tog('+i+')\">';"
-"h+=(o?'\\u25BE \\u{1F4C1} ':'\\u25B8 \\u{1F4C1} ')+esc(nm)+'</div>'}else{"
-"h+='<div class=\"fi\" style=\"padding-left:'+(16+d*16)+'px\">';"
-"h+='\\u{1F4C4} '+esc(nm)+'<span class=\"sz\">'+fmtB(f.size)+'</span></div>'}});"
-"h+='<div class=\"dh\">Drop files here to add to save</div>';"
-"$('ct').innerHTML=h||'<div class=\"empty\">Empty</div>';setupDZ('ct',handleBrw)}"
-"function tog(i){const n=cf[i].name;if(ex.has(n))ex.delete(n);else ex.add(n);renderF()}"
-"function confirmReplace(name){return new Promise(res=>{const bg=document.createElement('div');"
-"bg.className='modal-bg';bg.innerHTML='<div class=\"modal\"><h3>File already exists</h3>"
-"<p><b>'+esc(name)+'</b> already exists in this save. Replace it?</p>"
-"<div class=\"btns\"><button class=\"mbtn-s\" id=\"mskip\">Skip</button>"
-"<button class=\"mbtn-r\" id=\"mrep\">Replace</button></div></div>';"
-"document.body.appendChild(bg);"
-"$(\"mrep\").onclick=()=>{bg.remove();res(true)};"
-"$(\"mskip\").onclick=()=>{bg.remove();res(false)}})}"
-"async function handleBrw(files){if(bsy||!mt)return;bsy=true;"
-"try{for(let j=0;j<files.length;j++){const file=files[j];"
-"if(file.name.endsWith('.zip')){"
-"log('Extracting '+file.name+' ('+fmtB(file.size)+')...');"
-"const r=await fetch('/api/upload',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file});"
-"const d=await r.json();log('Extracted '+d.files+' files','ok')"
-"}else{"
-"const ck=await fetch('/api/file_exists?name='+encodeURIComponent(file.name));"
-"const ce=await ck.json();"
-"if(ce.exists){const ok=await confirmReplace(file.name);if(!ok){log('Skipped '+file.name);continue}}"
-"log('Uploading '+file.name+' ('+fmtB(file.size)+')...');"
-"const r=await fetch('/api/upload_file?name='+encodeURIComponent(file.name),{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file});"
-"const d=await r.json();if(d.ok)log('Added '+file.name,'ok');else log(d.error,'err')"
-"}}"
-"const r2=await fetch('/api/files');const d2=await r2.json();"
-"cf=d2.files||[];ex=new Set();cf.forEach(f=>{if(f.dir)ex.add(f.name)});renderF()"
-"}catch(e){log('Error: '+e.message,'err')}bsy=false}"
-"async function dlZip(){if(bsy)return;bsy=true;renderTB();"
-"try{log('Downloading zip...');const r=await fetch('/api/download');const b=await r.blob();"
-"const s=si>=0?S[si]:null;dl(b,s?(s.title_id+'_'+s.save_name+'.zip'):'save.zip');"
-"log('Downloaded '+fmtB(b.size),'ok')}catch(e){log('Error: '+e.message,'err')}"
-"bsy=false;renderTB()}"
-"async function dlBin(){if(bsy||si<0)return;bsy=true;renderTB();const s=S[si];"
-"try{log('Unmounting to finalize...');await fetch('/api/unmount');mt=false;"
-"log('Downloading encrypted save...');const r=await fetch('/api/download_raw?idx='+si);"
-"const b=await r.blob();dl(b,s.title_id+'_'+s.save_name);"
-"log('Downloaded '+fmtB(b.size),'ok');si=-1;renderL();renderTB();renderCt()"
-"}catch(e){log('Error: '+e.message,'err')}bsy=false}"
-"async function um(){if(bsy)return;bsy=true;renderTB();"
-"try{log('Unmounting...');await fetch('/api/unmount');mt=false;"
-"si=-1;renderL();renderTB();renderCt();log('Unmounted','ok')"
-"}catch(e){log('Error: '+e.message,'err')}bsy=false}"
-"function dl(b,n){const a=document.createElement('a');a.href=URL.createObjectURL(b);"
-"a.download=n;document.body.appendChild(a);a.click();"
-"setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},1e3)}"
-"async function shutdown(){if(!confirm('Kill GarlicMgr?'))return;"
-"log('Killing GarlicMgr...');try{await fetch('/api/shutdown')}catch(e){}"
-"log('GarlicMgr killed','ok');document.body.style.opacity='.3'}"
-"load();renderCt();renderTB()"
-"</script></body></html>";
+/* ── Embedded Web UI (generated from src/ui.html via xxd -i) ──── */
+#include "ui.h"
 
 /* ── Request handler ────────────────────────────────────────────── */
 static void handle_request(int sock) {
@@ -905,6 +644,10 @@ static void handle_request(int sock) {
     char method[8] = {0}, url[2048] = {0};
     sscanf(req, "%7s %2047s", method, url);
 
+    /* Handle Expect: 100-continue for large uploads */
+    if (strcasestr(req, "Expect: 100-continue"))
+        send(sock, "HTTP/1.1 100 Continue\r\n\r\n", 25, 0);
+
     /* CORS preflight */
     if (strcmp(method, "OPTIONS") == 0) {
         http_send(sock, "204 No Content", "text/plain", NULL, 0);
@@ -913,7 +656,7 @@ static void handle_request(int sock) {
 
     /* GET / → embedded web UI */
     if (strcmp(method, "GET") == 0 && (strcmp(url, "/") == 0 || strcmp(url, "/index.html") == 0)) {
-        http_send(sock, "200 OK", "text/html", HTML_PAGE, sizeof(HTML_PAGE) - 1);
+        http_send(sock, "200 OK", "text/html", (const char *)src_ui_html, src_ui_html_len);
         return;
     }
 
@@ -947,11 +690,16 @@ static void handle_request(int sock) {
     /* GET /api/files → file listing of mounted save */
     if (strcmp(method, "GET") == 0 && strcmp(url, "/api/files") == 0) {
         if (!g_mounted) { http_json(sock, "{\"files\":[]}"); return; }
-        char json[32768];
-        int pos = snprintf(json, sizeof(json), "{\"files\":[");
-        pos += json_list_dir(json + pos, sizeof(json) - pos, g_mount_point, "");
-        pos += snprintf(json + pos, sizeof(json) - pos, "]}");
+        int need = snprintf(NULL, 0, "{\"files\":[");
+        need += json_list_dir(NULL, 0, g_mount_point, "");
+        need += snprintf(NULL, 0, "]}");
+        char *json = malloc(need + 1);
+        if (!json) { http_json(sock, "{\"error\":\"Out of memory\"}"); return; }
+        int pos = snprintf(json, need + 1, "{\"files\":[");
+        pos += json_list_dir(json + pos, need + 1 - pos, g_mount_point, "");
+        snprintf(json + pos, need + 1 - pos, "]}");
         http_json(sock, json);
+        free(json);
         return;
     }
 
@@ -975,9 +723,9 @@ static void handle_request(int sock) {
             "Cache-Control: no-cache\r\n"
             "Connection: close\r\n\r\n", (long long)st.st_size);
         send(sock, hdr, hlen, 0);
-        char buf[BUF_SIZE];
+        char *buf = g_iobuf;
         ssize_t nr;
-        while ((nr = read(fd, buf, sizeof(buf))) > 0)
+        while ((nr = read(fd, buf, BUF_SIZE)) > 0)
             send(sock, buf, nr, 0);
         close(fd);
         return;
@@ -986,16 +734,26 @@ static void handle_request(int sock) {
     /* GET /api/saves */
     if (strcmp(method, "GET") == 0 && strcmp(url, "/api/saves") == 0) {
         scan_saves();
-        char json[32768];
-        int pos = snprintf(json, sizeof(json), "{\"saves\":[");
+        int need = snprintf(NULL, 0, "{\"saves\":[");
         for (int i = 0; i < g_save_count; i++) {
-            if (i > 0) json[pos++] = ',';
-            pos += snprintf(json + pos, sizeof(json) - pos,
+            if (i > 0) need++; /* comma */
+            need += snprintf(NULL, 0,
                 "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"path\":\"%s\",\"dir\":\"%s\"}",
                 g_saves[i].title_id, g_saves[i].save_name, g_saves[i].path, g_saves[i].dir_name);
         }
-        pos += snprintf(json + pos, sizeof(json) - pos, "]}");
+        need += snprintf(NULL, 0, "]}");
+        char *json = malloc(need + 1);
+        if (!json) { http_json(sock, "{\"error\":\"Out of memory\"}"); return; }
+        int pos = snprintf(json, need + 1, "{\"saves\":[");
+        for (int i = 0; i < g_save_count; i++) {
+            if (i > 0) json[pos++] = ',';
+            pos += snprintf(json + pos, need + 1 - pos,
+                "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"path\":\"%s\",\"dir\":\"%s\"}",
+                g_saves[i].title_id, g_saves[i].save_name, g_saves[i].path, g_saves[i].dir_name);
+        }
+        snprintf(json + pos, need + 1 - pos, "]}");
         http_json(sock, json);
+        free(json);
         return;
     }
 
@@ -1043,15 +801,23 @@ static void handle_request(int sock) {
             close(sfo_fd);
         }
 
-        char json[32768];
         const char *tid = sfo_title_id[0] ? sfo_title_id : g_saves[idx].title_id;
-        int pos = snprintf(json, sizeof(json),
+        int need = snprintf(NULL, 0,
             "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"mount\":\"%s\","
             "\"account_id\":\"%s\",\"save_title\":\"%s\",\"files\":[",
             tid, g_saves[idx].save_name, g_mount_point, acct_id, save_title);
-        pos += json_list_dir(json + pos, sizeof(json) - pos, g_mount_point, "");
-        pos += snprintf(json + pos, sizeof(json) - pos, "]}");
+        need += json_list_dir(NULL, 0, g_mount_point, "");
+        need += snprintf(NULL, 0, "]}");
+        char *json = malloc(need + 1);
+        if (!json) { http_json(sock, "{\"error\":\"Out of memory\"}"); return; }
+        int pos = snprintf(json, need + 1,
+            "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"mount\":\"%s\","
+            "\"account_id\":\"%s\",\"save_title\":\"%s\",\"files\":[",
+            tid, g_saves[idx].save_name, g_mount_point, acct_id, save_title);
+        pos += json_list_dir(json + pos, need + 1 - pos, g_mount_point, "");
+        snprintf(json + pos, need + 1 - pos, "]}");
         http_json(sock, json);
+        free(json);
         return;
     }
 
@@ -1091,9 +857,9 @@ static void handle_request(int sock) {
             "Connection: close\r\n"
             "\r\n", s->save_name, (long long)st.st_size);
         send(sock, hdr, hlen, 0);
-        char buf[BUF_SIZE];
+        char *buf = g_iobuf;
         ssize_t nr;
-        while ((nr = read(fd, buf, sizeof(buf))) > 0)
+        while ((nr = read(fd, buf, BUF_SIZE)) > 0)
             send(sock, buf, nr, 0);
         close(fd);
         return;
@@ -1112,6 +878,80 @@ static void handle_request(int sock) {
             "\r\n");
         send(sock, hdr, hlen, 0);
         zip_send(sock, g_mount_point);
+        return;
+    }
+
+    /* GET /api/dump_usb?idx=N -> copy raw save to /mnt/usb0/saves/<titleid>/ with progress */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/dump_usb", 13) == 0) {
+        scan_saves();
+        int idx = -1;
+        char *p = strstr(url, "idx=");
+        if (p) idx = atoi(p + 4);
+        if (idx < 0 || idx >= g_save_count) {
+            http_json(sock, "{\"error\":\"Invalid index\"}"); return;
+        }
+        save_entry_t *s = &g_saves[idx];
+        pid_t rpid = getpid();
+        kernel_set_ucred_uid(rpid, 0);
+        kernel_set_ucred_authid(rpid, 0x4800000000000010ULL);
+
+        struct stat sst;
+        if (stat(s->path, &sst) < 0) {
+            http_json(sock, "{\"error\":\"Source file not found\"}"); return;
+        }
+
+        mkdir("/mnt/usb0/saves", 0777);
+        char title_dir[MAX_PATH_LEN];
+        snprintf(title_dir, sizeof(title_dir), "/mnt/usb0/saves/%s", s->title_id);
+        mkdir(title_dir, 0777);
+
+        char dst[MAX_PATH_LEN];
+        snprintf(dst, sizeof(dst), "%s/%s", title_dir, s->save_name);
+
+        int sfd = open(s->path, O_RDONLY);
+        if (sfd < 0) {
+            http_json(sock, "{\"error\":\"Cannot open source - is USB inserted?\"}"); return;
+        }
+        int dfd = open(dst, O_CREAT | O_WRONLY | O_TRUNC, 0755);
+        if (dfd < 0) {
+            close(sfd);
+            http_json(sock, "{\"error\":\"Cannot create dest - is USB inserted?\"}"); return;
+        }
+
+        /* Stream progress as newline-delimited JSON */
+        char hdr[512];
+        int hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/x-ndjson\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n\r\n");
+        send(sock, hdr, hlen, 0);
+
+        char *buf = g_iobuf;
+        ssize_t nr;
+        size_t copied = 0;
+        long long total = (long long)sst.st_size;
+        int last_pct = -1;
+        while ((nr = read(sfd, buf, BUF_SIZE)) > 0) {
+            write(dfd, buf, nr);
+            copied += nr;
+            int pct = total > 0 ? (int)(copied * 100 / total) : 100;
+            if (pct != last_pct) {
+                last_pct = pct;
+                char prog[128];
+                int plen = snprintf(prog, sizeof(prog),
+                    "{\"progress\":%d,\"copied\":%zu,\"total\":%lld}\n", pct, copied, total);
+                send(sock, prog, plen, 0);
+            }
+        }
+        close(sfd);
+        close(dfd);
+
+        char done[512];
+        int dlen = snprintf(done, sizeof(done),
+            "{\"ok\":true,\"path\":\"%s/%s\",\"size\":%lld}\n",
+            title_dir, s->save_name, total);
+        send(sock, done, dlen, 0);
         return;
     }
 
@@ -1155,7 +995,7 @@ static void handle_request(int sock) {
         size_t clen = 0;
         char *cl = strcasestr(req, "Content-Length:");
         if (cl) clen = strtoul(cl + 15, NULL, 10);
-        if (clen == 0 || clen > 256 * 1024 * 1024) {
+        if (clen == 0 || clen > (size_t)2 * 1024 * 1024 * 1024) {
             http_json(sock, "{\"error\":\"Invalid size\"}"); return;
         }
         char *body_start = strstr(req, "\r\n\r\n");
@@ -1171,9 +1011,9 @@ static void handle_request(int sock) {
         write(fd, body_start, body_in_buf);
         size_t received = body_in_buf;
         while (received < clen) {
-            char buf[BUF_SIZE];
-            size_t want = sizeof(buf) < (clen - received) ? sizeof(buf) : (clen - received);
-            ssize_t r = recv(sock, buf, want, 0);
+            char *buf = g_iobuf;
+            size_t want = BUF_SIZE < (clen - received) ? BUF_SIZE : (clen - received);
+            ssize_t r = recv_all(sock, buf, want);
             if (r <= 0) break;
             write(fd, buf, r);
             received += r;
@@ -1209,7 +1049,7 @@ static void handle_request(int sock) {
         size_t clen = 0;
         char *cl = strcasestr(req, "Content-Length:");
         if (cl) clen = strtoul(cl + 15, NULL, 10);
-        if (clen == 0 || clen > 256 * 1024 * 1024) {
+        if (clen == 0 || clen > (size_t)2 * 1024 * 1024 * 1024) {
             http_json(sock, "{\"error\":\"Invalid size\"}"); return;
         }
         char *body_start = strstr(req, "\r\n\r\n");
@@ -1223,7 +1063,7 @@ static void handle_request(int sock) {
         memcpy(tar_data, body_start, body_in_buf);
         size_t received = body_in_buf;
         while (received < clen) {
-            ssize_t r = recv(sock, tar_data + received, clen - received, 0);
+            ssize_t r = recv_all(sock, tar_data + received, clen - received);
             if (r <= 0) break;
             received += r;
         }
@@ -1352,8 +1192,8 @@ static void handle_request(int sock) {
         return;
     }
 
-    /* GET /api/encrypt_download -> serve the encrypted file */
-    if (strcmp(method, "GET") == 0 && strcmp(url, "/api/encrypt_download") == 0) {
+    /* GET /api/encrypt_download?name=<optional> -> serve the encrypted file */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/encrypt_download", 21) == 0) {
         const char *tmp = "/data/save_files/_tmp_enc";
         struct stat est;
         if (stat(tmp, &est) < 0) {
@@ -1363,26 +1203,42 @@ static void handle_request(int sock) {
         if (fd < 0) {
             http_json(sock, "{\"error\":\"Cannot read file\"}"); return;
         }
-        char hdr[512];
+        char dlname[512] = "encrypted_save";
+        char *np = strstr(url, "name=");
+        if (np) {
+            strncpy(dlname, np + 5, sizeof(dlname) - 1);
+            dlname[sizeof(dlname) - 1] = 0;
+            /* URL-decode */
+            char *r = dlname, *w = dlname;
+            while (*r && *r != '&') {
+                if (*r == '%' && r[1] && r[2]) {
+                    char hex[3] = {r[1], r[2], 0};
+                    *w++ = (char)strtol(hex, NULL, 16);
+                    r += 3;
+                } else { *w++ = *r++; }
+            }
+            *w = 0;
+        }
+        char hdr[1024];
         int hlen = snprintf(hdr, sizeof(hdr),
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/octet-stream\r\n"
-            "Content-Disposition: attachment; filename=\"encrypted_save\"\r\n"
+            "Content-Disposition: attachment; filename=\"%s\"\r\n"
             "Content-Length: %lld\r\n"
             "Access-Control-Allow-Origin: *\r\n"
-            "Connection: close\r\n\r\n", (long long)est.st_size);
+            "Connection: close\r\n\r\n", dlname, (long long)est.st_size);
         send(sock, hdr, hlen, 0);
-        char buf[BUF_SIZE];
+        char *buf = g_iobuf;
         ssize_t nr;
-        while ((nr = read(fd, buf, sizeof(buf))) > 0)
+        while ((nr = read(fd, buf, BUF_SIZE)) > 0)
             send(sock, buf, nr, 0);
         close(fd);
         unlink(tmp);
         return;
     }
 
-    /* GET /api/resign_download -> serve the resigned file */
-    if (strcmp(method, "GET") == 0 && strcmp(url, "/api/resign_download") == 0) {
+    /* GET /api/resign_download?name=<optional> -> serve the resigned file */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/resign_download", 20) == 0) {
         const char *tmp = "/data/save_files/_tmp_resign";
         struct stat rst;
         if (stat(tmp, &rst) < 0) {
@@ -1392,18 +1248,33 @@ static void handle_request(int sock) {
         if (fd < 0) {
             http_json(sock, "{\"error\":\"Cannot read file\"}"); return;
         }
-        char hdr[512];
+        char dlname[512] = "resigned_save";
+        char *np = strstr(url, "name=");
+        if (np) {
+            strncpy(dlname, np + 5, sizeof(dlname) - 1);
+            dlname[sizeof(dlname) - 1] = 0;
+            char *r = dlname, *w = dlname;
+            while (*r && *r != '&') {
+                if (*r == '%' && r[1] && r[2]) {
+                    char hex[3] = {r[1], r[2], 0};
+                    *w++ = (char)strtol(hex, NULL, 16);
+                    r += 3;
+                } else { *w++ = *r++; }
+            }
+            *w = 0;
+        }
+        char hdr[1024];
         int hlen = snprintf(hdr, sizeof(hdr),
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/octet-stream\r\n"
-            "Content-Disposition: attachment; filename=\"resigned_save\"\r\n"
+            "Content-Disposition: attachment; filename=\"%s\"\r\n"
             "Content-Length: %lld\r\n"
             "Access-Control-Allow-Origin: *\r\n"
-            "Connection: close\r\n\r\n", (long long)rst.st_size);
+            "Connection: close\r\n\r\n", dlname, (long long)rst.st_size);
         send(sock, hdr, hlen, 0);
-        char buf[BUF_SIZE];
+        char *buf = g_iobuf;
         ssize_t nr;
-        while ((nr = read(fd, buf, sizeof(buf))) > 0)
+        while ((nr = read(fd, buf, BUF_SIZE)) > 0)
             send(sock, buf, nr, 0);
         close(fd);
         unlink(tmp);
@@ -1434,7 +1305,7 @@ static void handle_request(int sock) {
         size_t clen = 0;
         char *cl = strcasestr(req, "Content-Length:");
         if (cl) clen = strtoul(cl + 15, NULL, 10);
-        if (clen > 256 * 1024 * 1024) {
+        if (clen > (size_t)2 * 1024 * 1024 * 1024) {
             http_json(sock, "{\"error\":\"File too large\"}"); return;
         }
 
@@ -1463,9 +1334,9 @@ static void handle_request(int sock) {
         write(fd, body_start, body_in_buf);
         size_t received = body_in_buf;
         while (received < clen) {
-            char buf[BUF_SIZE];
-            size_t want = sizeof(buf) < (clen - received) ? sizeof(buf) : (clen - received);
-            ssize_t r = recv(sock, buf, want, 0);
+            char *buf = g_iobuf;
+            size_t want = BUF_SIZE < (clen - received) ? BUF_SIZE : (clen - received);
+            ssize_t r = recv_all(sock, buf, want);
             if (r <= 0) break;
             write(fd, buf, r);
             received += r;
@@ -1486,7 +1357,7 @@ static void handle_request(int sock) {
         size_t clen = 0;
         char *cl = strcasestr(req, "Content-Length:");
         if (cl) clen = strtoul(cl + 15, NULL, 10);
-        if (clen == 0 || clen > 256 * 1024 * 1024) {
+        if (clen == 0 || clen > (size_t)2 * 1024 * 1024 * 1024) {
             http_json(sock, "{\"error\":\"Invalid content length\"}");
             return;
         }
@@ -1504,7 +1375,7 @@ static void handle_request(int sock) {
         size_t received = body_in_buf;
 
         while (received < clen) {
-            ssize_t r = recv(sock, body + received, clen - received, 0);
+            ssize_t r = recv_all(sock, body + received, clen - received);
             if (r <= 0) break;
             received += r;
         }
@@ -1626,9 +1497,9 @@ static void handle_request(int sock) {
             "Access-Control-Allow-Origin: *\r\n"
             "Connection: close\r\n\r\n", (long long)st.st_size);
         send(sock, hdr, hlen, 0);
-        char buf[BUF_SIZE];
+        char *buf = g_iobuf;
         ssize_t nr;
-        while ((nr = read(fd, buf, sizeof(buf))) > 0)
+        while ((nr = read(fd, buf, BUF_SIZE)) > 0)
             send(sock, buf, nr, 0);
         close(fd);
         unlink(tmp_path);
@@ -1670,7 +1541,7 @@ static void handle_request(int sock) {
         size_t clen = 0;
         char *cl = strcasestr(req, "Content-Length:");
         if (cl) clen = strtoul(cl + 15, NULL, 10);
-        if (clen == 0 || clen > 256 * 1024 * 1024) {
+        if (clen == 0 || clen > (size_t)2 * 1024 * 1024 * 1024) {
             http_json(sock, "{\"error\":\"Invalid size\"}"); return;
         }
         char *body_start = strstr(req, "\r\n\r\n");
@@ -1686,9 +1557,9 @@ static void handle_request(int sock) {
         write(fd, body_start, body_in_buf);
         size_t received = body_in_buf;
         while (received < clen) {
-            char buf[BUF_SIZE];
-            size_t want = sizeof(buf) < (clen - received) ? sizeof(buf) : (clen - received);
-            ssize_t r = recv(sock, buf, want, 0);
+            char *buf = g_iobuf;
+            size_t want = BUF_SIZE < (clen - received) ? BUF_SIZE : (clen - received);
+            ssize_t r = recv_all(sock, buf, want);
             if (r <= 0) break;
             write(fd, buf, r);
             received += r;
@@ -1755,9 +1626,12 @@ int main(void) {
     }
 
     /* Force unmount any stale mounts from previous runs */
-    UmountOpt u0; memset(&u0, 0, sizeof(u0));
-    sceFsInitUmountSaveDataOpt(&u0);
-    sceFsUmountSaveData(&u0, "/data/mount_sd", 0, 0);
+    struct stat st0;
+    if (stat("/data/mount_sd", &st0) == 0) {
+        UmountOpt u0; memset(&u0, 0, sizeof(u0));
+        sceFsInitUmountSaveDataOpt(&u0);
+        sceFsUmountSaveData(&u0, "/data/mount_sd", 0, 0);
+    }
 
     printf("=== Garlic SaveMgr for PS5 by earthonion ===\n");
     notify("Garlic SaveMgr: port %d", PORT);
@@ -1785,6 +1659,9 @@ int main(void) {
         socklen_t clen = sizeof(client);
         int conn = accept(srvfd, (struct sockaddr*)&client, &clen);
         if (conn < 0) continue;
+        int rcvbuf = 1024 * 1024;
+        setsockopt(conn, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+        setsockopt(conn, SOL_SOCKET, SO_SNDBUF, &rcvbuf, sizeof(rcvbuf));
         handle_request(conn);
         close(conn);
     }
