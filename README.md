@@ -8,8 +8,6 @@ PS5 save decrypt/encrypt/browse with embedded web UI.
 2. Open `http://<ps5-ip>:8082` in your browser on your PC
 3. Drag and drop files into the browse tab to add/replace files
 
-> Click browse twice to make it ungrey out.
-
 ## Building
 
 Requires the [PS5 Payload SDK](https://github.com/ps5-payload-dev/sdk).
