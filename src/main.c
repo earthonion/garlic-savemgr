@@ -1112,13 +1112,22 @@ static void handle_request(int sock) {
         for (int i = 0; i < g_save_count; i++) {
             if (i > 0) need++;
             const char *tname = lookup_title(g_saves[i].title_id);
+            const char *stype = (strncmp(g_saves[i].save_name, "sdimg_", 6) == 0 &&
+                                  strstr(g_saves[i].path, "/savedata/") != NULL &&
+                                  strstr(g_saves[i].path, "/savedata_prospero/") == NULL) ? "ps4" : "ps5";
+            /* Count escaped title_name length */
+            int tname_esc_len = 0;
+            if (tname) {
+                for (const char *c = tname; *c; c++)
+                    tname_esc_len += (*c == '"' || *c == '\\' || *c < 0x20) ? 2 : 1;
+            }
             need += snprintf(NULL, 0,
-                "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"path\":\"%s\",\"dir\":\"%s\",\"title_name\":\"%s\"}",
+                "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"path\":\"%s\",\"dir\":\"%s\",\"title_name\":\"\",\"type\":\"%s\"}",
                 g_saves[i].title_id, g_saves[i].save_name, g_saves[i].path, g_saves[i].dir_name,
-                tname ? tname : "");
+                stype);
+            need += tname_esc_len;
         }
         need += snprintf(NULL, 0, "]}");
-        need += 512; /* extra for JSON escaping */
         char *json = malloc(need + 1);
         if (!json) { http_json(sock, "{\"error\":\"Out of memory\"}"); return; }
         int pos = snprintf(json, need + 1, "{\"saves\":[");
@@ -1128,10 +1137,20 @@ static void handle_request(int sock) {
             const char *stype = (strncmp(g_saves[i].save_name, "sdimg_", 6) == 0 &&
                                   strstr(g_saves[i].path, "/savedata/") != NULL &&
                                   strstr(g_saves[i].path, "/savedata_prospero/") == NULL) ? "ps4" : "ps5";
+            /* Escape title_name for JSON */
+            char esc_tname[512] = {0};
+            if (tname) {
+                int tp = 0;
+                for (const char *c = tname; *c && tp < (int)sizeof(esc_tname) - 2; c++) {
+                    if (*c == '"' || *c == '\\') { esc_tname[tp++] = '\\'; esc_tname[tp++] = *c; }
+                    else if (*c >= 0x20) { esc_tname[tp++] = *c; }
+                }
+                esc_tname[tp] = 0;
+            }
             pos += snprintf(json + pos, need + 1 - pos,
                 "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"path\":\"%s\",\"dir\":\"%s\",\"title_name\":\"%s\",\"type\":\"%s\"}",
                 g_saves[i].title_id, g_saves[i].save_name, g_saves[i].path, g_saves[i].dir_name,
-                tname ? tname : "", stype);
+                esc_tname, stype);
         }
         snprintf(json + pos, need + 1 - pos, "]}");
         http_json(sock, json);
