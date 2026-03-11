@@ -21,6 +21,7 @@
 #include <dlfcn.h>
 
 #include <ps5/kernel.h>
+#include "sqlite3.h"
 
 /* ── SDK imports ────────────────────────────────────────────────── */
 typedef struct { uint8_t reserved; char *budgetid; } MountOpt;
@@ -40,6 +41,7 @@ static PprCreateFn g_pprCreate = NULL;
 int sceFsUfsAllocateSaveData(int fd, uint64_t size, uint64_t flags, int ext);
 
 int sceUserServiceInitialize(void*);
+int sceUserServiceGetForegroundUser(int *user_id);
 
 typedef struct { char unused[45]; char message[3075]; } notify_request_t;
 int sceKernelSendNotificationRequest(int, notify_request_t*, size_t, int);
@@ -79,6 +81,59 @@ static char g_mounted_path[MAX_PATH_LEN] = {0};
 static char g_mount_point[MAX_PATH_LEN] = {0};
 static int g_mounted = 0;
 static char g_local_copy[MAX_PATH_LEN] = {0};
+
+/* ── Title name lookup from app.db ──────────────────────────────── */
+typedef struct {
+    char title_id[32];
+    char title_name[256];
+} title_entry_t;
+
+static title_entry_t *g_titles = NULL;
+static int g_title_count = 0;
+static int g_title_cap = 0;
+
+static void load_app_db(void) {
+    const char *db_path = "/system_data/priv/mms/app.db";
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        printf("[GarlicMgr] Cannot open app.db: %s\n", sqlite3_errmsg(db));
+        if (db) sqlite3_close(db);
+        return;
+    }
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT titleId, titleName FROM tbl_contentinfo WHERE titleName IS NOT NULL";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        printf("[GarlicMgr] SQL error: %s\n", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return;
+    }
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *tid = (const char *)sqlite3_column_text(stmt, 0);
+        const char *tname = (const char *)sqlite3_column_text(stmt, 1);
+        if (!tid || !tname) continue;
+        if (g_title_count >= g_title_cap) {
+            int newcap = g_title_cap ? g_title_cap * 2 : 64;
+            title_entry_t *p = realloc(g_titles, newcap * sizeof(title_entry_t));
+            if (!p) break;
+            g_titles = p;
+            g_title_cap = newcap;
+        }
+        title_entry_t *t = &g_titles[g_title_count++];
+        strncpy(t->title_id, tid, sizeof(t->title_id) - 1);
+        strncpy(t->title_name, tname, sizeof(t->title_name) - 1);
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    printf("[GarlicMgr] Loaded %d title names from app.db\n", g_title_count);
+}
+
+static const char *lookup_title(const char *title_id) {
+    for (int i = 0; i < g_title_count; i++) {
+        if (strcmp(g_titles[i].title_id, title_id) == 0)
+            return g_titles[i].title_name;
+    }
+    return NULL;
+}
 
 /* ── Notification ───────────────────────────────────────────────── */
 static void notify(const char *fmt, ...) {
@@ -811,20 +866,25 @@ static void handle_request(int sock) {
         scan_saves();
         int need = snprintf(NULL, 0, "{\"saves\":[");
         for (int i = 0; i < g_save_count; i++) {
-            if (i > 0) need++; /* comma */
+            if (i > 0) need++;
+            const char *tname = lookup_title(g_saves[i].title_id);
             need += snprintf(NULL, 0,
-                "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"path\":\"%s\",\"dir\":\"%s\"}",
-                g_saves[i].title_id, g_saves[i].save_name, g_saves[i].path, g_saves[i].dir_name);
+                "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"path\":\"%s\",\"dir\":\"%s\",\"title_name\":\"%s\"}",
+                g_saves[i].title_id, g_saves[i].save_name, g_saves[i].path, g_saves[i].dir_name,
+                tname ? tname : "");
         }
         need += snprintf(NULL, 0, "]}");
+        need += 512; /* extra for JSON escaping */
         char *json = malloc(need + 1);
         if (!json) { http_json(sock, "{\"error\":\"Out of memory\"}"); return; }
         int pos = snprintf(json, need + 1, "{\"saves\":[");
         for (int i = 0; i < g_save_count; i++) {
             if (i > 0) json[pos++] = ',';
+            const char *tname = lookup_title(g_saves[i].title_id);
             pos += snprintf(json + pos, need + 1 - pos,
-                "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"path\":\"%s\",\"dir\":\"%s\"}",
-                g_saves[i].title_id, g_saves[i].save_name, g_saves[i].path, g_saves[i].dir_name);
+                "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"path\":\"%s\",\"dir\":\"%s\",\"title_name\":\"%s\"}",
+                g_saves[i].title_id, g_saves[i].save_name, g_saves[i].path, g_saves[i].dir_name,
+                tname ? tname : "");
         }
         snprintf(json + pos, need + 1 - pos, "]}");
         http_json(sock, json);
@@ -1621,6 +1681,12 @@ static void handle_request(int sock) {
                 int sfo_fd = open(sfo_path, O_RDWR);
                 if (sfo_fd >= 0) {
                     pwrite(sfo_fd, new_aid, 8, 0x1B8);
+                    int local_uid = 0;
+                    if (sceUserServiceGetForegroundUser(&local_uid) == 0) {
+                        uint32_t uid = (uint32_t)local_uid;
+                        pwrite(sfo_fd, &uid, 4, 0x660);
+                        printf("[GarlicMgr] download_new: patched user_id to 0x%x\n", uid);
+                    }
                     close(sfo_fd);
                     sync();
                     printf("[GarlicMgr] download_new: patched account ID\n");
@@ -1758,6 +1824,38 @@ static void handle_request(int sock) {
             close(sfo_fd); unmount_save(); unlink(tmp);
             http_json(sock, "{\"error\":\"Failed to write account ID\"}"); return;
         }
+        /* Patch user_id (uint32_t) at offset 0x660 */
+        char *up = strstr(url, "uid=");
+        uint32_t uid = 0;
+        int have_uid = 0;
+        if (up) {
+            char uid_hex[16] = {0};
+            strncpy(uid_hex, up + 4, sizeof(uid_hex) - 1);
+            char *rp2 = uid_hex, *wp2 = uid_hex;
+            while (*rp2 && *rp2 != '&') {
+                if (*rp2 == '%' && rp2[1] && rp2[2]) {
+                    char hx[3] = {rp2[1], rp2[2], 0};
+                    *wp2++ = (char)strtol(hx, NULL, 16);
+                    rp2 += 3;
+                } else { *wp2++ = *rp2++; }
+            }
+            *wp2 = 0;
+            char *us = uid_hex;
+            if (us[0] == '0' && (us[1] == 'x' || us[1] == 'X')) us += 2;
+            uid = (uint32_t)strtoul(us, NULL, 16);
+            have_uid = 1;
+        }
+        if (!have_uid) {
+            int local_uid = 0;
+            if (sceUserServiceGetForegroundUser(&local_uid) == 0) {
+                uid = (uint32_t)local_uid;
+                have_uid = 1;
+            }
+        }
+        if (have_uid) {
+            pwrite(sfo_fd, &uid, 4, 0x660);
+            printf("[GarlicMgr] resign: patched user_id to 0x%x\n", uid);
+        }
         close(sfo_fd);
         sync();
         printf("[GarlicMgr] resign: patched account ID to %s\n", aid_hex);
@@ -1787,6 +1885,7 @@ int main(void) {
     kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
     signal(SIGPIPE, SIG_IGN);
     init_crc();
+    load_app_db();
 
     /* Try to load sceFsCreatePprPfsSaveDataImage via dlsym */
     void *vsh = dlopen("libSceFsInternalForVsh.sprx", RTLD_LAZY);

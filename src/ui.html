@@ -448,18 +448,52 @@ async function load() {
 }
 
 /* ── Render save list (left panel) ─────────────────── */
+let exG = new Set(); /* expanded groups */
+
 function renderL() {
   if (!S.length) {
     $('svs').innerHTML = '<div class="empty">No saves found</div>';
     return;
   }
-  let h = '';
+  /* Group saves by title_id */
+  const groups = [];
+  const gmap = {};
   S.forEach((s, i) => {
-    h += '<div class="sv' + (i === si ? ' sel' : '') + '" onclick="sel(' + i + ')">';
-    h += '<div class="tid">' + esc(s.title_id) + '</div>';
-    h += '<div class="sn">' + esc(s.save_name) + '</div></div>';
+    if (!gmap[s.title_id]) {
+      gmap[s.title_id] = { title_id: s.title_id, name: s.title_name || s.title_id, items: [] };
+      groups.push(gmap[s.title_id]);
+    }
+    gmap[s.title_id].items.push(i);
+  });
+
+  let h = '';
+  groups.forEach(g => {
+    if (g.items.length === 1) {
+      const i = g.items[0], s = S[i];
+      h += '<div class="sv' + (i === si ? ' sel' : '') + '" onclick="sel(' + i + ')">';
+      h += '<div class="tid">' + esc(g.name) + '</div>';
+      h += '<div class="sn">' + esc(s.save_name) + '</div></div>';
+    } else {
+      const open = exG.has(g.title_id);
+      const anySel = g.items.includes(si);
+      h += '<div class="sv' + (anySel ? ' sel' : '') + '" onclick="togG(\'' + esc(g.title_id) + '\')" style="cursor:pointer">';
+      h += '<div class="tid">' + (open ? '\u25BE ' : '\u25B8 ') + esc(g.name) + '</div>';
+      h += '<div class="sn">' + g.items.length + ' saves</div></div>';
+      if (open) {
+        g.items.forEach(i => {
+          const s = S[i];
+          h += '<div class="sv' + (i === si ? ' sel' : '') + '" onclick="sel(' + i + ')" style="padding-left:28px">';
+          h += '<div class="sn" style="color:var(--tx)">' + esc(s.save_name) + '</div></div>';
+        });
+      }
+    }
   });
   $('svs').innerHTML = h;
+}
+
+function togG(tid) {
+  if (exG.has(tid)) exG.delete(tid); else exG.add(tid);
+  renderL();
 }
 
 /* ── Render content area ───────────────────────────── */
@@ -490,10 +524,15 @@ function renderCt() {
   } else if (tab === 'resign') {
     c.className = 'ct ctr';
     c.innerHTML =
-      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:16px">'
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">'
       + '<label style="font-size:12px;color:var(--dm);font-weight:600;text-transform:uppercase;letter-spacing:.5px">New Account ID:</label>'
       + '<input id="raid" type="text" maxlength="16" placeholder="0000000000000000" '
       + 'style="background:var(--bg);border:1px solid var(--bd);color:var(--tx);padding:6px 10px;border-radius:8px;font-family:monospace;font-size:13px;width:170px">'
+      + '</div>'
+      + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:16px">'
+      + '<label style="font-size:12px;color:var(--dm);font-weight:600;text-transform:uppercase;letter-spacing:.5px">User ID:</label>'
+      + '<input id="ruid" type="text" maxlength="8" placeholder="optional (uses local user)" '
+      + 'style="background:var(--bg);border:1px solid var(--bd);color:var(--tx);padding:6px 10px;border-radius:8px;font-family:monospace;font-size:13px;width:240px">'
       + '</div>'
       + '<div class="drop" id="dz">'
       + '<div class="dlbl">Drag & drop encrypted save to resign</div>'
@@ -646,8 +685,11 @@ async function resignDrop(files) {
   bsy = true;
   $('ct').innerHTML = '<div class="drop"><div class="dlbl">Uploading for resign...</div></div>';
   try {
+    const uidv = document.getElementById('ruid') ? document.getElementById('ruid').value.trim() : '';
     log('Uploading ' + file.name + ' (' + fmtB(file.size) + ') for resign...');
-    const xhr = await upload('/api/resign?aid=' + encodeURIComponent(aidv), file, (loaded, total) => {
+    let rurl = '/api/resign?aid=' + encodeURIComponent(aidv);
+    if (uidv) rurl += '&uid=' + encodeURIComponent(uidv);
+    const xhr = await upload(rurl, file, (loaded, total) => {
       const pct = Math.round(loaded * 100 / total);
       showProgress(pct, loaded, total);
     });
