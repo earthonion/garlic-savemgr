@@ -55,6 +55,23 @@ int sceKernelSendNotificationRequest(int, notify_request_t*, size_t, int);
 
 static char g_iobuf[BUF_SIZE];
 
+/* Ring log buffer for remote debug */
+#define LOG_BUF_SIZE (32 * 1024)
+static char g_logbuf[LOG_BUF_SIZE];
+static int g_logpos = 0;
+static void logprintf(const char *fmt, ...) {
+    char tmp[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_end(ap);
+    printf("%s", tmp);
+    if (n > 0) {
+        for (int i = 0; i < n && g_logpos < LOG_BUF_SIZE - 1; i++)
+            g_logbuf[g_logpos++] = tmp[i];
+    }
+}
+
 /* ── Save entry ─────────────────────────────────────────────────── */
 typedef struct {
     char path[MAX_PATH_LEN];     /* full path to save image file */
@@ -81,6 +98,8 @@ static char g_mounted_path[MAX_PATH_LEN] = {0};
 static char g_mount_point[MAX_PATH_LEN] = {0};
 static int g_mounted = 0;
 static char g_local_copy[MAX_PATH_LEN] = {0};
+static uint8_t g_sealed_key[96] = {0};
+static int g_enc_ps4 = 0;
 
 /* ── Title name lookup from app.db ──────────────────────────────── */
 typedef struct {
@@ -151,9 +170,23 @@ static void scan_title_dir(const char *title_path, const char *title_id) {
     DIR *d = opendir(title_path);
     if (!d) return;
 
+    /* Check if this is a PS4 savedata dir (contains sdimg_ files) */
+    int is_ps4 = (strstr(title_path, "/savedata/") != NULL &&
+                  strstr(title_path, "/savedata_prospero/") == NULL);
+
     struct dirent *ent;
     while ((ent = readdir(d))) {
         if (ent->d_name[0] == '.') continue;
+
+        /* Skip .bin sealed key companions */
+        int len = strlen(ent->d_name);
+        if (len > 4 && strcmp(ent->d_name + len - 4, ".bin") == 0) continue;
+
+        /* For PS4 dirs, only pick up sdimg_ files, skip backups */
+        if (is_ps4) {
+            if (strncmp(ent->d_name, "sdimg_", 6) != 0) continue;
+            if (strncmp(ent->d_name, "sdimg_sce_bu_", 13) == 0) continue;
+        }
 
         char filepath[MAX_PATH_LEN];
         snprintf(filepath, sizeof(filepath), "%s/%s", title_path, ent->d_name);
@@ -192,7 +225,8 @@ static void scan_savedata_prospero(const char *prospero_path) {
 static void scan_saves(void) {
     g_save_count = 0;
 
-    /* /user/home/<userid>/savedata_prospero/<TitleId>/<savefile> */
+    /* /user/home/<userid>/savedata_prospero/<TitleId>/<savefile> (PS5) */
+    /* /user/home/<userid>/savedata/<TitleId>/sdimg_* (PS4) */
     DIR *home = opendir("/user/home");
     if (home) {
         struct dirent *ue;
@@ -201,6 +235,9 @@ static void scan_saves(void) {
             char prospero[MAX_PATH_LEN];
             snprintf(prospero, sizeof(prospero), "/user/home/%s/savedata_prospero", ue->d_name);
             scan_savedata_prospero(prospero);
+            char ps4[MAX_PATH_LEN];
+            snprintf(ps4, sizeof(ps4), "/user/home/%s/savedata", ue->d_name);
+            scan_savedata_prospero(ps4);
         }
         closedir(home);
     }
@@ -270,8 +307,18 @@ static int mount_save(int idx) {
 
     save_entry_t *s = &g_saves[idx];
 
-    /* Set authid — same as save-mounter, nothing else */
+    /* Check if PS4 save (sdimg_ prefix) */
+    const char *bname = strrchr(s->path, '/');
+    bname = bname ? bname + 1 : s->path;
+    int is_ps4 = (strncmp(bname, "sdimg_", 6) == 0);
+
+    /* Elevate credentials */
     kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
+    uint8_t ucaps[16];
+    kernel_get_ucred_caps(getpid(), ucaps);
+    ucaps[7] |= 0x40;
+    kernel_set_ucred_caps(getpid(), ucaps);
+    setuid(0);
 
     /*
      * If save is NOT on /data/, copy there first.
@@ -283,59 +330,105 @@ static int mount_save(int idx) {
 
     if (!is_on_data) {
         snprintf(g_local_copy, sizeof(g_local_copy), "/data/save_files/%s", s->save_name);
-        printf("[GarlicMgr] Copying %s -> %s\n", s->path, g_local_copy);
+        logprintf("[GarlicMgr] Copying %s -> %s\n", s->path, g_local_copy);
         mkdir("/data/save_files", 0777);
         if (copy_file(s->path, g_local_copy) < 0) {
-            printf("[GarlicMgr] Copy failed (errno %d: %s)\n", errno, strerror(errno));
+            logprintf("[GarlicMgr] Copy failed (errno %d: %s)\n", errno, strerror(errno));
             return -3;
         }
         chmod(g_local_copy, 0755);
         mount_src = g_local_copy;
-        struct stat cst;
-        if (stat(g_local_copy, &cst) == 0)
-            printf("[GarlicMgr] Copy OK (%lld bytes)\n", (long long)cst.st_size);
-        else
-            printf("[GarlicMgr] Copy OK but stat failed\n");
 
-        /* Verify copy matches source */
-        struct stat sst;
-        if (stat(s->path, &sst) == 0)
-            printf("[GarlicMgr] Source was %lld bytes\n", (long long)sst.st_size);
+        /* For PS4 saves, also copy the .bin sealed key */
+        if (is_ps4) {
+            const char *savename = bname + 6;
+            char src_dir[MAX_PATH_LEN], src_bin[MAX_PATH_LEN], dst_bin[MAX_PATH_LEN];
+            strncpy(src_dir, s->path, sizeof(src_dir) - 1);
+            src_dir[sizeof(src_dir) - 1] = 0;
+            char *sl = strrchr(src_dir, '/');
+            if (sl) *(sl + 1) = 0;
+            snprintf(src_bin, sizeof(src_bin), "%s%s.bin", src_dir, savename);
+            snprintf(dst_bin, sizeof(dst_bin), "/data/save_files/%s.bin", savename);
+            copy_file(src_bin, dst_bin);
+            chmod(dst_bin, 0755);
+            logprintf("[GarlicMgr] Copied .bin key %s -> %s\n", src_bin, dst_bin);
+        }
     }
 
-    /* Read sealed key at 0x800 and decrypt via pfsmgr — same as save-mounter */
-    struct {
-        uint8_t key[0x60];
-        uint8_t hash[0x20];
-        uint32_t result;
-    } pfsbuf;
+    /* Heap-allocate ioctl buffer — ioctl can corrupt stack beyond bounds */
+    uint8_t *data = malloc(0x100);
+    if (!data) return -10;
+    memset(data, 0, 0x100);
 
-    int fd = open(mount_src, O_RDONLY);
-    if (fd < 0) {
-        printf("[GarlicMgr] Cannot open %s (errno %d: %s)\n", mount_src, errno, strerror(errno));
-        return -4;
-    }
-    int ret = pread(fd, pfsbuf.key, 0x60, 0x800);
-    close(fd);
-    if (ret != 0x60) {
-        printf("[GarlicMgr] Failed to read sealed key (ret=%d)\n", ret);
-        return -5;
+    uint8_t decrypted_key[0x20];
+    memset(decrypted_key, 0, sizeof(decrypted_key));
+    int key_ok = 0;
+
+    if (is_ps4) {
+        /* PS4: read sealed key from companion .bin file */
+        const char *savename = bname + 6;
+        char dir[MAX_PATH_LEN];
+        strncpy(dir, mount_src, sizeof(dir) - 1);
+        dir[sizeof(dir) - 1] = 0;
+        char *slash = strrchr(dir, '/');
+        if (slash) *(slash + 1) = 0; else dir[0] = 0;
+
+        char bin_path[MAX_PATH_LEN];
+        snprintf(bin_path, sizeof(bin_path), "%s%s.bin", dir, savename);
+
+        int fd = open(bin_path, O_RDONLY);
+        if (fd < 0) {
+            logprintf("[GarlicMgr] mount: cannot open sealed key %s (errno=%d)\n", bin_path, errno);
+            free(data);
+            return -4;
+        }
+        int r = read(fd, data, 0x60);
+        close(fd);
+        if (r != 0x60) {
+            logprintf("[GarlicMgr] mount: short read on .bin (%d)\n", r);
+            free(data);
+            return -5;
+        }
+        logprintf("[GarlicMgr] mount: PS4 sealed key from %s (keyset=%d)\n",
+               bin_path, (data[9] << 8) | data[8]);
+
+        /* Decrypt PS4 sealed key via pfsmgr */
+        int pfsmgr = open("/dev/pfsmgr", O_RDWR);
+        if (pfsmgr >= 0) {
+            int ret = ioctl(pfsmgr, 0xc0845302, data);
+            close(pfsmgr);
+            if (ret >= 0) {
+                memcpy(decrypted_key, data + 0x60, 0x20);
+                key_ok = 1;
+                logprintf("[GarlicMgr] mount: PS4 key decrypted OK\n");
+            } else {
+                logprintf("[GarlicMgr] mount: PS4 key decrypt failed (ret=%d)\n", ret);
+            }
+        } else {
+            logprintf("[GarlicMgr] mount: cannot open /dev/pfsmgr\n");
+        }
+    } else {
+        /* PS5: read key from offset 0x800 in image */
+        int fd = open(mount_src, O_RDONLY);
+        if (fd < 0) { free(data); return -4; }
+        int ret = pread(fd, data, 0x60, 0x800);
+        close(fd);
+        if (ret != 0x60) { free(data); return -5; }
+
+        int pfsmgr = open("/dev/pfsmgr", 2);
+        if (pfsmgr < 0) { free(data); return -6; }
+        ret = ioctl(pfsmgr, 0xc0845302, data);
+        close(pfsmgr);
+        if (ret >= 0) {
+            memcpy(decrypted_key, data + 0x60, 0x20);
+            key_ok = 1;
+        }
     }
 
-    int pfsmgr = open("/dev/pfsmgr", 2);
-    if (pfsmgr < 0) {
-        printf("[GarlicMgr] Cannot open /dev/pfsmgr\n");
-        return -6;
-    }
-    ret = ioctl(pfsmgr, 0xc0845302, &pfsbuf);
-    close(pfsmgr);
-    printf("[GarlicMgr] ioctl ret=%d result=0x%08x\n", ret, pfsbuf.result);
-    printf("[GarlicMgr] Hash: ");
-    for (int i = 0; i < 0x20; i++) printf("%02x", pfsbuf.hash[i]);
-    printf("\n");
-    if (ret < 0) {
-        printf("[GarlicMgr] ioctl failed (ret=%d), using zeroed key\n", ret);
-        memset(pfsbuf.hash, 0, sizeof(pfsbuf.hash));
+    free(data);
+
+    if (!key_ok) {
+        logprintf("[GarlicMgr] mount: key decryption failed for %s\n", mount_src);
     }
 
     snprintf(g_mount_point, sizeof(g_mount_point), "/data/mount_sd");
@@ -346,23 +439,17 @@ static int mount_save(int idx) {
     sceFsInitMountSaveDataOpt(&mopt);
     mopt.budgetid = "system";
 
-    /* Restore default SIGPIPE handler before mount — EPIPE may be related */
     signal(SIGPIPE, SIG_DFL);
-
-    ret = sceFsMountSaveData(&mopt, mount_src, g_mount_point, pfsbuf.hash);
-
-    /* Re-ignore SIGPIPE for socket operations */
+    int ret = sceFsMountSaveData(&mopt, mount_src, g_mount_point, decrypted_key);
     signal(SIGPIPE, SIG_IGN);
 
     if (ret >= 0) {
-        printf("[GarlicMgr] Mounted OK (handle=%d)\n", ret);
+        logprintf("[GarlicMgr] Mounted OK (handle=%d, key_ok=%d)\n", ret, key_ok);
         snprintf(g_mounted_path, sizeof(g_mounted_path), "%s", s->path);
         g_mounted = 1;
         return 0;
     }
-    printf("[GarlicMgr] Mount failed (0x%x, errno=%d: %s)\n", ret, errno, strerror(errno));
-
-    /* Don't delete copy — leave for debugging */
+    logprintf("[GarlicMgr] Mount failed (0x%x, key_ok=%d, errno=%d: %s)\n", ret, key_ok, errno, strerror(errno));
     return ret;
 }
 
@@ -393,25 +480,94 @@ static int unmount_save(void) {
 static int mount_by_path(const char *path) {
     if (g_mounted) unmount_save();
 
+    /* Check if this is a PS4 save (sdimg_ prefix) */
+    const char *bname = strrchr(path, '/');
+    bname = bname ? bname + 1 : path;
+    int is_ps4 = (strncmp(bname, "sdimg_", 6) == 0);
+
     kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
+    uint8_t caps[16];
+    kernel_get_ucred_caps(getpid(), caps);
+    caps[7] |= 0x40;
+    kernel_set_ucred_caps(getpid(), caps);
+    setuid(0);
 
-    struct {
-        uint8_t key[0x60];
-        uint8_t hash[0x20];
-        uint32_t result;
-    } pfsbuf;
+    /* Heap-allocate ioctl buffer — ioctl can corrupt stack beyond bounds */
+    uint8_t *data = malloc(0x100);
+    if (!data) return -10;
+    memset(data, 0, 0x100);
 
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) { printf("[GarlicMgr] mount_by_path: cannot open %s\n", path); return -1; }
-    int ret = pread(fd, pfsbuf.key, 0x60, 0x800);
-    close(fd);
-    if (ret != 0x60) return -2;
+    uint8_t decrypted_key[0x20];
+    memset(decrypted_key, 0, sizeof(decrypted_key));
+    int key_ok = 0;
 
-    int pfsmgr = open("/dev/pfsmgr", 2);
-    if (pfsmgr < 0) return -3;
-    ret = ioctl(pfsmgr, 0xc0845302, &pfsbuf);
-    close(pfsmgr);
-    if (ret < 0) memset(pfsbuf.hash, 0, sizeof(pfsbuf.hash));
+    if (is_ps4) {
+        /* PS4: read sealed key from companion .bin file */
+        const char *savename = bname + 6;
+        char dir[MAX_PATH_LEN];
+        strncpy(dir, path, sizeof(dir) - 1);
+        dir[sizeof(dir) - 1] = 0;
+        char *slash = strrchr(dir, '/');
+        if (slash) *(slash + 1) = 0; else dir[0] = 0;
+
+        char bin_path[MAX_PATH_LEN];
+        snprintf(bin_path, sizeof(bin_path), "%s%s.bin", dir, savename);
+
+        int fd = open(bin_path, O_RDONLY);
+        if (fd < 0) {
+            logprintf("[GarlicMgr] mount: cannot open sealed key %s\n", bin_path);
+            free(data);
+            return -1;
+        }
+        int r = read(fd, data, 0x60);
+        close(fd);
+        if (r != 0x60) {
+            logprintf("[GarlicMgr] mount: short read on .bin (%d)\n", r);
+            free(data);
+            return -2;
+        }
+        logprintf("[GarlicMgr] mount: PS4 sealed key from %s (keyset=%d)\n",
+               bin_path, (data[9] << 8) | data[8]);
+
+        /* Decrypt PS4 sealed key via pfsmgr */
+        int pfsmgr = open("/dev/pfsmgr", O_RDWR);
+        if (pfsmgr >= 0) {
+            int ret = ioctl(pfsmgr, 0xc0845302, data);
+            close(pfsmgr);
+            if (ret >= 0) {
+                memcpy(decrypted_key, data + 0x60, 0x20);
+                key_ok = 1;
+                logprintf("[GarlicMgr] mount: PS4 key decrypted OK\n");
+            } else {
+                logprintf("[GarlicMgr] mount: PS4 key decrypt failed (ret=%d)\n", ret);
+            }
+        } else {
+            logprintf("[GarlicMgr] mount: cannot open /dev/pfsmgr\n");
+        }
+    } else {
+        /* PS5: read key from offset 0x800 in image */
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) { free(data); return -1; }
+        int ret = pread(fd, data, 0x60, 0x800);
+        close(fd);
+        if (ret != 0x60) { free(data); return -2; }
+
+        int pfsmgr = open("/dev/pfsmgr", 2);
+        if (pfsmgr < 0) { free(data); return -3; }
+        ret = ioctl(pfsmgr, 0xc0845302, data);
+        close(pfsmgr);
+        if (ret >= 0) {
+            memcpy(decrypted_key, data + 0x60, 0x20);
+            key_ok = 1;
+        }
+    }
+
+    free(data);
+
+    if (!key_ok) {
+        logprintf("[GarlicMgr] mount: key decryption failed for %s\n", path);
+        /* Try mounting with zeroed key anyway */
+    }
 
     snprintf(g_mount_point, sizeof(g_mount_point), "/data/mount_sd");
     mkdir(g_mount_point, 0777);
@@ -422,17 +578,17 @@ static int mount_by_path(const char *path) {
     mopt.budgetid = "system";
 
     signal(SIGPIPE, SIG_DFL);
-    ret = sceFsMountSaveData(&mopt, path, g_mount_point, pfsbuf.hash);
+    int ret = sceFsMountSaveData(&mopt, path, g_mount_point, decrypted_key);
     signal(SIGPIPE, SIG_IGN);
 
     if (ret >= 0) {
-        printf("[GarlicMgr] mount_by_path: mounted %s (handle=%d)\n", path, ret);
+        logprintf("[GarlicMgr] mount: mounted %s (handle=%d, key_ok=%d)\n", path, ret, key_ok);
         snprintf(g_mounted_path, sizeof(g_mounted_path), "%s", path);
         g_local_copy[0] = 0;
         g_mounted = 1;
         return 0;
     }
-    printf("[GarlicMgr] mount_by_path: failed 0x%x\n", ret);
+    logprintf("[GarlicMgr] mount: failed 0x%x (key_ok=%d)\n", ret, key_ok);
     return ret;
 }
 
@@ -549,6 +705,94 @@ static void zip_send(int sock, const char *base) {
     uint8_t ecd[22]; memset(ecd, 0, 22);
     ecd[0]=0x50; ecd[1]=0x4b; ecd[2]=0x05; ecd[3]=0x06;
     uint16_t cnt16 = (uint16_t)count;
+    memcpy(ecd+8, &cnt16, 2);
+    memcpy(ecd+10, &cnt16, 2);
+    memcpy(ecd+12, &cd_size, 4);
+    memcpy(ecd+16, &cd_offset, 4);
+    send(sock, ecd, 22, 0);
+    free(entries);
+}
+
+/* ── Zip streaming for specific files by path ──────────────────── */
+typedef struct { const char *path; const char *name; } zip_file_t;
+
+static void zip_send_files(int sock, const zip_file_t *files, int nfiles) {
+    zip_entry_t *entries = malloc(nfiles * sizeof(zip_entry_t));
+    if (!entries) return;
+
+    uint32_t offset = 0;
+    for (int i = 0; i < nfiles; i++) {
+        zip_entry_t *e = &entries[i];
+        snprintf(e->name, sizeof(e->name), "%s", files[i].name);
+
+        struct stat st;
+        if (stat(files[i].path, &st) < 0) { e->size = 0; e->crc = 0; e->offset = offset; continue; }
+        e->size = (uint32_t)st.st_size;
+        e->offset = offset;
+
+        int fd = open(files[i].path, O_RDONLY);
+        if (fd < 0) { e->crc = 0; continue; }
+
+        /* Stream: compute CRC while sending */
+        uint16_t nlen = strlen(e->name);
+        /* Send local header with CRC=0, will use data descriptor */
+        uint8_t lh[30]; memset(lh, 0, 30);
+        lh[0]=0x50; lh[1]=0x4b; lh[2]=0x03; lh[3]=0x04;
+        lh[4]=20;
+        lh[6]=0x08; /* flag: data descriptor follows */
+        memcpy(lh+18, &e->size, 4);
+        memcpy(lh+22, &e->size, 4);
+        memcpy(lh+26, &nlen, 2);
+        send(sock, lh, 30, 0);
+        send(sock, e->name, nlen, 0);
+
+        uint32_t crc = 0xFFFFFFFF;
+        char *buf = g_iobuf;
+        ssize_t nr;
+        while ((nr = read(fd, buf, BUF_SIZE)) > 0) {
+            for (ssize_t j = 0; j < nr; j++) {
+                crc ^= (uint8_t)buf[j];
+                for (int k = 0; k < 8; k++)
+                    crc = (crc >> 1) ^ (0xEDB88320 & (-(crc & 1)));
+            }
+            send(sock, buf, nr, 0);
+        }
+        close(fd);
+        crc ^= 0xFFFFFFFF;
+        e->crc = crc;
+
+        /* Data descriptor */
+        uint8_t dd[16];
+        dd[0]=0x50; dd[1]=0x4b; dd[2]=0x07; dd[3]=0x08;
+        memcpy(dd+4, &e->crc, 4);
+        memcpy(dd+8, &e->size, 4);
+        memcpy(dd+12, &e->size, 4);
+        send(sock, dd, 16, 0);
+
+        offset += 30 + nlen + e->size + 16;
+    }
+
+    uint32_t cd_offset = offset;
+    for (int i = 0; i < nfiles; i++) {
+        zip_entry_t *e = &entries[i];
+        uint16_t nlen = strlen(e->name);
+        uint8_t cd[46]; memset(cd, 0, 46);
+        cd[0]=0x50; cd[1]=0x4b; cd[2]=0x01; cd[3]=0x02;
+        cd[4]=20; cd[6]=20;
+        memcpy(cd+16, &e->crc, 4);
+        memcpy(cd+20, &e->size, 4);
+        memcpy(cd+24, &e->size, 4);
+        memcpy(cd+28, &nlen, 2);
+        memcpy(cd+42, &e->offset, 4);
+        send(sock, cd, 46, 0);
+        send(sock, e->name, nlen, 0);
+        offset += 46 + nlen;
+    }
+    uint32_t cd_size = offset - cd_offset;
+
+    uint8_t ecd[22]; memset(ecd, 0, 22);
+    ecd[0]=0x50; ecd[1]=0x4b; ecd[2]=0x05; ecd[3]=0x06;
+    uint16_t cnt16 = (uint16_t)nfiles;
     memcpy(ecd+8, &cnt16, 2);
     memcpy(ecd+10, &cnt16, 2);
     memcpy(ecd+12, &cd_size, 4);
@@ -881,10 +1125,13 @@ static void handle_request(int sock) {
         for (int i = 0; i < g_save_count; i++) {
             if (i > 0) json[pos++] = ',';
             const char *tname = lookup_title(g_saves[i].title_id);
+            const char *stype = (strncmp(g_saves[i].save_name, "sdimg_", 6) == 0 &&
+                                  strstr(g_saves[i].path, "/savedata/") != NULL &&
+                                  strstr(g_saves[i].path, "/savedata_prospero/") == NULL) ? "ps4" : "ps5";
             pos += snprintf(json + pos, need + 1 - pos,
-                "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"path\":\"%s\",\"dir\":\"%s\",\"title_name\":\"%s\"}",
+                "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"path\":\"%s\",\"dir\":\"%s\",\"title_name\":\"%s\",\"type\":\"%s\"}",
                 g_saves[i].title_id, g_saves[i].save_name, g_saves[i].path, g_saves[i].dir_name,
-                tname ? tname : "");
+                tname ? tname : "", stype);
         }
         snprintf(json + pos, need + 1 - pos, "]}");
         http_json(sock, json);
@@ -908,7 +1155,15 @@ static void handle_request(int sock) {
             return;
         }
 
-        /* Read param.sfo: account ID (8B @ 0x1B8), save title (0x20B @ 0x5DC), title ID (9B @ 0xB20) */
+        /* Detect PS4 save for SFO offset differences */
+        const char *mn = strrchr(g_saves[idx].save_name, '/');
+        mn = mn ? mn + 1 : g_saves[idx].save_name;
+        int sfo_ps4 = (strncmp(mn, "sdimg_", 6) == 0);
+
+        /* Read param.sfo:
+         * PS5: account_id 8B @ 0x1B8, save_title @ 0x5DC, title_id 9B @ 0xB20
+         * PS4: account_id 8B @ 0x15C
+         */
         char acct_id[20] = {0};
         char save_title[64] = {0};
         char sfo_title_id[16] = {0};
@@ -917,7 +1172,8 @@ static void handle_request(int sock) {
         int sfo_fd = open(sfo_path, O_RDONLY);
         if (sfo_fd >= 0) {
             uint8_t aid[8];
-            if (pread(sfo_fd, aid, 8, 0x1B8) == 8)
+            int aid_off = sfo_ps4 ? 0x15C : 0x1B8;
+            if (pread(sfo_fd, aid, 8, aid_off) == 8)
                 snprintf(acct_id, sizeof(acct_id), "0x%02X%02X%02X%02X%02X%02X%02X%02X",
                     aid[0],aid[1],aid[2],aid[3],aid[4],aid[5],aid[6],aid[7]);
             char raw_title[0x21] = {0};
@@ -931,7 +1187,7 @@ static void handle_request(int sock) {
                 }
                 save_title[tp] = 0;
             }
-            if (pread(sfo_fd, sfo_title_id, 9, 0xB20) > 0)
+            if (!sfo_ps4 && pread(sfo_fd, sfo_title_id, 9, 0xB20) > 0)
                 sfo_title_id[9] = 0;
             close(sfo_fd);
         }
@@ -1007,7 +1263,6 @@ static void handle_request(int sock) {
         int hlen = snprintf(hdr, sizeof(hdr),
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/zip\r\n"
-            "Content-Disposition: attachment; filename=\"save.zip\"\r\n"
             "Access-Control-Allow-Origin: *\r\n"
             "Connection: close\r\n"
             "\r\n");
@@ -1099,6 +1354,13 @@ static void handle_request(int sock) {
         return;
     }
 
+    /* GET /api/log */
+    if (strcmp(method, "GET") == 0 && strcmp(url, "/api/log") == 0) {
+        g_logbuf[g_logpos] = 0;
+        http_send(sock, "200 OK", "text/plain", g_logbuf, g_logpos);
+        return;
+    }
+
     /* GET /api/shutdown */
     if (strcmp(method, "GET") == 0 && strcmp(url, "/api/shutdown") == 0) {
         if (g_mounted) unmount_save();
@@ -1125,8 +1387,41 @@ static void handle_request(int sock) {
         return;
     }
 
-    /* POST /api/decrypt_upload -> upload encrypted .bin, get decrypted .zip */
-    if (strcmp(method, "POST") == 0 && strcmp(url, "/api/decrypt_upload") == 0) {
+    /* POST /api/upload_key -> upload PS4 .bin sealed key for decrypt */
+    if (strcmp(method, "POST") == 0 && strcmp(url, "/api/upload_key") == 0) {
+        size_t clen = 0;
+        char *cl = strcasestr(req, "Content-Length:");
+        if (cl) clen = strtoul(cl + 15, NULL, 10);
+        if (clen == 0 || clen > 4096) {
+            http_json(sock, "{\"error\":\"Invalid key size\"}"); return;
+        }
+        char *body_start = strstr(req, "\r\n\r\n");
+        if (!body_start) { http_json(sock, "{\"error\":\"Bad request\"}"); return; }
+        body_start += 4;
+        size_t body_in_buf = n - (body_start - req);
+        if (body_in_buf > clen) body_in_buf = clen;
+
+        mkdir("/data/save_files", 0777);
+        int fd = open("/data/save_files/_tmp_key.bin", O_CREAT | O_WRONLY | O_TRUNC, 0755);
+        if (fd < 0) { http_json(sock, "{\"error\":\"Cannot create key file\"}"); return; }
+        write(fd, body_start, body_in_buf);
+        size_t received = body_in_buf;
+        while (received < clen) {
+            char *buf = g_iobuf;
+            size_t want = BUF_SIZE < (clen - received) ? BUF_SIZE : (clen - received);
+            ssize_t r = recv_all(sock, buf, want);
+            if (r <= 0) break;
+            write(fd, buf, r);
+            received += r;
+        }
+        close(fd);
+        printf("[GarlicMgr] upload_key: received %zu bytes\n", received);
+        http_json(sock, "{\"ok\":true}");
+        return;
+    }
+
+    /* POST /api/decrypt_upload -> upload encrypted save, get decrypted .zip */
+    if (strcmp(method, "POST") == 0 && strncmp(url, "/api/decrypt_upload", 19) == 0) {
         size_t clen = 0;
         char *cl = strcasestr(req, "Content-Length:");
         if (cl) clen = strtoul(cl + 15, NULL, 10);
@@ -1139,7 +1434,8 @@ static void handle_request(int sock) {
         size_t body_in_buf = n - (body_start - req);
 
         mkdir("/data/save_files", 0777);
-        const char *tmp = "/data/save_files/_tmp_dec";
+        int is_ps4_dec = (strstr(url, "ps4=1") != NULL);
+        const char *tmp = is_ps4_dec ? "/data/save_files/sdimg__tmp_dec" : "/data/save_files/_tmp_dec";
         int fd = open(tmp, O_CREAT | O_WRONLY | O_TRUNC, 0755);
         if (fd < 0) { http_json(sock, "{\"error\":\"Cannot create temp file\"}"); return; }
         if (body_in_buf > clen) body_in_buf = clen;
@@ -1154,7 +1450,11 @@ static void handle_request(int sock) {
             received += r;
         }
         close(fd);
-        printf("[GarlicMgr] decrypt_upload: received %zu bytes\n", received);
+        printf("[GarlicMgr] decrypt_upload: received %zu bytes (ps4=%d)\n", received, is_ps4_dec);
+
+        /* For PS4, rename uploaded key to match the expected .bin path */
+        if (is_ps4_dec)
+            rename("/data/save_files/_tmp_key.bin", "/data/save_files/_tmp_dec.bin");
 
         int ret = mount_by_path(tmp);
         if (ret < 0) {
@@ -1164,18 +1464,9 @@ static void handle_request(int sock) {
             http_json(sock, json); return;
         }
 
-        char hdr[512];
-        int hlen = snprintf(hdr, sizeof(hdr),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/zip\r\n"
-            "Content-Disposition: attachment; filename=\"decrypted.zip\"\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Connection: close\r\n\r\n");
-        send(sock, hdr, hlen, 0);
-        zip_send(sock, g_mount_point);
-
-        unmount_save();
-        unlink(tmp);
+        /* Mount succeeded — return JSON with download URL instead of streaming zip
+         * on the same connection (avoids browser XHR issues with large blob responses) */
+        http_json(sock, "{\"ok\":true,\"download\":\"/api/download\"}");
         return;
     }
 
@@ -1372,16 +1663,13 @@ static void handle_request(int sock) {
         return;
     }
 
-    /* GET /api/resign_download?name=<optional> -> serve the resigned file */
+    /* GET /api/resign_download?name=<optional>&ps4=1 -> serve the resigned file */
     if (strcmp(method, "GET") == 0 && strncmp(url, "/api/resign_download", 20) == 0) {
-        const char *tmp = "/data/save_files/_tmp_resign";
+        int is_ps4 = (strstr(url, "ps4=1") != NULL);
+        const char *tmp = is_ps4 ? "/data/save_files/sdimg__tmp_resign" : "/data/save_files/_tmp_resign";
         struct stat rst;
         if (stat(tmp, &rst) < 0) {
             http_json(sock, "{\"error\":\"No resigned file\"}"); return;
-        }
-        int fd = open(tmp, O_RDONLY);
-        if (fd < 0) {
-            http_json(sock, "{\"error\":\"Cannot read file\"}"); return;
         }
         char dlname[512] = "resigned_save";
         char *np = strstr(url, "name=");
@@ -1398,21 +1686,54 @@ static void handle_request(int sock) {
             }
             *w = 0;
         }
-        char hdr[1024];
-        int hlen = snprintf(hdr, sizeof(hdr),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/octet-stream\r\n"
-            "Content-Disposition: attachment; filename=\"%s\"\r\n"
-            "Content-Length: %lld\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Connection: close\r\n\r\n", dlname, (long long)rst.st_size);
-        send(sock, hdr, hlen, 0);
-        char *buf = g_iobuf;
-        ssize_t nr;
-        while ((nr = read(fd, buf, BUF_SIZE)) > 0)
-            send(sock, buf, nr, 0);
-        close(fd);
-        unlink(tmp);
+
+        if (is_ps4) {
+            /* PS4: zip both sdimg_ image and .bin key */
+            const char *bin_tmp = "/data/save_files/_tmp_resign.bin";
+            char img_name[512], key_name[512], zip_name[512];
+            /* Strip sdimg_ prefix from dlname if present for key naming */
+            const char *base = dlname;
+            if (strncmp(base, "sdimg_", 6) == 0) base += 6;
+            snprintf(img_name, sizeof(img_name), "sdimg_%s", base);
+            snprintf(key_name, sizeof(key_name), "%s.bin", base);
+            snprintf(zip_name, sizeof(zip_name), "%s.zip", base);
+
+            zip_file_t zfiles[2] = {
+                { tmp,     img_name },
+                { bin_tmp, key_name }
+            };
+            char hdr[1024];
+            int hlen = snprintf(hdr, sizeof(hdr),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/zip\r\n"
+                "Content-Disposition: attachment; filename=\"%s\"\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Connection: close\r\n\r\n", zip_name);
+            send(sock, hdr, hlen, 0);
+            zip_send_files(sock, zfiles, 2);
+            unlink(tmp);
+            unlink(bin_tmp);
+        } else {
+            int fd = open(tmp, O_RDONLY);
+            if (fd < 0) {
+                http_json(sock, "{\"error\":\"Cannot read file\"}"); return;
+            }
+            char hdr[1024];
+            int hlen = snprintf(hdr, sizeof(hdr),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/octet-stream\r\n"
+                "Content-Disposition: attachment; filename=\"%s\"\r\n"
+                "Content-Length: %lld\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Connection: close\r\n\r\n", dlname, (long long)rst.st_size);
+            send(sock, hdr, hlen, 0);
+            char *buf = g_iobuf;
+            ssize_t nr;
+            while ((nr = read(fd, buf, BUF_SIZE)) > 0)
+                send(sock, buf, nr, 0);
+            close(fd);
+            unlink(tmp);
+        }
         return;
     }
 
@@ -1525,10 +1846,13 @@ static void handle_request(int sock) {
         return;
     }
 
-    /* GET /api/create_pfs?size=<bytes> -> create fresh PFS image, mount it */
+    /* GET /api/create_pfs?size=<bytes>&ps4=1 -> create fresh PFS image, mount it */
     if (strcmp(method, "GET") == 0 && strncmp(url, "/api/create_pfs", 15) == 0) {
         if (g_mounted) unmount_save();
         kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
+
+        int is_ps4 = (strstr(url, "ps4=1") != NULL);
+        g_enc_ps4 = is_ps4;
 
         /* Parse optional size (default 256MB) */
         uint64_t img_size = 256 * 1024 * 1024;
@@ -1548,6 +1872,56 @@ static void handle_request(int sock) {
         const char *tmp = "/data/save_files/_tmp_enc";
         unlink(tmp);
 
+        uint8_t ckey[0x20] = {0};
+
+        if (is_ps4) {
+            /* PS4: generate sealed key, decrypt it, use non-Ppr create */
+            uint8_t *kbuf = malloc(0x100);
+            if (!kbuf) { http_json(sock, "{\"error\":\"Out of memory\"}"); return; }
+            memset(kbuf, 0, 0x100);
+
+            /* Try sbl_srv first, then pfsmgr for sealed key generation */
+            int gen_ok = 0;
+            int kfd = open("/dev/sbl_srv", O_RDWR);
+            if (kfd >= 0) {
+                if (ioctl(kfd, 0x40845303, kbuf) >= 0) gen_ok = 1;
+                close(kfd);
+            }
+            if (!gen_ok) {
+                memset(kbuf, 0, 0x100);
+                kfd = open("/dev/pfsmgr", O_RDWR);
+                if (kfd >= 0) {
+                    if (ioctl(kfd, 0x40845303, kbuf) >= 0) gen_ok = 1;
+                    close(kfd);
+                }
+            }
+            if (!gen_ok) {
+                free(kbuf);
+                http_json(sock, "{\"error\":\"Cannot generate sealed key\"}"); return;
+            }
+            memcpy(g_sealed_key, kbuf, 96);
+            printf("[GarlicMgr] create_pfs: PS4 sealed key generated (keyset=%d)\n",
+                   (kbuf[9] << 8) | kbuf[8]);
+
+            /* Decrypt sealed key via pfsmgr */
+            memset(kbuf, 0, 0x100);
+            memcpy(kbuf, g_sealed_key, 96);
+            int pfsmgr = open("/dev/pfsmgr", O_RDWR);
+            if (pfsmgr < 0) {
+                free(kbuf);
+                http_json(sock, "{\"error\":\"Cannot open pfsmgr\"}"); return;
+            }
+            int ret = ioctl(pfsmgr, 0xc0845302, kbuf);
+            close(pfsmgr);
+            if (ret < 0) {
+                free(kbuf);
+                http_json(sock, "{\"error\":\"Cannot decrypt sealed key\"}"); return;
+            }
+            memcpy(ckey, kbuf + 0x60, 0x20);
+            free(kbuf);
+            printf("[GarlicMgr] create_pfs: PS4 sealed key decrypted OK\n");
+        }
+
         int imgfd = open(tmp, O_CREAT | O_TRUNC | O_RDWR, 0777);
         if (imgfd < 0) {
             http_json(sock, "{\"error\":\"Cannot create temp file\"}"); return;
@@ -1566,20 +1940,26 @@ static void handle_request(int sock) {
         CreateOpt copt;
         memset(&copt, 0, sizeof(copt));
         sceFsInitCreatePfsSaveDataOpt(&copt);
-        copt.flags[1] = 0x02;
-        uint8_t ckey[0x20] = {0};
-        if (!g_pprCreate) {
-            unlink(tmp);
-            http_json(sock, "{\"error\":\"PprCreate not available\"}"); return;
+
+        if (is_ps4) {
+            /* PS4: use non-Ppr create with decrypted key */
+            ret = sceFsCreatePfsSaveDataImage(&copt, tmp, 0, img_size, ckey);
+        } else {
+            /* PS5: use PprCreate with zeroed key + compression flag */
+            copt.flags[1] = 0x02;
+            if (!g_pprCreate) {
+                unlink(tmp);
+                http_json(sock, "{\"error\":\"PprCreate not available\"}"); return;
+            }
+            ret = g_pprCreate(&copt, tmp, 0, img_size, ckey);
         }
-        ret = g_pprCreate(&copt, tmp, 0, img_size, ckey);
         if (ret < 0) {
             unlink(tmp);
             char json[128];
             snprintf(json, sizeof(json), "{\"error\":\"Format PFS failed: 0x%x\"}", ret);
             http_json(sock, json); return;
         }
-        printf("[GarlicMgr] create_pfs: formatted OK\n");
+        printf("[GarlicMgr] create_pfs: formatted OK (%s)\n", is_ps4 ? "PS4" : "PS5");
 
         snprintf(g_mount_point, sizeof(g_mount_point), "/data/mount_sd");
         mkdir(g_mount_point, 0777);
@@ -1680,9 +2060,10 @@ static void handle_request(int sock) {
                 snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
                 int sfo_fd = open(sfo_path, O_RDWR);
                 if (sfo_fd >= 0) {
-                    pwrite(sfo_fd, new_aid, 8, 0x1B8);
+                    /* PS4: AID at 0x15C, PS5: AID at 0x1B8 */
+                    pwrite(sfo_fd, new_aid, 8, g_enc_ps4 ? 0x15C : 0x1B8);
                     int local_uid = 0;
-                    if (sceUserServiceGetForegroundUser(&local_uid) == 0) {
+                    if (!g_enc_ps4 && sceUserServiceGetForegroundUser(&local_uid) == 0) {
                         uint32_t uid = (uint32_t)local_uid;
                         pwrite(sfo_fd, &uid, 4, 0x660);
                         printf("[GarlicMgr] download_new: patched user_id to 0x%x\n", uid);
@@ -1699,15 +2080,21 @@ static void handle_request(int sock) {
         snprintf(tmp_path, sizeof(tmp_path), "%s", g_mounted_path);
         unmount_save();
 
+        /* For PS4: write sealed key .bin companion file */
+        if (g_enc_ps4) {
+            const char *bin_tmp = "/data/save_files/_tmp_enc.bin";
+            int bfd = open(bin_tmp, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+            if (bfd >= 0) {
+                write(bfd, g_sealed_key, 96);
+                close(bfd);
+                printf("[GarlicMgr] download_new: wrote .bin sealed key\n");
+            }
+        }
+
         struct stat st;
         if (stat(tmp_path, &st) < 0) {
             unlink(tmp_path);
             http_json(sock, "{\"error\":\"File not found\"}"); return;
-        }
-        int fd = open(tmp_path, O_RDONLY);
-        if (fd < 0) {
-            unlink(tmp_path);
-            http_json(sock, "{\"error\":\"Cannot read file\"}"); return;
         }
         char dlname[512] = "new_save";
         char *np = strstr(url, "name=");
@@ -1724,26 +2111,60 @@ static void handle_request(int sock) {
             }
             *w = 0;
         }
-        char hdr[1024];
-        int hlen = snprintf(hdr, sizeof(hdr),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/octet-stream\r\n"
-            "Content-Disposition: attachment; filename=\"%s\"\r\n"
-            "Content-Length: %lld\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Connection: close\r\n\r\n", dlname, (long long)st.st_size);
-        send(sock, hdr, hlen, 0);
-        char *buf = g_iobuf;
-        ssize_t nr;
-        while ((nr = read(fd, buf, BUF_SIZE)) > 0)
-            send(sock, buf, nr, 0);
-        close(fd);
-        unlink(tmp_path);
+
+        if (g_enc_ps4) {
+            /* PS4: zip both sdimg_ image and .bin key together */
+            const char *bin_tmp = "/data/save_files/_tmp_enc.bin";
+            char img_name[512], key_name[512], zip_name[512];
+            snprintf(img_name, sizeof(img_name), "sdimg_%s", dlname);
+            snprintf(key_name, sizeof(key_name), "%s.bin", dlname);
+            snprintf(zip_name, sizeof(zip_name), "%s_ps4.zip", dlname);
+
+            zip_file_t zfiles[2] = {
+                { tmp_path, img_name },
+                { bin_tmp,  key_name }
+            };
+            char hdr[1024];
+            int hlen = snprintf(hdr, sizeof(hdr),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/zip\r\n"
+                "Content-Disposition: attachment; filename=\"%s\"\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Connection: close\r\n\r\n", zip_name);
+            send(sock, hdr, hlen, 0);
+            zip_send_files(sock, zfiles, 2);
+            unlink(tmp_path);
+            unlink(bin_tmp);
+        } else {
+            /* PS5: stream raw image */
+            int fd = open(tmp_path, O_RDONLY);
+            if (fd < 0) {
+                unlink(tmp_path);
+                http_json(sock, "{\"error\":\"Cannot read file\"}"); return;
+            }
+            char hdr[1024];
+            int hlen = snprintf(hdr, sizeof(hdr),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/octet-stream\r\n"
+                "Content-Disposition: attachment; filename=\"%s\"\r\n"
+                "Content-Length: %lld\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Connection: close\r\n\r\n", dlname, (long long)st.st_size);
+            send(sock, hdr, hlen, 0);
+            char *buf = g_iobuf;
+            ssize_t nr;
+            while ((nr = read(fd, buf, BUF_SIZE)) > 0)
+                send(sock, buf, nr, 0);
+            close(fd);
+            unlink(tmp_path);
+        }
         return;
     }
 
-    /* POST /api/resign?aid=<hex> -> upload encrypted, change account id, download */
+    /* POST /api/resign?aid=<hex>&ps4=1 -> upload encrypted, change account id, download */
     if (strcmp(method, "POST") == 0 && strncmp(url, "/api/resign", 11) == 0) {
+        int is_ps4 = (strstr(url, "ps4=1") != NULL);
+
         /* Parse account ID from query string */
         char aid_hex[64] = {0};
         char *ap = strstr(url, "aid=");
@@ -1787,6 +2208,8 @@ static void handle_request(int sock) {
 
         mkdir("/data/save_files", 0777);
         const char *tmp = "/data/save_files/_tmp_resign";
+        /* PS4: name as sdimg_ so mount_by_path detects it */
+        if (is_ps4) tmp = "/data/save_files/sdimg__tmp_resign";
         int fd = open(tmp, O_CREAT | O_WRONLY | O_TRUNC, 0755);
         if (fd < 0) { http_json(sock, "{\"error\":\"Cannot create temp file\"}"); return; }
         if (body_in_buf > clen) body_in_buf = clen;
@@ -1801,64 +2224,77 @@ static void handle_request(int sock) {
             received += r;
         }
         close(fd);
-        printf("[GarlicMgr] resign: received %zu bytes\n", received);
+        printf("[GarlicMgr] resign: received %zu bytes (ps4=%d)\n", received, is_ps4);
+
+        /* For PS4: rename uploaded .bin key to match image name */
+        if (is_ps4) {
+            rename("/data/save_files/_tmp_key.bin", "/data/save_files/_tmp_resign.bin");
+        }
 
         /* Mount the save */
         int ret = mount_by_path(tmp);
         if (ret < 0) {
             unlink(tmp);
+            if (is_ps4) unlink("/data/save_files/_tmp_resign.bin");
             char json[128];
             snprintf(json, sizeof(json), "{\"error\":\"Mount failed: %d\"}", ret);
             http_json(sock, json); return;
         }
 
-        /* Patch account ID in param.sfo at offset 0x1B8 */
+        /* Patch account ID in param.sfo */
         char sfo_path[MAX_PATH_LEN];
         snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
         int sfo_fd = open(sfo_path, O_RDWR);
         if (sfo_fd < 0) {
             unmount_save(); unlink(tmp);
+            if (is_ps4) unlink("/data/save_files/_tmp_resign.bin");
             http_json(sock, "{\"error\":\"Cannot open param.sfo\"}"); return;
         }
-        if (pwrite(sfo_fd, new_aid, 8, 0x1B8) != 8) {
+        /* PS4: AID at 0x15C, PS5: AID at 0x1B8 */
+        off_t aid_offset = is_ps4 ? 0x15C : 0x1B8;
+        if (pwrite(sfo_fd, new_aid, 8, aid_offset) != 8) {
             close(sfo_fd); unmount_save(); unlink(tmp);
+            if (is_ps4) unlink("/data/save_files/_tmp_resign.bin");
             http_json(sock, "{\"error\":\"Failed to write account ID\"}"); return;
         }
-        /* Patch user_id (uint32_t) at offset 0x660 */
-        char *up = strstr(url, "uid=");
-        uint32_t uid = 0;
-        int have_uid = 0;
-        if (up) {
-            char uid_hex[16] = {0};
-            strncpy(uid_hex, up + 4, sizeof(uid_hex) - 1);
-            char *rp2 = uid_hex, *wp2 = uid_hex;
-            while (*rp2 && *rp2 != '&') {
-                if (*rp2 == '%' && rp2[1] && rp2[2]) {
-                    char hx[3] = {rp2[1], rp2[2], 0};
-                    *wp2++ = (char)strtol(hx, NULL, 16);
-                    rp2 += 3;
-                } else { *wp2++ = *rp2++; }
-            }
-            *wp2 = 0;
-            char *us = uid_hex;
-            if (us[0] == '0' && (us[1] == 'x' || us[1] == 'X')) us += 2;
-            uid = (uint32_t)strtoul(us, NULL, 16);
-            have_uid = 1;
-        }
-        if (!have_uid) {
-            int local_uid = 0;
-            if (sceUserServiceGetForegroundUser(&local_uid) == 0) {
-                uid = (uint32_t)local_uid;
+
+        if (!is_ps4) {
+            /* PS5 only: patch user_id (uint32_t) at offset 0x660 */
+            char *up = strstr(url, "uid=");
+            uint32_t uid = 0;
+            int have_uid = 0;
+            if (up) {
+                char uid_hex[16] = {0};
+                strncpy(uid_hex, up + 4, sizeof(uid_hex) - 1);
+                char *rp2 = uid_hex, *wp2 = uid_hex;
+                while (*rp2 && *rp2 != '&') {
+                    if (*rp2 == '%' && rp2[1] && rp2[2]) {
+                        char hx[3] = {rp2[1], rp2[2], 0};
+                        *wp2++ = (char)strtol(hx, NULL, 16);
+                        rp2 += 3;
+                    } else { *wp2++ = *rp2++; }
+                }
+                *wp2 = 0;
+                char *us = uid_hex;
+                if (us[0] == '0' && (us[1] == 'x' || us[1] == 'X')) us += 2;
+                uid = (uint32_t)strtoul(us, NULL, 16);
                 have_uid = 1;
             }
-        }
-        if (have_uid) {
-            pwrite(sfo_fd, &uid, 4, 0x660);
-            printf("[GarlicMgr] resign: patched user_id to 0x%x\n", uid);
+            if (!have_uid) {
+                int local_uid = 0;
+                if (sceUserServiceGetForegroundUser(&local_uid) == 0) {
+                    uid = (uint32_t)local_uid;
+                    have_uid = 1;
+                }
+            }
+            if (have_uid) {
+                pwrite(sfo_fd, &uid, 4, 0x660);
+                printf("[GarlicMgr] resign: patched user_id to 0x%x\n", uid);
+            }
         }
         close(sfo_fd);
         sync();
-        printf("[GarlicMgr] resign: patched account ID to %s\n", aid_hex);
+        printf("[GarlicMgr] resign: patched account ID to %s (%s)\n", aid_hex, is_ps4 ? "PS4" : "PS5");
 
         /* Unmount (re-encrypts) */
         unmount_save();
@@ -1867,10 +2303,12 @@ static void handle_request(int sock) {
         struct stat st;
         if (stat(tmp, &st) < 0) {
             unlink(tmp);
+            if (is_ps4) unlink("/data/save_files/_tmp_resign.bin");
             http_json(sock, "{\"error\":\"Resigned file not found\"}"); return;
         }
         char json[128];
-        snprintf(json, sizeof(json), "{\"ok\":true,\"size\":%lld}", (long long)st.st_size);
+        snprintf(json, sizeof(json), "{\"ok\":true,\"size\":%lld,\"ps4\":%s}",
+                 (long long)st.st_size, is_ps4 ? "true" : "false");
         http_json(sock, json);
         return;
     }

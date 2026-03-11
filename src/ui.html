@@ -100,6 +100,9 @@
       font-size: 11px; color: var(--dm); margin-top: 2px;
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
+    .badge { display:inline-block; font-size:9px; font-weight:700; padding:1px 5px; border-radius:3px; float:right; margin-left:6px }
+    .badge-ps4 { background:#1e6fbf; color:#fff }
+    .badge-ps5 { background:#1a8a3f; color:#fff }
 
     /* ── Right panel ─────────────────────────────────── */
     .right { flex: 1; display: flex; flex-direction: column; overflow: hidden }
@@ -307,11 +310,13 @@ function upload(url, file, onProgress, respType) {
     xhr.open('POST', url);
     xhr.setRequestHeader('Content-Type', 'application/octet-stream');
     if (respType) xhr.responseType = respType;
+    xhr.timeout = 300000; /* 5 min timeout for large saves */
     xhr.upload.onprogress = e => {
       if (e.lengthComputable && onProgress) onProgress(e.loaded, e.total);
     };
     xhr.onload = () => resolve(xhr);
     xhr.onerror = () => reject(new Error('Network error'));
+    xhr.ontimeout = () => reject(new Error('Timeout'));
     xhr.send(file);
   });
 }
@@ -468,16 +473,18 @@ function renderL() {
 
   let h = '';
   groups.forEach(g => {
+    const gtype = S[g.items[0]].type || 'ps5';
+    const badge = '<span class="badge badge-' + gtype + '">' + gtype.toUpperCase() + '</span>';
     if (g.items.length === 1) {
       const i = g.items[0], s = S[i];
       h += '<div class="sv' + (i === si ? ' sel' : '') + '" onclick="sel(' + i + ')">';
-      h += '<div class="tid">' + esc(g.name) + '</div>';
+      h += '<div class="tid">' + badge + esc(g.name) + '</div>';
       h += '<div class="sn">' + esc(s.save_name) + '</div></div>';
     } else {
       const open = exG.has(g.title_id);
       const anySel = g.items.includes(si);
       h += '<div class="sv' + (anySel ? ' sel' : '') + '" onclick="togG(\'' + esc(g.title_id) + '\')" style="cursor:pointer">';
-      h += '<div class="tid">' + (open ? '\u25BE ' : '\u25B8 ') + esc(g.name) + '</div>';
+      h += '<div class="tid">' + badge + (open ? '\u25BE ' : '\u25B8 ') + esc(g.name) + '</div>';
       h += '<div class="sn">' + g.items.length + ' saves</div></div>';
       if (open) {
         g.items.forEach(i => {
@@ -505,16 +512,22 @@ function renderCt() {
     c.innerHTML =
       '<div class="drop" id="dz">'
       + '<div class="dlbl">Drag & drop encrypted save file</div>'
+      + '<div style="font-size:11px;color:var(--dm);margin:6px 0">PS4: drop save image + .bin key together</div>'
       + '<button class="bbtn">Browse Files</button></div>';
     setupDZ('dz', decDrop);
 
   } else if (tab === 'encrypt') {
     c.className = 'ct ctr';
     c.innerHTML =
-      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:16px">'
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">'
       + '<label style="font-size:12px;color:var(--dm);font-weight:600;text-transform:uppercase;letter-spacing:.5px">Account ID:</label>'
       + '<input id="eaid" type="text" maxlength="16" placeholder="optional" '
       + 'style="background:var(--bg);border:1px solid var(--bd);color:var(--tx);padding:6px 10px;border-radius:8px;font-family:monospace;font-size:13px;width:170px">'
+      + '</div>'
+      + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:16px">'
+      + '<label style="cursor:pointer;display:flex;align-items:center;gap:6px;font-size:12px;color:var(--dm);font-weight:600;text-transform:uppercase;letter-spacing:.5px">'
+      + '<input id="eps4" type="checkbox" style="accent-color:#1e6fbf;width:16px;height:16px"> PS4 Save'
+      + '</label>'
       + '</div>'
       + '<div class="drop" id="dz">'
       + '<div class="dlbl">Drag & drop a <b>folder</b> to encrypt into a save</div>'
@@ -536,6 +549,7 @@ function renderCt() {
       + '</div>'
       + '<div class="drop" id="dz">'
       + '<div class="dlbl">Drag & drop encrypted save to resign</div>'
+      + '<div style="font-size:11px;color:var(--dm);margin:6px 0">PS4: drop save image + .bin key together</div>'
       + '<button class="bbtn">Browse Files</button></div>';
     setupDZ('dz', resignDrop);
 
@@ -586,29 +600,48 @@ async function sel(i) {
 
 /* ── Decrypt drop ──────────────────────────────────── */
 async function decDrop(files) {
-  const file = files[0];
-  if (bsy || !file) return;
+  if (bsy || !files.length) return;
+  /* Check first byte to detect PS4 (0x01) vs PS5 (0x02) */
+  const imgFile = files[0];
+  const hdr = new Uint8Array(await imgFile.slice(0, 1).arrayBuffer());
+  const isPS4 = (hdr[0] === 0x01);
+
+  let binFile = null;
+  if (isPS4) {
+    /* Look for .bin in the dropped files */
+    for (let i = 1; i < files.length; i++) {
+      if (files[i].name.endsWith('.bin')) { binFile = files[i]; break; }
+    }
+    if (!binFile) {
+      log('PS4 save detected — please drop both the save image and its .bin sealed key file together', 'err');
+      return;
+    }
+  }
+
   bsy = true;
   $('ct').innerHTML = '<div class="drop"><div class="dlbl">Uploading for decrypt...</div></div>';
   try {
-    log('Uploading ' + file.name + ' (' + fmtB(file.size) + ')...');
-    const xhr = await upload('/api/decrypt_upload', file, (loaded, total) => {
+    /* For PS4, upload .bin key first */
+    if (isPS4 && binFile) {
+      log('Uploading PS4 sealed key ' + binFile.name + '...');
+      const kxhr = await upload('/api/upload_key', binFile);
+      if (kxhr.status !== 200) throw new Error('Failed to upload .bin key');
+    }
+    log('Uploading ' + imgFile.name + ' (' + fmtB(imgFile.size) + ')...');
+    const xhr = await upload('/api/decrypt_upload' + (isPS4 ? '?ps4=1' : ''), imgFile, (loaded, total) => {
       const pct = Math.round(loaded * 100 / total);
       showProgress(pct, loaded, total);
-    }, 'blob');
+    });
     if (xhr.status !== 200) {
-      const text = await xhr.response.text();
-      const d = JSON.parse(text);
+      const d = JSON.parse(xhr.responseText);
       throw new Error(d.error || 'Failed');
     }
-    $('ct').innerHTML = '<div class="drop"><div class="dlbl">Decrypting...</div></div>';
-    const blob = xhr.response;
-    const name = file.name.replace(/\.[^.]+$/, '') + '.zip';
-    const url = URL.createObjectURL(blob);
-    log('Decrypted ' + fmtB(blob.size), 'ok');
+    log('Mounted — click Download to save decrypted files', 'ok');
+    const name = imgFile.name.replace(/\.[^.]+$/, '') + '.zip';
     $('ct').innerHTML =
-      '<div class="drop"><div class="dlbl">' + esc(name) + '<br>' + fmtB(blob.size) + '</div>'
-      + '<a class="dlnk" href="' + url + '" download="' + esc(name) + '">Download .zip</a></div>';
+      '<div class="drop"><div class="dlbl">Decrypted successfully!</div>'
+      + '<a class="dlnk" href="/api/download" download="' + esc(name) + '">Download .zip</a>'
+      + '<br><button class="bbtn" style="margin-top:12px" onclick="fetch(\'/api/unmount\');renderCt()">Done</button></div>';
   } catch (e) {
     log('Error: ' + e.message, 'err');
     renderCt();
@@ -620,6 +653,7 @@ async function decDrop(files) {
 async function encDrop(files, folderName) {
   if (bsy || !files || !files.length) return;
   const aidv = document.getElementById('eaid') ? document.getElementById('eaid').value.trim() : '';
+  const isPS4 = document.getElementById('eps4') ? document.getElementById('eps4').checked : false;
   bsy = true;
 
   try {
@@ -628,9 +662,9 @@ async function encDrop(files, folderName) {
     for (const f of files) totalSize += f.size;
 
     /* Step 1: create fresh PFS image and mount it */
-    log('Creating PFS image (' + fmtB(totalSize) + ' of files)...');
+    log('Creating ' + (isPS4 ? 'PS4' : 'PS5') + ' PFS image (' + fmtB(totalSize) + ' of files)...');
     $('ct').innerHTML = '<div class="drop"><div class="dlbl">Creating PFS image...</div></div>';
-    let r = await fetch('/api/create_pfs?size=' + totalSize);
+    let r = await fetch('/api/create_pfs?size=' + totalSize + (isPS4 ? '&ps4=1' : ''));
     let d = await r.json();
     if (d.error) throw new Error(d.error);
     log('PFS image created and mounted', 'ok');
@@ -663,12 +697,21 @@ async function encDrop(files, folderName) {
     let dlUrl = '/api/download_new?name=' + encodeURIComponent(name);
     if (aidv) dlUrl += '&aid=' + encodeURIComponent(aidv);
     const a = document.createElement('a');
-    a.href = dlUrl; a.download = name;
+    a.href = dlUrl;
+    a.download = isPS4 ? (name + '_ps4.zip') : name;
     document.body.appendChild(a); a.click(); a.remove();
     log('Encrypted save download started', 'ok');
-    $('ct').innerHTML =
-      '<div class="drop"><div class="dlbl">' + esc(name) + '</div>'
-      + '<div style="color:#0f0">Download started</div></div>';
+
+    if (isPS4) {
+      $('ct').innerHTML =
+        '<div class="drop"><div class="dlbl">PS4 Save: <b>sdimg_' + esc(name) + '</b> + <b>' + esc(name) + '.bin</b></div>'
+        + '<div style="color:#0f0">Download started (.zip)</div>'
+        + '<div style="font-size:11px;color:var(--dm);margin-top:8px">Extract and place both files in the same directory on PS5</div></div>';
+    } else {
+      $('ct').innerHTML =
+        '<div class="drop"><div class="dlbl">' + esc(name) + '</div>'
+        + '<div style="color:#0f0">Download started</div></div>';
+    }
   } catch (e) {
     log('Error: ' + e.message, 'err');
     renderCt();
@@ -678,31 +721,56 @@ async function encDrop(files, folderName) {
 
 /* ── Resign drop ───────────────────────────────────── */
 async function resignDrop(files) {
-  const file = files[0];
-  if (bsy || !file) return;
+  if (bsy || !files.length) return;
   const aidv = document.getElementById('raid').value.trim();
   if (!aidv) { log('Enter new Account ID first', 'err'); return }
+
+  /* Find image file (largest non-.bin) and detect PS4 */
+  let imgFile = null, binFile = null;
+  for (let i = 0; i < files.length; i++) {
+    if (files[i].name.endsWith('.bin')) binFile = files[i];
+    else if (!imgFile || files[i].size > imgFile.size) imgFile = files[i];
+  }
+  if (!imgFile) return;
+
+  const hdr = new Uint8Array(await imgFile.slice(0, 1).arrayBuffer());
+  const isPS4 = (hdr[0] === 0x01);
+
+  if (isPS4 && !binFile) {
+    log('PS4 save detected — please drop both the save image and its .bin sealed key file together', 'err');
+    return;
+  }
+
   bsy = true;
   $('ct').innerHTML = '<div class="drop"><div class="dlbl">Uploading for resign...</div></div>';
   try {
+    /* For PS4, upload .bin key first */
+    if (isPS4 && binFile) {
+      log('Uploading PS4 sealed key ' + binFile.name + '...');
+      const kxhr = await upload('/api/upload_key', binFile);
+      if (kxhr.status !== 200) throw new Error('Failed to upload .bin key');
+    }
+
     const uidv = document.getElementById('ruid') ? document.getElementById('ruid').value.trim() : '';
-    log('Uploading ' + file.name + ' (' + fmtB(file.size) + ') for resign...');
+    log('Uploading ' + imgFile.name + ' (' + fmtB(imgFile.size) + ') for resign...');
     let rurl = '/api/resign?aid=' + encodeURIComponent(aidv);
+    if (isPS4) rurl += '&ps4=1';
     if (uidv) rurl += '&uid=' + encodeURIComponent(uidv);
-    const xhr = await upload(rurl, file, (loaded, total) => {
+    const xhr = await upload(rurl, imgFile, (loaded, total) => {
       const pct = Math.round(loaded * 100 / total);
       showProgress(pct, loaded, total);
     });
     const d = JSON.parse(xhr.responseText);
     if (d.error) throw new Error(d.error);
     log('Resigned ' + fmtB(d.size) + ', starting download...', 'ok');
-    const name = file.name.replace(/\.[^.]+$/, '') + '_resigned';
+    const name = imgFile.name.replace(/\.[^.]+$/, '') + '_resigned';
     const a = document.createElement('a');
-    a.href = '/api/resign_download?name=' + encodeURIComponent(name); a.download = name;
+    a.href = '/api/resign_download?name=' + encodeURIComponent(name) + (isPS4 ? '&ps4=1' : '');
+    a.download = isPS4 ? (name + '.zip') : name;
     document.body.appendChild(a); a.click(); a.remove();
     $('ct').innerHTML =
       '<div class="drop"><div class="dlbl">' + esc(name) + '<br>' + fmtB(d.size) + '</div>'
-      + '<div style="color:#0f0">Download started</div></div>';
+      + '<div style="color:#0f0">Download started' + (isPS4 ? ' (.zip)' : '') + '</div></div>';
   } catch (e) {
     log('Error: ' + e.message, 'err');
     renderCt();
