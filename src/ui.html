@@ -1008,9 +1008,11 @@ async function dlBin() {
     log('Unmounting to finalize...');
     await fetch('/api/unmount'); mt = false;
     log('Downloading encrypted save...');
+    const isPS4 = s.type === 'ps4';
     const r = await fetch('/api/download_raw?idx=' + si);
     const b = await r.blob();
-    dl(b, s.title_id + '_' + s.save_name);
+    const fname = isPS4 ? (s.title_id + '_' + s.save_name + '.zip') : (s.title_id + '_' + s.save_name);
+    dl(b, fname);
     log('Downloaded ' + fmtB(b.size), 'ok');
     si = -1; renderL(); renderTB(); renderCt();
   } catch (e) {

@@ -1295,26 +1295,63 @@ static void handle_request(int sock) {
             http_json(sock, "{\"error\":\"File not found\"}");
             return;
         }
-        int fd = open(s->path, O_RDONLY);
-        if (fd < 0) {
-            http_json(sock, "{\"error\":\"Cannot open file\"}");
-            return;
+
+        if (s->is_ps4 && strncmp(s->save_name, "sdimg_", 6) == 0) {
+            /* PS4: zip the save image + .bin sealed key together */
+            const char *savename = s->save_name + 6;
+            char dir[MAX_PATH_LEN];
+            strncpy(dir, s->path, sizeof(dir) - 1);
+            dir[sizeof(dir) - 1] = 0;
+            char *sl = strrchr(dir, '/');
+            if (sl) *(sl + 1) = 0;
+            char bin_path[MAX_PATH_LEN];
+            snprintf(bin_path, sizeof(bin_path), "%s%s.bin", dir, savename);
+
+            char zip_name[512];
+            snprintf(zip_name, sizeof(zip_name), "%s_%s.zip", s->title_id, savename);
+            char key_name[256];
+            snprintf(key_name, sizeof(key_name), "%s.bin", savename);
+
+            zip_file_t zfiles[2] = {
+                { s->path, s->save_name },
+                { bin_path, key_name }
+            };
+            /* Check if .bin exists; if not, just send 1 file */
+            int nfiles = (stat(bin_path, &st) == 0) ? 2 : 1;
+
+            char hdr[512];
+            int hlen = snprintf(hdr, sizeof(hdr),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/zip\r\n"
+                "Content-Disposition: attachment; filename=\"%s\"\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Connection: close\r\n"
+                "\r\n", zip_name);
+            send(sock, hdr, hlen, 0);
+            zip_send_files(sock, zfiles, nfiles);
+        } else {
+            /* PS5: stream raw image */
+            int fd = open(s->path, O_RDONLY);
+            if (fd < 0) {
+                http_json(sock, "{\"error\":\"Cannot open file\"}");
+                return;
+            }
+            char hdr[512];
+            int hlen = snprintf(hdr, sizeof(hdr),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/octet-stream\r\n"
+                "Content-Disposition: attachment; filename=\"%s\"\r\n"
+                "Content-Length: %lld\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Connection: close\r\n"
+                "\r\n", s->save_name, (long long)st.st_size);
+            send(sock, hdr, hlen, 0);
+            char *buf = g_iobuf;
+            ssize_t nr;
+            while ((nr = read(fd, buf, BUF_SIZE)) > 0)
+                send(sock, buf, nr, 0);
+            close(fd);
         }
-        char hdr[512];
-        int hlen = snprintf(hdr, sizeof(hdr),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/octet-stream\r\n"
-            "Content-Disposition: attachment; filename=\"%s\"\r\n"
-            "Content-Length: %lld\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Connection: close\r\n"
-            "\r\n", s->save_name, (long long)st.st_size);
-        send(sock, hdr, hlen, 0);
-        char *buf = g_iobuf;
-        ssize_t nr;
-        while ((nr = read(fd, buf, BUF_SIZE)) > 0)
-            send(sock, buf, nr, 0);
-        close(fd);
         return;
     }
 
