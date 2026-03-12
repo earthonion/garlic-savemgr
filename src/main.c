@@ -2758,6 +2758,243 @@ static void handle_request(int sock) {
         return;
     }
 
+    /* GET /api/export_title?id=<title_id> -> zip all saves for a title */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/export_title", 17) == 0 && url[17] != '_') {
+        char tid[64] = {0};
+        char *tp = strstr(url, "id=");
+        if (tp) {
+            strncpy(tid, tp + 3, sizeof(tid) - 1);
+            char *amp = strchr(tid, '&');
+            if (amp) *amp = 0;
+            /* URL-decode */
+            char *r = tid, *w = tid;
+            while (*r) {
+                if (*r == '%' && r[1] && r[2]) {
+                    char hex[3] = {r[1], r[2], 0};
+                    *w++ = (char)strtol(hex, NULL, 16);
+                    r += 3;
+                } else { *w++ = *r++; }
+            }
+            *w = 0;
+        }
+        if (!tid[0]) { http_json(sock, "{\"error\":\"Missing id\"}"); return; }
+
+        scan_saves();
+        kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
+
+        /* Collect all saves matching this title_id (x2 for PS4 .bin companions) */
+        zip_file_t *zfiles = malloc(g_save_count * 2 * sizeof(zip_file_t));
+        char **names = malloc(g_save_count * 2 * sizeof(char*));
+        char **allocs = malloc(g_save_count * sizeof(char*));
+        int nfiles = 0, nallocs = 0;
+        for (int i = 0; i < g_save_count; i++) {
+            if (strcmp(g_saves[i].title_id, tid) != 0) continue;
+            struct stat fst;
+            if (stat(g_saves[i].path, &fst) < 0) continue;
+            zfiles[nfiles].path = g_saves[i].path;
+            names[nfiles] = malloc(512);
+            snprintf(names[nfiles], 512, "%s/%s", tid, g_saves[i].save_name);
+            zfiles[nfiles].name = names[nfiles];
+
+            /* For PS4 saves, also include .bin key if it exists */
+            if (g_saves[i].is_ps4 && strncmp(g_saves[i].save_name, "sdimg_", 6) == 0) {
+                const char *savename = g_saves[i].save_name + 6;
+                char dir[MAX_PATH_LEN];
+                strncpy(dir, g_saves[i].path, sizeof(dir) - 1);
+                dir[sizeof(dir) - 1] = 0;
+                char *sl = strrchr(dir, '/');
+                if (sl) *(sl + 1) = 0;
+                char *bin_path = malloc(MAX_PATH_LEN);
+                snprintf(bin_path, MAX_PATH_LEN, "%s%s.bin", dir, savename);
+                if (stat(bin_path, &fst) == 0) {
+                    nfiles++;
+                    zfiles[nfiles].path = bin_path;
+                    allocs[nallocs++] = bin_path;
+                    names[nfiles] = malloc(512);
+                    snprintf(names[nfiles], 512, "%s/%s.bin", tid, savename);
+                    zfiles[nfiles].name = names[nfiles];
+                } else {
+                    free(bin_path);
+                }
+            }
+            nfiles++;
+        }
+
+        if (nfiles == 0) {
+            free(zfiles); free(names); free(allocs);
+            http_json(sock, "{\"error\":\"No saves found for this title\"}");
+            return;
+        }
+
+        char zip_name[128];
+        snprintf(zip_name, sizeof(zip_name), "%s_saves.zip", tid);
+        char hdr[512];
+        int hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/zip\r\n"
+            "Content-Disposition: attachment; filename=\"%s\"\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n\r\n", zip_name);
+        send(sock, hdr, hlen, 0);
+        zip_send_files(sock, zfiles, nfiles);
+
+        for (int i = 0; i < nfiles; i++) free(names[i]);
+        for (int i = 0; i < nallocs; i++) free(allocs[i]);
+        free(names); free(zfiles); free(allocs);
+        return;
+    }
+
+    /* GET /api/export_title_dec?id=<title_id> -> mount each save, zip decrypted contents */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/export_title_dec", 21) == 0) {
+        char tid[64] = {0};
+        char *tp = strstr(url, "id=");
+        if (tp) {
+            strncpy(tid, tp + 3, sizeof(tid) - 1);
+            char *amp = strchr(tid, '&');
+            if (amp) *amp = 0;
+            char *r = tid, *w = tid;
+            while (*r) {
+                if (*r == '%' && r[1] && r[2]) {
+                    char hex[3] = {r[1], r[2], 0};
+                    *w++ = (char)strtol(hex, NULL, 16);
+                    r += 3;
+                } else { *w++ = *r++; }
+            }
+            *w = 0;
+        }
+        if (!tid[0]) { http_json(sock, "{\"error\":\"Missing id\"}"); return; }
+
+        scan_saves();
+        kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
+
+        /* Collect indices of saves matching this title */
+        int *indices = malloc(g_save_count * sizeof(int));
+        int nidx = 0;
+        for (int i = 0; i < g_save_count; i++)
+            if (strcmp(g_saves[i].title_id, tid) == 0)
+                indices[nidx++] = i;
+
+        if (nidx == 0) {
+            free(indices);
+            http_json(sock, "{\"error\":\"No saves found for this title\"}");
+            return;
+        }
+
+        /* For each save: mount, collect files into memory, unmount.
+         * Store all entries with save_name/ prefix for the final zip. */
+        typedef struct {
+            char name[512];
+            uint8_t *data;
+            uint32_t size;
+            uint32_t crc;
+            uint32_t offset;
+        } dec_entry_t;
+
+        dec_entry_t *all_entries = malloc(MAX_ZIP_ENTRIES * sizeof(dec_entry_t));
+        int total = 0;
+
+        for (int n = 0; n < nidx && total < MAX_ZIP_ENTRIES; n++) {
+            int idx = indices[n];
+            if (g_mounted) unmount_save();
+
+            int ret = mount_save(idx);
+            if (ret < 0) continue;
+
+            /* Collect file list from mounted save */
+            zip_entry_t *tmp_entries = malloc(MAX_ZIP_ENTRIES * sizeof(zip_entry_t));
+            int tmp_count = 0;
+            collect_files(g_mount_point, "", tmp_entries, &tmp_count);
+
+            const char *sname = g_saves[idx].save_name;
+            for (int f = 0; f < tmp_count && total < MAX_ZIP_ENTRIES; f++) {
+                dec_entry_t *de = &all_entries[total];
+                snprintf(de->name, sizeof(de->name), "%s/%s/%s", tid, sname, tmp_entries[f].name);
+                de->size = tmp_entries[f].size;
+                de->data = NULL;
+
+                char fullpath[MAX_PATH_LEN];
+                snprintf(fullpath, sizeof(fullpath), "%s/%s", g_mount_point, tmp_entries[f].name);
+                if (de->size > 0) {
+                    int fd = open(fullpath, O_RDONLY);
+                    if (fd >= 0) {
+                        de->data = malloc(de->size);
+                        if (de->data) {
+                            ssize_t rd = read(fd, de->data, de->size);
+                            if (rd < (ssize_t)de->size) de->size = rd > 0 ? (uint32_t)rd : 0;
+                        }
+                        close(fd);
+                    }
+                }
+                de->crc = de->data ? calc_crc(de->data, de->size) : 0;
+                total++;
+            }
+            free(tmp_entries);
+            unmount_save();
+        }
+        free(indices);
+
+        /* Stream the combined zip */
+        char zip_name[128];
+        snprintf(zip_name, sizeof(zip_name), "%s_saves_dec.zip", tid);
+        char hdr[512];
+        int hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/zip\r\n"
+            "Content-Disposition: attachment; filename=\"%s\"\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n\r\n", zip_name);
+        send(sock, hdr, hlen, 0);
+
+        uint32_t offset = 0;
+        for (int i = 0; i < total; i++) {
+            dec_entry_t *e = &all_entries[i];
+            e->offset = offset;
+            uint16_t nlen = strlen(e->name);
+
+            uint8_t lh[30]; memset(lh, 0, 30);
+            lh[0]=0x50; lh[1]=0x4b; lh[2]=0x03; lh[3]=0x04;
+            lh[4]=20;
+            memcpy(lh+14, &e->crc, 4);
+            memcpy(lh+18, &e->size, 4);
+            memcpy(lh+22, &e->size, 4);
+            memcpy(lh+26, &nlen, 2);
+            send(sock, lh, 30, 0);
+            send(sock, e->name, nlen, 0);
+            if (e->data) { send(sock, e->data, e->size, 0); free(e->data); }
+            offset += 30 + nlen + e->size;
+        }
+
+        uint32_t cd_offset = offset;
+        for (int i = 0; i < total; i++) {
+            dec_entry_t *e = &all_entries[i];
+            uint16_t nlen = strlen(e->name);
+            uint8_t cd[46]; memset(cd, 0, 46);
+            cd[0]=0x50; cd[1]=0x4b; cd[2]=0x01; cd[3]=0x02;
+            cd[4]=20; cd[6]=20;
+            memcpy(cd+16, &e->crc, 4);
+            memcpy(cd+20, &e->size, 4);
+            memcpy(cd+24, &e->size, 4);
+            memcpy(cd+28, &nlen, 2);
+            memcpy(cd+42, &e->offset, 4);
+            send(sock, cd, 46, 0);
+            send(sock, e->name, nlen, 0);
+            offset += 46 + nlen;
+        }
+        uint32_t cd_size = offset - cd_offset;
+
+        uint8_t ecd[22]; memset(ecd, 0, 22);
+        ecd[0]=0x50; ecd[1]=0x4b; ecd[2]=0x05; ecd[3]=0x06;
+        uint16_t cnt16 = (uint16_t)total;
+        memcpy(ecd+8, &cnt16, 2);
+        memcpy(ecd+10, &cnt16, 2);
+        memcpy(ecd+12, &cd_size, 4);
+        memcpy(ecd+16, &cd_offset, 4);
+        send(sock, ecd, 22, 0);
+
+        free(all_entries);
+        return;
+    }
+
     /* 404 */
     http_send(sock, "404 Not Found", "application/json", "{\"error\":\"Not found\"}", 20);
 }

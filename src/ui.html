@@ -163,12 +163,19 @@
     .fi.dir { color: var(--ac2); font-weight: 600; cursor: pointer }
     .fi .sz { color: var(--dm); font-size: 12px; margin-left: auto }
     .dir-dots {
-      color: var(--dm); font-size: 14px;
+      color: var(--dm); font-size: 18px;
       cursor: pointer; padding: 0 4px; margin-left: 6px;
       opacity: .3; transition: opacity .15s; border-radius: 4px;
     }
     .fi.dir:hover .dir-dots { opacity: .7 }
     .dir-dots:hover { opacity: 1 !important; color: var(--tx); background: rgba(255,255,255,.05) }
+    .title-dots {
+      color: var(--dm); font-size: 18px;
+      cursor: pointer; padding: 0 4px; margin-left: 6px;
+      opacity: .3; transition: opacity .15s; border-radius: 4px;
+    }
+    .sv:hover .title-dots { opacity: .7 }
+    .title-dots:hover { opacity: 1 !important; color: var(--tx); background: rgba(255,255,255,.05) }
 
     .empty { padding: 40px; text-align: center; color: var(--dm); font-size: 12px; letter-spacing: .3px }
     .dh { padding: 16px; text-align: center; color: var(--dm); font-size: 11px; opacity: .4; margin-top: auto }
@@ -619,17 +626,18 @@ function renderL() {
   groups.forEach(g => {
     const gtype = S[g.items[0]].type || 'ps5';
     const badge = '<span class="badge badge-' + gtype + '">' + gtype.toUpperCase() + '</span>';
+    const tdots = '<span class="title-dots" onclick="event.stopPropagation();showTitleMenu(event,\'' + esc(g.title_id).replace(/'/g, "\\'") + '\')">\u22EE</span>';
     if (g.items.length === 1) {
       const i = g.items[0], s = S[i];
       const bu = s.backup ? '<span class="badge badge-bu">BACKUP</span>' : '';
       h += '<div class="sv' + (i === si ? ' sel' : '') + '" onclick="sel(' + i + ')">';
-      h += '<div class="tid">' + bu + badge + esc(g.name) + '</div>';
+      h += '<div class="tid">' + bu + badge + esc(g.name) + tdots + '</div>';
       h += '<div class="sn">' + esc(s.save_name) + '</div></div>';
     } else {
       const open = exG.has(g.title_id);
       const anySel = g.items.includes(si);
       h += '<div class="sv' + (anySel ? ' sel' : '') + '" onclick="togG(\'' + esc(g.title_id) + '\')" style="cursor:pointer">';
-      h += '<div class="tid">' + badge + (open ? '\u25BE ' : '\u25B8 ') + esc(g.name) + '</div>';
+      h += '<div class="tid">' + badge + (open ? '\u25BE ' : '\u25B8 ') + esc(g.name) + tdots + '</div>';
       h += '<div class="sn">' + g.items.length + ' saves</div></div>';
       if (open) {
         g.items.forEach(i => {
@@ -1136,6 +1144,35 @@ function uploadToDir(dirName) {
     bsy = false;
   };
   i.click();
+}
+
+function showTitleMenu(e, titleId) {
+  e.preventDefault();
+  closeCtxMenu();
+  const m = document.createElement('div');
+  m.className = 'ctx-menu';
+  m.id = 'ctxmenu';
+  const tid = titleId.replace(/'/g, "\\'");
+  m.innerHTML = '<div onclick="exportTitle(\'' + tid + '\')">Export All Saves</div>'
+    + '<div onclick="exportTitleDec(\'' + tid + '\')">Export All Decrypted</div>';
+  m.style.left = e.clientX + 'px';
+  m.style.top = e.clientY + 'px';
+  document.body.appendChild(m);
+  const r = m.getBoundingClientRect();
+  if (r.right > window.innerWidth) m.style.left = (window.innerWidth - r.width - 4) + 'px';
+  if (r.bottom > window.innerHeight) m.style.top = (window.innerHeight - r.height - 4) + 'px';
+}
+
+function exportTitle(titleId) {
+  closeCtxMenu();
+  log('Exporting all saves for ' + titleId + '...');
+  window.location.href = '/api/export_title?id=' + encodeURIComponent(titleId);
+}
+
+function exportTitleDec(titleId) {
+  closeCtxMenu();
+  log('Exporting all decrypted saves for ' + titleId + ' (mount/dump each)...');
+  window.location.href = '/api/export_title_dec?id=' + encodeURIComponent(titleId);
 }
 
 function showCtxMenu(e, fname) {
