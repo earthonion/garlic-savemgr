@@ -641,6 +641,99 @@ static int mount_by_path(const char *path) {
     return ret;
 }
 
+/* ── SFO parser ────────────────────────────────────────────────── */
+typedef struct {
+    char title_id[16];
+    char dir_name[64];
+    char main_title[128];
+    char sub_title[128];
+    char detail[256];
+    char game_title_id[16];
+    uint32_t user_param;
+    uint32_t blocks;
+    uint64_t account_id;
+    uint32_t user_id;
+} sfo_info_t;
+
+static int parse_sfo(const char *path, sfo_info_t *info) {
+    memset(info, 0, sizeof(*info));
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.st_size < 20) { close(fd); return -1; }
+
+    uint8_t *buf = malloc(st.st_size);
+    if (!buf) { close(fd); return -1; }
+    if (read(fd, buf, st.st_size) != st.st_size) { free(buf); close(fd); return -1; }
+    close(fd);
+
+    /* Check magic PSF\0 */
+    if (buf[0] != 0x00 || buf[1] != 0x50 || buf[2] != 0x53 || buf[3] != 0x46) {
+        free(buf); return -1;
+    }
+
+    uint32_t key_off, data_off, n_entries;
+    memcpy(&key_off, buf + 8, 4);
+    memcpy(&data_off, buf + 12, 4);
+    memcpy(&n_entries, buf + 16, 4);
+
+    for (uint32_t i = 0; i < n_entries; i++) {
+        uint8_t *idx = buf + 20 + i * 16;
+        uint16_t koff;
+        uint32_t param_len, doff;
+        memcpy(&koff, idx, 2);
+        memcpy(&param_len, idx + 4, 4);
+        memcpy(&doff, idx + 12, 4);
+
+        const char *key = (const char *)(buf + key_off + koff);
+        uint8_t *val = buf + data_off + doff;
+
+        if (strcmp(key, "TITLE_ID") == 0)
+            snprintf(info->title_id, sizeof(info->title_id), "%.*s", (int)param_len, (char*)val);
+        else if (strcmp(key, "SAVEDATA_DIRECTORY") == 0)
+            snprintf(info->dir_name, sizeof(info->dir_name), "%.*s", (int)param_len, (char*)val);
+        else if (strcmp(key, "MAINTITLE") == 0 || strcmp(key, "TITLE") == 0)
+            snprintf(info->main_title, sizeof(info->main_title), "%.*s", (int)param_len, (char*)val);
+        else if (strcmp(key, "SUBTITLE") == 0)
+            snprintf(info->sub_title, sizeof(info->sub_title), "%.*s", (int)param_len, (char*)val);
+        else if (strcmp(key, "DETAIL") == 0)
+            snprintf(info->detail, sizeof(info->detail), "%.*s", (int)param_len, (char*)val);
+        else if (strcmp(key, "SAVEDATA_BLOCKS") == 0 && param_len >= 4)
+            memcpy(&info->blocks, val, 4);
+        else if (strcmp(key, "PARAMS") == 0 || strcmp(key, "USER_PARAM") == 0) {
+            if (param_len >= 4) memcpy(&info->user_param, val, 4);
+        }
+        else if (strcmp(key, "ACCOUNT_ID") == 0 && param_len >= 8)
+            memcpy(&info->account_id, val, 8);
+        else if (strcmp(key, "USER_ID") == 0 && param_len >= 4)
+            memcpy(&info->user_id, val, 4);
+        else if (strcmp(key, "SAVEDATA_LIST_PARAM") == 0 || strcmp(key, "CATEGORY") == 0) {
+            /* game_title_id from CATEGORY not needed, use title_id */
+        }
+    }
+    /* Default game_title_id to title_id */
+    if (!info->game_title_id[0])
+        strncpy(info->game_title_id, info->title_id, sizeof(info->game_title_id) - 1);
+
+    free(buf);
+    return 0;
+}
+
+/* ── Recursive mkdir helper ────────────────────────────────────── */
+static void recursive_mkdir(const char *path) {
+    char tmp[MAX_PATH_LEN];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = 0;
+            mkdir(tmp, 0777);
+            *p = '/';
+        }
+    }
+    mkdir(tmp, 0777);
+}
+
 /* ── CRC32 ─────────────────────────────────────────────────────── */
 static uint32_t crc_tab[256];
 static void init_crc(void) {
@@ -2408,6 +2501,261 @@ static void handle_request(int sock) {
         char json[128];
         snprintf(json, sizeof(json), "{\"ok\":true,\"size\":%lld,\"ps4\":%s}",
                  (long long)st.st_size, is_ps4 ? "true" : "false");
+        http_json(sock, json);
+        return;
+    }
+
+    /* GET /api/import_finish -> parse SFO, resign, unmount, copy to final location, update DB */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/import_finish", 18) == 0) {
+        if (!g_mounted) {
+            http_json(sock, "{\"error\":\"No save mounted\"}"); return;
+        }
+
+        /* Parse param.sfo from mounted save */
+        char sfo_path[MAX_PATH_LEN];
+        snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
+        sfo_info_t sfo;
+        if (parse_sfo(sfo_path, &sfo) < 0) {
+            http_json(sock, "{\"error\":\"Cannot parse param.sfo — is sce_sys/param.sfo present?\"}");
+            return;
+        }
+        if (!sfo.title_id[0] || !sfo.dir_name[0]) {
+            http_json(sock, "{\"error\":\"param.sfo missing TITLE_ID or SAVEDATA_DIRECTORY\"}");
+            return;
+        }
+        printf("[GarlicMgr] import: title_id=%s dir=%s title=%s blocks=%u\n",
+               sfo.title_id, sfo.dir_name, sfo.main_title, sfo.blocks);
+
+        /* Get local user info */
+        int local_uid = 0;
+        sceUserServiceGetForegroundUser(&local_uid);
+        uint32_t uid = (uint32_t)local_uid;
+        char uid_hex[16];
+        snprintf(uid_hex, sizeof(uid_hex), "%x", uid);
+
+        /* Read local account_id from user's existing savedata.db */
+        uint64_t local_aid = 0;
+        {
+            char aid_db_path[MAX_PATH_LEN];
+            snprintf(aid_db_path, sizeof(aid_db_path),
+                     "/system_data/savedata_prospero/%s/db/user/savedata.db", uid_hex);
+            sqlite3 *adb = NULL;
+            if (sqlite3_open_v2(aid_db_path, &adb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+                sqlite3_stmt *astmt = NULL;
+                if (sqlite3_prepare_v2(adb, "SELECT account_id FROM savedata LIMIT 1", -1, &astmt, NULL) == SQLITE_OK) {
+                    if (sqlite3_step(astmt) == SQLITE_ROW)
+                        local_aid = (uint64_t)sqlite3_column_int64(astmt, 0);
+                    sqlite3_finalize(astmt);
+                }
+                sqlite3_close(adb);
+            }
+        }
+
+        /* Resign: patch account_id and user_id in param.sfo */
+        int sfo_fd = open(sfo_path, O_RDWR);
+        if (sfo_fd >= 0) {
+            if (local_aid) {
+                /* PS5 SFO: AID at 0x1B8, UID at 0x660 */
+                pwrite(sfo_fd, &local_aid, 8, 0x1B8);
+                pwrite(sfo_fd, &uid, 4, 0x660);
+                printf("[GarlicMgr] import: resigned to aid=%llu uid=0x%x\n",
+                       (unsigned long long)local_aid, uid);
+            } else {
+                /* Just patch user_id */
+                pwrite(sfo_fd, &uid, 4, 0x660);
+                printf("[GarlicMgr] import: patched uid=0x%x (no local aid found)\n", uid);
+            }
+            close(sfo_fd);
+            sync();
+        }
+
+        /* Copy icon before unmount */
+        char icon_src[MAX_PATH_LEN];
+        char icon_tmp[MAX_PATH_LEN] = {0};
+        snprintf(icon_src, sizeof(icon_src), "%s/sce_sys/icon0.png", g_mount_point);
+        struct stat icon_st;
+        if (stat(icon_src, &icon_st) == 0) {
+            snprintf(icon_tmp, sizeof(icon_tmp), "/data/save_files/_tmp_icon.png");
+            copy_file(icon_src, icon_tmp);
+        }
+
+        /* Save mounted path before unmount clears it */
+        char tmp_path[MAX_PATH_LEN];
+        snprintf(tmp_path, sizeof(tmp_path), "%s", g_mounted_path);
+
+        /* Unmount (re-encrypts the PFS image) */
+        unmount_save();
+
+        /* Build destination paths */
+        char sd_dir[MAX_PATH_LEN], sd_dst[MAX_PATH_LEN];
+        snprintf(sd_dir, sizeof(sd_dir),
+                 "/user/home/%s/savedata_prospero/%s", uid_hex, sfo.title_id);
+        snprintf(sd_dst, sizeof(sd_dst),
+                 "%s/sdimg_%s", sd_dir, sfo.dir_name);
+
+        /* Create directories */
+        recursive_mkdir(sd_dir);
+
+        /* Copy encrypted image to final location */
+        printf("[GarlicMgr] import: copying %s -> %s\n", tmp_path, sd_dst);
+        if (copy_file(tmp_path, sd_dst) < 0) {
+            unlink(tmp_path);
+            if (icon_tmp[0]) unlink(icon_tmp);
+            http_json(sock, "{\"error\":\"Failed to copy save to destination\"}");
+            return;
+        }
+        unlink(tmp_path);
+        chmod(sd_dst, 0644);
+
+        /* Copy icon to meta directory */
+        if (icon_tmp[0]) {
+            char icon_dir[MAX_PATH_LEN], icon_dst[MAX_PATH_LEN];
+            snprintf(icon_dir, sizeof(icon_dir),
+                     "/user/home/%s/savedata_prospero_meta/user/%s", uid_hex, sfo.title_id);
+            snprintf(icon_dst, sizeof(icon_dst),
+                     "%s/%s_icon0.png", icon_dir, sfo.dir_name);
+            recursive_mkdir(icon_dir);
+            copy_file(icon_tmp, icon_dst);
+            unlink(icon_tmp);
+            printf("[GarlicMgr] import: icon -> %s\n", icon_dst);
+        }
+
+        /* Update savedata.db */
+        char db_path[MAX_PATH_LEN];
+        snprintf(db_path, sizeof(db_path),
+                 "/system_data/savedata_prospero/%s/db/user/savedata.db", uid_hex);
+
+        /* Create DB dir if needed */
+        {
+            char db_dir[MAX_PATH_LEN];
+            snprintf(db_dir, sizeof(db_dir),
+                     "/system_data/savedata_prospero/%s/db/user", uid_hex);
+            recursive_mkdir(db_dir);
+        }
+
+        sqlite3 *db = NULL;
+        int ret = sqlite3_open(db_path, &db);
+        if (ret != SQLITE_OK) {
+            printf("[GarlicMgr] import: cannot open savedata.db: %s\n", sqlite3_errmsg(db));
+            if (db) sqlite3_close(db);
+            /* Save is already copied, just DB update failed */
+            char json[256];
+            snprintf(json, sizeof(json),
+                     "{\"ok\":true,\"warning\":\"Save imported but DB update failed\","
+                     "\"title_id\":\"%s\",\"dir_name\":\"%s\"}", sfo.title_id, sfo.dir_name);
+            http_json(sock, json);
+            return;
+        }
+
+        /* Create table if it doesn't exist */
+        char *err_msg = NULL;
+        sqlite3_exec(db,
+            "CREATE TABLE IF NOT EXISTS savedata ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,"
+            "title_id NOT NULL, dir_name NOT NULL, main_title NOT NULL,"
+            "sub_title, detail, tmp_dir_name, is_broken, user_param,"
+            "blocks, free_blocks, size_kib, mtime NOT NULL,"
+            "fake_broken, account_id, user_id, faked_owner,"
+            "cloud_icon_url, cloud_revision, game_title_id NOT NULL, system_blocks)",
+            NULL, 0, &err_msg);
+        if (err_msg) { sqlite3_free(err_msg); err_msg = NULL; }
+
+        sqlite3_exec(db,
+            "CREATE INDEX IF NOT EXISTS savedata_index ON savedata"
+            "(title_id, dir_name, user_param, size_kib, mtime, game_title_id)",
+            NULL, 0, &err_msg);
+        if (err_msg) { sqlite3_free(err_msg); err_msg = NULL; }
+
+        /* Escape single quotes in strings */
+        char esc_title[256], esc_sub[256], esc_detail[512];
+        {
+            char *src, *dst;
+            src = sfo.main_title; dst = esc_title;
+            while (*src && dst < esc_title + sizeof(esc_title) - 2) {
+                if (*src == '\'') *dst++ = '\'';
+                *dst++ = *src++;
+            }
+            *dst = 0;
+            src = sfo.sub_title; dst = esc_sub;
+            while (*src && dst < esc_sub + sizeof(esc_sub) - 2) {
+                if (*src == '\'') *dst++ = '\'';
+                *dst++ = *src++;
+            }
+            *dst = 0;
+            src = sfo.detail; dst = esc_detail;
+            while (*src && dst < esc_detail + sizeof(esc_detail) - 2) {
+                if (*src == '\'') *dst++ = '\'';
+                *dst++ = *src++;
+            }
+            *dst = 0;
+        }
+
+        /* Get current timestamp */
+        char mtime[64];
+        {
+            time_t now = time(NULL);
+            struct tm *tm = gmtime(&now);
+            strftime(mtime, sizeof(mtime), "%Y-%m-%dT%H:%M:%S.00Z", tm);
+        }
+
+        /* Check if entry already exists */
+        char check_sql[512];
+        snprintf(check_sql, sizeof(check_sql),
+                 "SELECT COUNT(*) FROM savedata WHERE title_id='%s' AND dir_name='%s'",
+                 sfo.title_id, sfo.dir_name);
+        sqlite3_stmt *stmt = NULL;
+        int exists = 0;
+        if (sqlite3_prepare_v2(db, check_sql, -1, &stmt, NULL) == SQLITE_OK) {
+            if (sqlite3_step(stmt) == SQLITE_ROW)
+                exists = sqlite3_column_int(stmt, 0);
+            sqlite3_finalize(stmt);
+        }
+
+        uint64_t aid_val = local_aid ? local_aid : sfo.account_id;
+        uint32_t size_kib = sfo.blocks * 0x40;
+
+        char sql[2048];
+        if (exists) {
+            snprintf(sql, sizeof(sql),
+                "UPDATE savedata SET main_title='%s', sub_title='%s', detail='%s',"
+                "user_param=%u, blocks=%u, free_blocks=%u, size_kib=%u,"
+                "mtime='%s', account_id=%llu, user_id=%u "
+                "WHERE title_id='%s' AND dir_name='%s'",
+                esc_title, esc_sub, esc_detail,
+                sfo.user_param, sfo.blocks, sfo.blocks, size_kib,
+                mtime, (unsigned long long)aid_val, uid,
+                sfo.title_id, sfo.dir_name);
+        } else {
+            snprintf(sql, sizeof(sql),
+                "INSERT INTO savedata (title_id, dir_name, main_title, sub_title, detail,"
+                "is_broken, user_param, blocks, free_blocks, size_kib, mtime,"
+                "fake_broken, account_id, user_id, faked_owner, cloud_revision,"
+                "game_title_id, system_blocks) VALUES ("
+                "'%s','%s','%s','%s','%s',"
+                "0,%u,%u,%u,%u,'%s',"
+                "0,%llu,%u,0,0,"
+                "'%s',0)",
+                sfo.title_id, sfo.dir_name, esc_title, esc_sub, esc_detail,
+                sfo.user_param, sfo.blocks, sfo.blocks, size_kib, mtime,
+                (unsigned long long)aid_val, uid,
+                sfo.game_title_id);
+        }
+
+        ret = sqlite3_exec(db, sql, NULL, 0, &err_msg);
+        if (ret != SQLITE_OK) {
+            printf("[GarlicMgr] import: DB error: %s\n", err_msg);
+            sqlite3_free(err_msg);
+        } else {
+            printf("[GarlicMgr] import: DB %s OK\n", exists ? "updated" : "inserted");
+        }
+        sqlite3_close(db);
+
+        char json[512];
+        snprintf(json, sizeof(json),
+                 "{\"ok\":true,\"title_id\":\"%s\",\"dir_name\":\"%s\","
+                 "\"main_title\":\"%s\",\"exists\":%s}",
+                 sfo.title_id, sfo.dir_name, sfo.main_title,
+                 exists ? "true" : "false");
         http_json(sock, json);
         return;
     }

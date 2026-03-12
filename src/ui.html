@@ -254,6 +254,7 @@
   <button class="tab" onclick="switchTab('decrypt')">Decrypt</button>
   <button class="tab" onclick="switchTab('encrypt')">Encrypt</button>
   <button class="tab" onclick="switchTab('resign')">Resign</button>
+  <button class="tab" onclick="switchTab('import')">Import</button>
   <span class="spacer"></span>
   <button class="shut" onclick="shutdown()">Kill GarlicMgr</button>
 </nav>
@@ -429,7 +430,7 @@ function readEntryRecursive(entry, basePath) {
 function switchTab(t) {
   tab = t;
   document.querySelectorAll('.tab').forEach((b, i) => {
-    b.className = 'tab' + ((['browse', 'decrypt', 'encrypt', 'resign'][i] === t) ? ' active' : '');
+    b.className = 'tab' + ((['browse', 'decrypt', 'encrypt', 'resign', 'import'][i] === t) ? ' active' : '');
   });
   $('mn').className = t === 'browse' ? 'main' : 'main full';
   if (t === 'browse') load();
@@ -556,6 +557,15 @@ function renderCt() {
       + '<button class="bbtn">Browse Files</button></div>';
     setupDZ('dz', resignDrop);
 
+  } else if (tab === 'import') {
+    c.className = 'ct ctr';
+    c.innerHTML =
+      '<div class="drop" id="dz">'
+      + '<div class="dlbl">Drag & drop a <b>decrypted save folder</b> to import</div>'
+      + '<div style="font-size:11px;color:var(--dm);margin:6px 0">Folder must contain sce_sys/param.sfo<br>PS5 saves only for now</div>'
+      + '<button class="bbtn">Browse Folder</button></div>';
+    setupFolderDZ('dz', importDrop);
+
   } else {
     if (mt) {
       c.className = 'ct';
@@ -640,7 +650,7 @@ async function decDrop(files) {
       throw new Error(d.error || 'Failed');
     }
     log('Mounted — click Download to save decrypted files', 'ok');
-    const name = imgFile.name.replace(/\.[^.]+$/, '') + '.zip';
+    const name = imgFile.name.replace(/\.[^.]+$/, '') + '_dec.zip';
     $('ct').innerHTML =
       '<div class="drop"><div class="dlbl">Decrypted successfully!</div>'
       + '<a class="dlnk" href="/api/download" download="' + esc(name) + '">Download .zip</a>'
@@ -696,7 +706,7 @@ async function encDrop(files, folderName) {
     /* Step 3: patch AID if provided, unmount, download encrypted */
     log('Encrypting and downloading...');
     $('ct').innerHTML = '<div class="drop"><div class="dlbl">Encrypting save...</div></div>';
-    const name = folderName || 'encrypted_save';
+    const name = (folderName || 'encrypted_save') + '_enc';
     let dlUrl = '/api/download_new?name=' + encodeURIComponent(name);
     if (aidv) dlUrl += '&aid=' + encodeURIComponent(aidv);
     const a = document.createElement('a');
@@ -776,6 +786,82 @@ async function resignDrop(files) {
       + '<div style="color:#0f0">Download started' + (isPS4 ? ' (.zip)' : '') + '</div></div>';
   } catch (e) {
     log('Error: ' + e.message, 'err');
+    renderCt();
+  }
+  bsy = false;
+}
+
+/* ── Import drop ───────────────────────────────────── */
+async function importDrop(files, folderName) {
+  if (bsy || !files || !files.length) return;
+
+  /* Check for sce_sys/param.sfo in the dropped files */
+  let hasSfo = false;
+  for (const f of files) {
+    const p = f._path || f.webkitRelativePath || f.name;
+    if (p.match(/sce_sys\/param\.sfo$/i)) { hasSfo = true; break; }
+  }
+  if (!hasSfo) {
+    log('Folder must contain sce_sys/param.sfo', 'err');
+    return;
+  }
+
+  bsy = true;
+  try {
+    /* Calculate total size */
+    let totalSize = 0;
+    for (const f of files) totalSize += f.size;
+
+    /* Step 1: create PFS image */
+    log('Creating PFS image for import (' + fmtB(totalSize) + ' of files)...');
+    $('ct').innerHTML = '<div class="drop"><div class="dlbl">Creating PFS image...</div></div>';
+    let r = await fetch('/api/create_pfs?size=' + totalSize);
+    let d = await r.json();
+    if (d.error) throw new Error(d.error);
+    log('PFS image created and mounted', 'ok');
+
+    /* Step 2: upload each file */
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      const path = f._path || f.webkitRelativePath || f.name;
+      const parts = path.split('/');
+      const relPath = parts.length > 1 ? parts.slice(1).join('/') : parts[0];
+
+      log('Uploading (' + (i + 1) + '/' + files.length + ') ' + relPath + ' (' + fmtB(f.size) + ')...');
+      $('ct').innerHTML = '<div class="drop" id="dz"><div class="dlbl">Uploading ' + esc(relPath)
+        + '<br>(' + (i + 1) + '/' + files.length + ')</div></div>';
+
+      const xhr = await upload('/api/upload_file?name=' + encodeURIComponent(relPath), f, (loaded, total) => {
+        const pct = Math.round(loaded * 100 / total);
+        showProgress(pct, loaded, total);
+      });
+      const rd = JSON.parse(xhr.responseText);
+      if (!rd.ok) throw new Error(rd.error || 'Upload failed for ' + relPath);
+    }
+    log('All ' + files.length + ' files uploaded', 'ok');
+
+    /* Step 3: finalize import (resign, unmount, copy to system, update DB) */
+    log('Finalizing import...');
+    $('ct').innerHTML = '<div class="drop"><div class="dlbl">Importing save to system...</div></div>';
+    r = await fetch('/api/import_finish');
+    d = await r.json();
+    if (d.error) throw new Error(d.error);
+
+    log('Import complete: ' + d.title_id + '/' + d.dir_name + (d.exists ? ' (updated)' : ' (new)'), 'ok');
+    $('ct').innerHTML =
+      '<div class="drop"><div class="dlbl">'
+      + '<div style="color:var(--ok);font-size:16px;font-weight:700;margin-bottom:8px">Import Successful</div>'
+      + '<b>' + esc(d.main_title || d.title_id) + '</b><br>'
+      + esc(d.title_id) + ' / ' + esc(d.dir_name)
+      + (d.exists ? '<br><span style="color:var(--dm)">Existing save updated</span>' : '<br><span style="color:var(--dm)">New save added</span>')
+      + (d.warning ? '<br><span style="color:#c89b00">' + esc(d.warning) + '</span>' : '')
+      + '</div>'
+      + '<button class="bbtn" style="margin-top:12px" onclick="switchTab(\'import\')">Import Another</button></div>';
+
+  } catch (e) {
+    log('Import error: ' + e.message, 'err');
+    /* Try to clean up by unmounting */
+    try { await fetch('/api/unmount'); } catch(x) {}
     renderCt();
   }
   bsy = false;
@@ -991,7 +1077,7 @@ async function dlZip() {
     const r = await fetch('/api/download');
     const b = await r.blob();
     const s = si >= 0 ? S[si] : null;
-    dl(b, s ? (s.title_id + '_' + s.save_name + '.zip') : 'save.zip');
+    dl(b, s ? (s.title_id + '_' + s.save_name + '_dec.zip') : 'save_dec.zip');
     log('Downloaded ' + fmtB(b.size), 'ok');
   } catch (e) {
     log('Error: ' + e.message, 'err');
@@ -1011,7 +1097,7 @@ async function dlBin() {
     const isPS4 = s.type === 'ps4';
     const r = await fetch('/api/download_raw?idx=' + si);
     const b = await r.blob();
-    const fname = isPS4 ? (s.title_id + '_' + s.save_name + '.zip') : (s.title_id + '_' + s.save_name);
+    const fname = isPS4 ? (s.title_id + '_' + s.save_name + '_enc.zip') : (s.title_id + '_' + s.save_name + '_enc');
     dl(b, fname);
     log('Downloaded ' + fmtB(b.size), 'ok');
     si = -1; renderL(); renderTB(); renderCt();
