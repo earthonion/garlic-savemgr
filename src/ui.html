@@ -162,6 +162,13 @@
     .fi { padding: 6px 16px; font-size: 14px; color: var(--tx); display: flex; align-items: center }
     .fi.dir { color: var(--ac2); font-weight: 600; cursor: pointer }
     .fi .sz { color: var(--dm); font-size: 12px; margin-left: auto }
+    .dir-dots {
+      color: var(--dm); font-size: 14px;
+      cursor: pointer; padding: 0 4px; margin-left: 6px;
+      opacity: .3; transition: opacity .15s; border-radius: 4px;
+    }
+    .fi.dir:hover .dir-dots { opacity: .7 }
+    .dir-dots:hover { opacity: 1 !important; color: var(--tx); background: rgba(255,255,255,.05) }
 
     .empty { padding: 40px; text-align: center; color: var(--dm); font-size: 12px; letter-spacing: .3px }
     .dh { padding: 16px; text-align: center; color: var(--dm); font-size: 11px; opacity: .4; margin-top: auto }
@@ -230,6 +237,22 @@
     .ctx-menu div:hover { background: rgba(255,255,255,.05) }
     .ctx-menu .ctx-del { color: var(--er) }
 
+    /* ── Options dropdown ────────────────────────────── */
+    .opts-menu {
+      display: none; position: absolute; top: 100%; right: 0;
+      background: var(--s1); border: 1px solid var(--bd);
+      border-radius: 8px; padding: 4px 0; min-width: 200px;
+      box-shadow: 0 4px 16px rgba(0,0,0,.5); z-index: 200;
+      margin-top: 4px;
+    }
+    .opts-menu.open { display: block }
+    .mob-opts { display: none; position: relative }
+    .opts-menu div {
+      padding: 9px 16px; font-size: 12px; cursor: pointer;
+      transition: background .1s; white-space: nowrap;
+    }
+    .opts-menu div:hover { background: rgba(255,255,255,.05) }
+
     /* ── Progress bar ────────────────────────────────── */
     .prog {
       width: 100%; height: 4px; background: var(--bd);
@@ -242,6 +265,72 @@
     .prog-text {
       font-size: 11px; color: var(--dm); margin-top: 6px;
       font-family: 'SF Mono', Consolas, monospace;
+    }
+
+    /* ── Hamburger button (mobile only) ─────────────── */
+    .hamburger {
+      display: none; background: none; border: 1px solid var(--bd);
+      color: var(--tx); padding: 6px 8px; border-radius: 6px;
+      cursor: pointer; font-size: 18px; line-height: 1;
+    }
+
+    /* ── Mobile menu overlay ────────────────────────── */
+    .mob-menu {
+      display: none; position: fixed; top: 48px; left: 0; right: 0;
+      background: var(--s1); border-bottom: 1px solid var(--bd);
+      z-index: 50; flex-direction: column; padding: 8px 0;
+      box-shadow: 0 8px 24px rgba(0,0,0,.5);
+    }
+    .mob-menu.open { display: flex }
+    .mob-menu .tab {
+      border-radius: 0; padding: 12px 20px; text-align: left;
+      font-size: 13px; border: none;
+    }
+    .mob-menu .tab.active { border-radius: 0 }
+    .mob-menu .shut {
+      margin: 8px 16px; text-align: center;
+    }
+
+    /* ── Drawer toggle (mobile browse) ──────────────── */
+    .drawer-toggle {
+      display: none; padding: 10px 16px; background: var(--s1);
+      border-bottom: 1px solid var(--bd); cursor: pointer;
+      font-size: 11px; font-weight: 700; color: var(--dm);
+      text-transform: uppercase; letter-spacing: 1px;
+      flex-shrink: 0;
+    }
+    .drawer-toggle:hover { color: var(--tx) }
+
+    /* ── Mobile ─────────────────────────────────────── */
+    @media (max-width: 768px) {
+      .hamburger { display: block }
+      nav .tab, nav .shut { display: none }
+
+      .main { flex-direction: column }
+      .main .left {
+        width: 100%; min-width: 0; border-right: none;
+        border-bottom: 1px solid var(--bd);
+        max-height: 50vh; flex-shrink: 0;
+      }
+      .main .left.collapsed .svs { display: none }
+      .main .left.collapsed { max-height: none }
+      .main.full .left { display: none }
+
+      .drawer-toggle { display: block }
+      .desk-shdr { display: none }
+
+      .desk-btn { display: none !important }
+      .mob-opts { display: inline-block !important }
+      .tb { gap: 6px; padding: 8px 10px }
+      .tb .btn { font-size: 10px; padding: 5px 10px }
+      .tb img { width: 60px !important; height: 34px !important }
+
+      .drop { padding: 24px 20px; max-width: 100%; width: 95% }
+
+      .logw { height: 100px }
+
+      .fi { font-size: 12px; padding: 6px 10px }
+      .dir-dots { opacity: .5 }
     }
   </style>
 </head>
@@ -257,12 +346,22 @@
   <button class="tab" onclick="switchTab('import')">Import</button>
   <span class="spacer"></span>
   <button class="shut" onclick="shutdown()">Kill GarlicMgr</button>
+  <button class="hamburger" onclick="toggleMenu()">&#9776;</button>
 </nav>
+<div class="mob-menu" id="mobmenu">
+  <button class="tab active" onclick="switchTab('browse')">Browse</button>
+  <button class="tab" onclick="switchTab('decrypt')">Decrypt</button>
+  <button class="tab" onclick="switchTab('encrypt')">Encrypt</button>
+  <button class="tab" onclick="switchTab('resign')">Resign</button>
+  <button class="tab" onclick="switchTab('import')">Import</button>
+  <button class="shut" onclick="shutdown()">Kill GarlicMgr</button>
+</div>
 
 <!-- ── Main layout ─────────────────────────────────── -->
 <div class="main" id="mn">
-  <div class="left">
-    <div class="shdr">Saves</div>
+  <div class="left" id="drawer">
+    <div class="shdr desk-shdr">Saves</div>
+    <div class="drawer-toggle" onclick="toggleDrawer()" id="dtog"></div>
     <div class="svs" id="svs"><div class="empty">Loading...</div></div>
   </div>
   <div class="right">
@@ -426,13 +525,55 @@ function readEntryRecursive(entry, basePath) {
   });
 }
 
+/* ── Options dropdown toggle ───────────────────────── */
+function toggleOpts() {
+  const m = $('optsmenu');
+  if (!m) return;
+  m.classList.toggle('open');
+}
+function closeOpts() {
+  const m = $('optsmenu');
+  if (m) m.classList.remove('open');
+}
+document.addEventListener('click', e => {
+  if (!e.target.closest('.opts-menu') && !e.target.closest('[onclick*="toggleOpts"]'))
+    closeOpts();
+});
+
+/* ── Hamburger menu ────────────────────────────────── */
+function toggleMenu() {
+  const m = $('mobmenu');
+  m.classList.toggle('open');
+}
+
+/* ── Drawer toggle (mobile save list) ─────────────── */
+let drawerOpen = false;
+function toggleDrawer() {
+  drawerOpen = !drawerOpen;
+  updateDrawer();
+}
+function updateDrawer() {
+  const d = $('drawer');
+  if (drawerOpen) {
+    d.classList.remove('collapsed');
+    $('dtog').textContent = '\u25BE Saves';
+  } else {
+    d.classList.add('collapsed');
+    $('dtog').textContent = '\u25B8 Saves' + (S.length ? ' (' + S.length + ')' : '');
+  }
+}
+
 /* ── Tab switching ─────────────────────────────────── */
 function switchTab(t) {
   tab = t;
-  document.querySelectorAll('.tab').forEach((b, i) => {
-    b.className = 'tab' + ((['browse', 'decrypt', 'encrypt', 'resign', 'import'][i] === t) ? ' active' : '');
+  const tabs = ['browse', 'decrypt', 'encrypt', 'resign', 'import'];
+  document.querySelectorAll('nav .tab, .mob-menu .tab').forEach(b => {
+    const idx = tabs.indexOf(b.textContent.trim().toLowerCase());
+    b.className = 'tab' + (tabs[idx] === t ? ' active' : '');
   });
   $('mn').className = t === 'browse' ? 'main' : 'main full';
+  /* Close mobile menu */
+  $('mobmenu').classList.remove('open');
   if (t === 'browse') load();
   renderTB();
   renderCt();
@@ -446,6 +587,7 @@ async function load() {
     S = d.saves || [];
     renderL();
     renderTB();
+    updateDrawer();
     log('Loaded ' + S.length + ' saves', 'ok');
   } catch (e) {
     log('Failed: ' + e.message, 'err');
@@ -595,10 +737,19 @@ function renderTB() {
     h += (mpt ? '<div style="font-size:11px;color:var(--dm);margin-top:2px;opacity:.5">FTP: ' + esc(mpt) + '</div>' : '');
     h += '</div>';
 
-    h += '<button class="btn grn" onclick="dlZip()" ' + (bsy ? 'disabled' : '') + '>Download Decrypted Zip</button>';
-    h += '<button class="btn" onclick="dlBin()" ' + (bsy ? 'disabled' : '') + '>Download Encrypted</button>';
-    h += '<button class="btn" onclick="dumpUsb()" ' + (bsy ? 'disabled' : '') + '>Dump to USB</button>';
-    h += '<button class="btn red" onclick="um()" ' + (bsy ? 'disabled' : '') + '>Unmount</button>';
+    h += '<button class="btn grn desk-btn" onclick="dlZip()" ' + (bsy ? 'disabled' : '') + '>Download Decrypted Zip</button>';
+    h += '<button class="btn desk-btn" onclick="dlBin()" ' + (bsy ? 'disabled' : '') + '>Download Encrypted</button>';
+    h += '<button class="btn desk-btn" onclick="dumpUsb()" ' + (bsy ? 'disabled' : '') + '>Dump to USB</button>';
+    h += '<button class="btn red desk-btn" onclick="um()" ' + (bsy ? 'disabled' : '') + '>Unmount</button>';
+    h += '<div class="mob-opts">'
+      + '<button class="btn" onclick="toggleOpts()" ' + (bsy ? 'disabled' : '') + '>Options \u25BE</button>'
+      + '<div class="opts-menu" id="optsmenu">'
+      + '<div onclick="closeOpts();dlZip()">Download Decrypted Zip</div>'
+      + '<div onclick="closeOpts();dlBin()">Download Encrypted</div>'
+      + '<div onclick="closeOpts();dumpUsb()">Dump to USB</div>'
+      + '<div onclick="closeOpts();ctxUpload()">Upload File</div>'
+      + '<div class="ctx-del" onclick="closeOpts();um()">Unmount</div>'
+      + '</div></div>';
   }
   $('tb').innerHTML = h;
 }
@@ -609,6 +760,8 @@ async function sel(i) {
   si = i;
   renderL();
   await mountBrw(i);
+  /* Collapse drawer on mobile after selecting */
+  if (window.innerWidth <= 768 && drawerOpen) toggleDrawer();
 }
 
 /* ── Decrypt drop ──────────────────────────────────── */
@@ -884,7 +1037,7 @@ async function mountBrw(i) {
     mtid = d.title_id || '';
     mpt = d.mount || '';
     ex = new Set();
-    cf.forEach(f => { if (f.dir) ex.add(f.name) });
+    /* folders start collapsed */
     log('Mounted ' + (mtid ? mtid + ' ' : '') + (stitle ? stitle + ' ' : '') + (aid ? '[' + aid + ']' : ''), 'ok');
     renderF();
   } catch (e) {
@@ -911,8 +1064,11 @@ function renderF() {
     const nm = f.name.split('/').pop();
     if (f.dir) {
       const o = ex.has(f.name);
+      const fn = esc(f.name).replace(/'/g, "\\'");
       h += '<div class="fi dir" style="padding-left:' + (16 + d * 16) + 'px" onclick="tog(' + i + ')">';
-      h += (o ? '\u25BE \u{1F4C1} ' : '\u25B8 \u{1F4C1} ') + esc(nm) + '</div>';
+      h += (o ? '\u25BE \u{1F4C1} ' : '\u25B8 \u{1F4C1} ') + esc(nm);
+      h += '<span class="dir-dots" onclick="event.stopPropagation();showDirMenu(event,\'' + fn + '\')">\u22EE</span>';
+      h += '</div>';
     } else {
       h += '<div class="fi" style="padding-left:' + (16 + d * 16) + 'px" oncontextmenu="showCtxMenu(event,\'' + esc(f.name).replace(/'/g, "\\'") + '\')">';
       h += '\u{1F4C4} ' + esc(nm) + '<span class="sz">' + fmtB(f.size) + '</span></div>';
@@ -930,6 +1086,56 @@ function renderF() {
 function closeCtxMenu() {
   const m = document.getElementById('ctxmenu');
   if (m) m.remove();
+}
+
+function showDirMenu(e, dirName) {
+  e.preventDefault();
+  closeCtxMenu();
+  const m = document.createElement('div');
+  m.className = 'ctx-menu';
+  m.id = 'ctxmenu';
+  const fn = dirName.replace(/'/g, "\\'");
+  m.innerHTML = '<div onclick="uploadToDir(\'' + fn + '\')">Upload File Here</div>';
+  m.style.left = e.clientX + 'px';
+  m.style.top = e.clientY + 'px';
+  document.body.appendChild(m);
+  const r = m.getBoundingClientRect();
+  if (r.right > window.innerWidth) m.style.left = (window.innerWidth - r.width - 4) + 'px';
+  if (r.bottom > window.innerHeight) m.style.top = (window.innerHeight - r.height - 4) + 'px';
+}
+
+function uploadToDir(dirName) {
+  closeCtxMenu();
+  const i = document.createElement('input');
+  i.type = 'file'; i.multiple = true;
+  i.onchange = async () => {
+    if (!i.files.length || bsy || !mt) return;
+    bsy = true;
+    try {
+      for (let j = 0; j < i.files.length; j++) {
+        const file = i.files[j];
+        const relPath = dirName + '/' + file.name;
+        log('Uploading ' + relPath + ' (' + fmtB(file.size) + ')...');
+        const r = await fetch('/api/upload_file?name=' + encodeURIComponent(relPath), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: file
+        });
+        const d = await r.json();
+        if (d.ok) log('Added ' + relPath, 'ok');
+        else log(d.error, 'err');
+      }
+      const r2 = await fetch('/api/files');
+      const d2 = await r2.json();
+      cf = d2.files || [];
+      /* folders start collapsed */
+      renderF();
+    } catch (e) {
+      log('Error: ' + e.message, 'err');
+    }
+    bsy = false;
+  };
+  i.click();
 }
 
 function showCtxMenu(e, fname) {
@@ -990,7 +1196,7 @@ async function ctxDelete(name) {
     const d2 = await r2.json();
     cf = d2.files || [];
     ex = new Set();
-    cf.forEach(f => { if (f.dir) ex.add(f.name) });
+    /* folders start collapsed */
     renderF();
   } catch (e) {
     log('Error: ' + e.message, 'err');
@@ -1060,7 +1266,7 @@ async function handleBrw(files) {
     const d2 = await r2.json();
     cf = d2.files || [];
     ex = new Set();
-    cf.forEach(f => { if (f.dir) ex.add(f.name) });
+    /* folders start collapsed */
     renderF();
   } catch (e) {
     log('Error: ' + e.message, 'err');
@@ -1077,7 +1283,7 @@ async function dlZip() {
     const r = await fetch('/api/download');
     const b = await r.blob();
     const s = si >= 0 ? S[si] : null;
-    dl(b, s ? (s.title_id + '_' + s.save_name + '_dec.zip') : 'save_dec.zip');
+    dl(b, s ? (s.title_id + '_' + s.save_name + '.zip') : 'save.zip');
     log('Downloaded ' + fmtB(b.size), 'ok');
   } catch (e) {
     log('Error: ' + e.message, 'err');
@@ -1097,7 +1303,7 @@ async function dlBin() {
     const isPS4 = s.type === 'ps4';
     const r = await fetch('/api/download_raw?idx=' + si);
     const b = await r.blob();
-    const fname = isPS4 ? (s.title_id + '_' + s.save_name + '_enc.zip') : (s.title_id + '_' + s.save_name + '_enc');
+    const fname = isPS4 ? (s.title_id + '_' + s.save_name + '_enc.zip') : (s.title_id + '_' + s.save_name);
     dl(b, fname);
     log('Downloaded ' + fmtB(b.size), 'ok');
     si = -1; renderL(); renderTB(); renderCt();
@@ -1186,10 +1392,21 @@ async function shutdown() {
   log('Killing GarlicMgr...');
   try { await fetch('/api/shutdown') } catch (e) {}
   log('GarlicMgr killed', 'ok');
-  document.body.style.opacity = '.3';
+  const bg = document.createElement('div');
+  bg.className = 'modal-bg';
+  bg.innerHTML =
+    '<div class="modal" style="text-align:center">'
+    + '<h3 style="font-size:18px;margin-bottom:16px">Thank you for using<br>Garlic SaveMgr!</h3>'
+    + '<p style="color:var(--dm);margin-bottom:12px">by earthonion</p>'
+    + '<iframe src="https://github.com/sponsors/earthonion/button" title="Sponsor earthonion" height="32" width="114" style="border:0;border-radius:6px"></iframe>'
+    + '</div>';
+  document.body.appendChild(bg);
 }
 
 /* ── Init ──────────────────────────────────────────── */
+if (window.innerWidth <= 768) $('drawer').classList.add('collapsed');
+else drawerOpen = true;
+updateDrawer();
 load();
 renderCt();
 renderTB();

@@ -881,9 +881,7 @@ static void zip_send_files(int sock, const zip_file_t *files, int nfiles) {
         uint8_t lh[30]; memset(lh, 0, 30);
         lh[0]=0x50; lh[1]=0x4b; lh[2]=0x03; lh[3]=0x04;
         lh[4]=20;
-        lh[6]=0x08; /* flag: data descriptor follows */
-        memcpy(lh+18, &e->size, 4);
-        memcpy(lh+22, &e->size, 4);
+        lh[6]=0x08; /* flag: data descriptor follows — CRC+sizes must be 0 */
         memcpy(lh+26, &nlen, 2);
         send(sock, lh, 30, 0);
         send(sock, e->name, nlen, 0);
