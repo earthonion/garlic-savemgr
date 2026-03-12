@@ -103,6 +103,7 @@
     .badge { display:inline-block; font-size:9px; font-weight:700; padding:1px 5px; border-radius:3px; float:right; margin-left:6px }
     .badge-ps4 { background:#1e6fbf; color:#fff }
     .badge-ps5 { background:#1a8a3f; color:#fff }
+    .badge-bu { background:#c89b00; color:#000 }
 
     /* ── Right panel ─────────────────────────────────── */
     .right { flex: 1; display: flex; flex-direction: column; overflow: hidden }
@@ -477,8 +478,9 @@ function renderL() {
     const badge = '<span class="badge badge-' + gtype + '">' + gtype.toUpperCase() + '</span>';
     if (g.items.length === 1) {
       const i = g.items[0], s = S[i];
+      const bu = s.backup ? '<span class="badge badge-bu">BACKUP</span>' : '';
       h += '<div class="sv' + (i === si ? ' sel' : '') + '" onclick="sel(' + i + ')">';
-      h += '<div class="tid">' + badge + esc(g.name) + '</div>';
+      h += '<div class="tid">' + bu + badge + esc(g.name) + '</div>';
       h += '<div class="sn">' + esc(s.save_name) + '</div></div>';
     } else {
       const open = exG.has(g.title_id);
@@ -489,8 +491,9 @@ function renderL() {
       if (open) {
         g.items.forEach(i => {
           const s = S[i];
+          const bu = s.backup ? '<span class="badge badge-bu">BACKUP</span>' : '';
           h += '<div class="sv' + (i === si ? ' sel' : '') + '" onclick="sel(' + i + ')" style="padding-left:28px">';
-          h += '<div class="sn" style="color:var(--tx)">' + esc(s.save_name) + '</div></div>';
+          h += '<div class="sn" style="color:var(--tx)">' + bu + esc(s.save_name) + '</div></div>';
         });
       }
     }

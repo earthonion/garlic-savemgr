@@ -78,6 +78,8 @@ typedef struct {
     char title_id[32];           /* e.g. PPSA01234 */
     char save_name[256];         /* save file name (varies per game) */
     char dir_name[256];          /* for mount point naming */
+    int is_ps4;                  /* 1 if PS4 save (byte 0x0 == 0x01) */
+    int is_backup;               /* 1 if backup save (sdimg_sce_bu_) */
 } save_entry_t;
 
 static save_entry_t *g_saves = NULL;
@@ -182,11 +184,8 @@ static void scan_title_dir(const char *title_path, const char *title_id) {
         int len = strlen(ent->d_name);
         if (len > 4 && strcmp(ent->d_name + len - 4, ".bin") == 0) continue;
 
-        /* For PS4 dirs, only pick up sdimg_ files, skip backups */
-        if (is_ps4) {
-            if (strncmp(ent->d_name, "sdimg_", 6) != 0) continue;
-            if (strncmp(ent->d_name, "sdimg_sce_bu_", 13) == 0) continue;
-        }
+        /* For PS4 dirs, only pick up sdimg_ files */
+        if (is_ps4 && strncmp(ent->d_name, "sdimg_", 6) != 0) continue;
 
         char filepath[MAX_PATH_LEN];
         snprintf(filepath, sizeof(filepath), "%s/%s", title_path, ent->d_name);
@@ -199,6 +198,15 @@ static void scan_title_dir(const char *title_path, const char *title_id) {
             snprintf(s->title_id, sizeof(s->title_id), "%s", title_id);
             snprintf(s->save_name, sizeof(s->save_name), "%s", ent->d_name);
             snprintf(s->dir_name, sizeof(s->dir_name), "%s_%s", title_id, ent->d_name);
+            s->is_backup = (strncmp(ent->d_name, "sdimg_sce_bu_", 13) == 0);
+            /* Detect PS4 by byte 0x0 */
+            s->is_ps4 = 0;
+            int hfd = open(filepath, O_RDONLY);
+            if (hfd >= 0) {
+                uint8_t hdr;
+                if (pread(hfd, &hdr, 1, 0) == 1 && hdr == 0x01) s->is_ps4 = 1;
+                close(hfd);
+            }
         }
     }
     closedir(d);
@@ -258,6 +266,14 @@ static void scan_saves(void) {
                 snprintf(s->title_id, sizeof(s->title_id), "manual");
                 snprintf(s->save_name, sizeof(s->save_name), "%s", ent->d_name);
                 snprintf(s->dir_name, sizeof(s->dir_name), "manual_%s", ent->d_name);
+                s->is_backup = (strncmp(ent->d_name, "sdimg_sce_bu_", 13) == 0);
+                s->is_ps4 = 0;
+                int hfd = open(filepath, O_RDONLY);
+                if (hfd >= 0) {
+                    uint8_t hdr;
+                    if (pread(hfd, &hdr, 1, 0) == 1 && hdr == 0x01) s->is_ps4 = 1;
+                    close(hfd);
+                }
             }
         }
         closedir(d);
@@ -306,11 +322,20 @@ static int mount_save(int idx) {
     if (idx < 0 || idx >= g_save_count) return -2;
 
     save_entry_t *s = &g_saves[idx];
-
-    /* Check if PS4 save (sdimg_ prefix) */
     const char *bname = strrchr(s->path, '/');
     bname = bname ? bname + 1 : s->path;
-    int is_ps4 = (strncmp(bname, "sdimg_", 6) == 0);
+
+    /* Detect PS4 vs PS5 by reading byte 0 of image (0x01=PS4, 0x02=PS5) */
+    int is_ps4 = 0;
+    {
+        int hfd = open(s->path, O_RDONLY);
+        if (hfd >= 0) {
+            uint8_t hdr;
+            if (pread(hfd, &hdr, 1, 0) == 1 && hdr == 0x01) is_ps4 = 1;
+            close(hfd);
+        }
+    }
+    logprintf("[GarlicMgr] mount: %s detected as %s\n", bname, is_ps4 ? "PS4" : "PS5");
 
     /* Elevate credentials */
     kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
@@ -340,7 +365,7 @@ static int mount_save(int idx) {
         mount_src = g_local_copy;
 
         /* For PS4 saves, also copy the .bin sealed key */
-        if (is_ps4) {
+        if (is_ps4 && strncmp(bname, "sdimg_", 6) == 0) {
             const char *savename = bname + 6;
             char src_dir[MAX_PATH_LEN], src_bin[MAX_PATH_LEN], dst_bin[MAX_PATH_LEN];
             strncpy(src_dir, s->path, sizeof(src_dir) - 1);
@@ -410,18 +435,32 @@ static int mount_save(int idx) {
     } else {
         /* PS5: read key from offset 0x800 in image */
         int fd = open(mount_src, O_RDONLY);
-        if (fd < 0) { free(data); return -4; }
+        if (fd < 0) {
+            logprintf("[GarlicMgr] mount: cannot open %s (errno=%d)\n", mount_src, errno);
+            free(data); return -4;
+        }
         int ret = pread(fd, data, 0x60, 0x800);
         close(fd);
-        if (ret != 0x60) { free(data); return -5; }
+        if (ret != 0x60) {
+            logprintf("[GarlicMgr] mount: short read key from %s (%d)\n", mount_src, ret);
+            free(data); return -5;
+        }
+        logprintf("[GarlicMgr] mount: PS5 key from %s (keyset=%d)\n",
+               mount_src, (data[9] << 8) | data[8]);
 
-        int pfsmgr = open("/dev/pfsmgr", 2);
-        if (pfsmgr < 0) { free(data); return -6; }
+        int pfsmgr = open("/dev/pfsmgr", O_RDWR);
+        if (pfsmgr < 0) {
+            logprintf("[GarlicMgr] mount: cannot open /dev/pfsmgr (errno=%d)\n", errno);
+            free(data); return -6;
+        }
         ret = ioctl(pfsmgr, 0xc0845302, data);
         close(pfsmgr);
         if (ret >= 0) {
             memcpy(decrypted_key, data + 0x60, 0x20);
             key_ok = 1;
+            logprintf("[GarlicMgr] mount: PS5 key decrypted OK\n");
+        } else {
+            logprintf("[GarlicMgr] mount: PS5 key decrypt failed (ret=%d, errno=%d)\n", ret, errno);
         }
     }
 
@@ -480,10 +519,20 @@ static int unmount_save(void) {
 static int mount_by_path(const char *path) {
     if (g_mounted) unmount_save();
 
-    /* Check if this is a PS4 save (sdimg_ prefix) */
     const char *bname = strrchr(path, '/');
     bname = bname ? bname + 1 : path;
-    int is_ps4 = (strncmp(bname, "sdimg_", 6) == 0);
+
+    /* Detect PS4 vs PS5 by reading byte 0 (0x01=PS4, 0x02=PS5) */
+    int is_ps4 = 0;
+    {
+        int hfd = open(path, O_RDONLY);
+        if (hfd >= 0) {
+            uint8_t hdr;
+            if (pread(hfd, &hdr, 1, 0) == 1 && hdr == 0x01) is_ps4 = 1;
+            close(hfd);
+        }
+    }
+    logprintf("[GarlicMgr] mount_by_path: %s detected as %s\n", bname, is_ps4 ? "PS4" : "PS5");
 
     kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
     uint8_t caps[16];
@@ -1112,9 +1161,7 @@ static void handle_request(int sock) {
         for (int i = 0; i < g_save_count; i++) {
             if (i > 0) need++;
             const char *tname = lookup_title(g_saves[i].title_id);
-            const char *stype = (strncmp(g_saves[i].save_name, "sdimg_", 6) == 0 &&
-                                  strstr(g_saves[i].path, "/savedata/") != NULL &&
-                                  strstr(g_saves[i].path, "/savedata_prospero/") == NULL) ? "ps4" : "ps5";
+            const char *stype = g_saves[i].is_ps4 ? "ps4" : "ps5";
             /* Count escaped title_name length */
             int tname_esc_len = 0;
             if (tname) {
@@ -1122,9 +1169,9 @@ static void handle_request(int sock) {
                     tname_esc_len += (*c == '"' || *c == '\\' || *c < 0x20) ? 2 : 1;
             }
             need += snprintf(NULL, 0,
-                "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"path\":\"%s\",\"dir\":\"%s\",\"title_name\":\"\",\"type\":\"%s\"}",
+                "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"path\":\"%s\",\"dir\":\"%s\",\"title_name\":\"\",\"type\":\"%s\",\"backup\":%s}",
                 g_saves[i].title_id, g_saves[i].save_name, g_saves[i].path, g_saves[i].dir_name,
-                stype);
+                stype, g_saves[i].is_backup ? "true" : "false");
             need += tname_esc_len;
         }
         need += snprintf(NULL, 0, "]}");
@@ -1134,9 +1181,7 @@ static void handle_request(int sock) {
         for (int i = 0; i < g_save_count; i++) {
             if (i > 0) json[pos++] = ',';
             const char *tname = lookup_title(g_saves[i].title_id);
-            const char *stype = (strncmp(g_saves[i].save_name, "sdimg_", 6) == 0 &&
-                                  strstr(g_saves[i].path, "/savedata/") != NULL &&
-                                  strstr(g_saves[i].path, "/savedata_prospero/") == NULL) ? "ps4" : "ps5";
+            const char *stype = g_saves[i].is_ps4 ? "ps4" : "ps5";
             /* Escape title_name for JSON */
             char esc_tname[512] = {0};
             if (tname) {
@@ -1148,9 +1193,9 @@ static void handle_request(int sock) {
                 esc_tname[tp] = 0;
             }
             pos += snprintf(json + pos, need + 1 - pos,
-                "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"path\":\"%s\",\"dir\":\"%s\",\"title_name\":\"%s\",\"type\":\"%s\"}",
+                "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"path\":\"%s\",\"dir\":\"%s\",\"title_name\":\"%s\",\"type\":\"%s\",\"backup\":%s}",
                 g_saves[i].title_id, g_saves[i].save_name, g_saves[i].path, g_saves[i].dir_name,
-                esc_tname, stype);
+                esc_tname, stype, g_saves[i].is_backup ? "true" : "false");
         }
         snprintf(json + pos, need + 1 - pos, "]}");
         http_json(sock, json);
@@ -1175,9 +1220,7 @@ static void handle_request(int sock) {
         }
 
         /* Detect PS4 save for SFO offset differences */
-        const char *mn = strrchr(g_saves[idx].save_name, '/');
-        mn = mn ? mn + 1 : g_saves[idx].save_name;
-        int sfo_ps4 = (strncmp(mn, "sdimg_", 6) == 0);
+        int sfo_ps4 = g_saves[idx].is_ps4;
 
         /* Read param.sfo:
          * PS5: account_id 8B @ 0x1B8, save_title @ 0x5DC, title_id 9B @ 0xB20
