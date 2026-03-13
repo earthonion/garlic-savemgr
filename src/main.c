@@ -78,8 +78,10 @@ typedef struct {
     char title_id[32];           /* e.g. PPSA01234 */
     char save_name[256];         /* save file name (varies per game) */
     char dir_name[256];          /* for mount point naming */
+    char user_id[16];            /* hex user id e.g. "10000000" */
     int is_ps4;                  /* 1 if PS4 save (byte 0x0 == 0x01) */
     int is_backup;               /* 1 if backup save (sdimg_sce_bu_) */
+    int is_usb;                  /* 1 if save is on USB */
 } save_entry_t;
 
 static save_entry_t *g_saves = NULL;
@@ -168,7 +170,7 @@ static void notify(const char *fmt, ...) {
 }
 
 /* ── Save discovery ─────────────────────────────────────────────── */
-static void scan_title_dir(const char *title_path, const char *title_id) {
+static void scan_title_dir(const char *title_path, const char *title_id, const char *uid) {
     DIR *d = opendir(title_path);
     if (!d) return;
 
@@ -199,6 +201,8 @@ static void scan_title_dir(const char *title_path, const char *title_id) {
             snprintf(s->save_name, sizeof(s->save_name), "%s", ent->d_name);
             snprintf(s->dir_name, sizeof(s->dir_name), "%s_%s", title_id, ent->d_name);
             s->is_backup = (strncmp(ent->d_name, "sdimg_sce_bu_", 13) == 0);
+            snprintf(s->user_id, sizeof(s->user_id), "%s", uid);
+            s->is_usb = 0;
             /* Detect PS4 by byte 0x0 */
             s->is_ps4 = 0;
             int hfd = open(filepath, O_RDONLY);
@@ -212,7 +216,7 @@ static void scan_title_dir(const char *title_path, const char *title_id) {
     closedir(d);
 }
 
-static void scan_savedata_prospero(const char *prospero_path) {
+static void scan_savedata_prospero(const char *prospero_path, const char *uid) {
     DIR *d = opendir(prospero_path);
     if (!d) return;
 
@@ -225,7 +229,67 @@ static void scan_savedata_prospero(const char *prospero_path) {
 
         struct stat st;
         if (stat(title_path, &st) == 0 && S_ISDIR(st.st_mode))
-            scan_title_dir(title_path, ent->d_name);
+            scan_title_dir(title_path, ent->d_name, uid);
+    }
+    closedir(d);
+}
+
+static void scan_usb_saves(const char *garlic_path) {
+    DIR *d = opendir(garlic_path);
+    if (!d) return;
+    struct dirent *ent;
+    while ((ent = readdir(d))) {
+        if (ent->d_name[0] == '.') continue;
+        char title_path[MAX_PATH_LEN];
+        snprintf(title_path, sizeof(title_path), "%s/%s", garlic_path, ent->d_name);
+        struct stat st;
+        if (stat(title_path, &st) < 0 || !S_ISDIR(st.st_mode)) continue;
+
+        DIR *td = opendir(title_path);
+        if (!td) continue;
+        struct dirent *se;
+        while ((se = readdir(td))) {
+            if (se->d_name[0] == '.') continue;
+            int len = strlen(se->d_name);
+            if (len > 4 && strcmp(se->d_name + len - 4, ".bin") == 0) continue;
+
+            char filepath[MAX_PATH_LEN];
+            snprintf(filepath, sizeof(filepath), "%s/%s", title_path, se->d_name);
+            struct stat fst;
+            if (stat(filepath, &fst) < 0) continue;
+            if (!S_ISREG(fst.st_mode) && !S_ISDIR(fst.st_mode)) continue;
+
+            save_entry_t *s = save_alloc();
+            if (!s) break;
+            snprintf(s->path, sizeof(s->path), "%s", filepath);
+            snprintf(s->title_id, sizeof(s->title_id), "%s", ent->d_name);
+            snprintf(s->save_name, sizeof(s->save_name), "%s", se->d_name);
+            snprintf(s->dir_name, sizeof(s->dir_name), "%s_%s", ent->d_name, se->d_name);
+            s->is_backup = (strncmp(se->d_name, "sdimg_sce_bu_", 13) == 0);
+            s->user_id[0] = 0;
+            s->is_usb = 1;
+            s->is_ps4 = 0;
+            if (S_ISREG(fst.st_mode)) {
+                /* Encrypted image: PS4 if byte 0x0 == 0x01 */
+                int hfd = open(filepath, O_RDONLY);
+                if (hfd >= 0) {
+                    uint8_t hdr;
+                    if (pread(hfd, &hdr, 1, 0) == 1 && hdr == 0x01) s->is_ps4 = 1;
+                    close(hfd);
+                }
+            } else if (S_ISDIR(fst.st_mode)) {
+                /* Decrypted folder: check param.sfo byte 0x8 — 0x0D=PS4, 0x00=PS5 */
+                char sfo[MAX_PATH_LEN];
+                snprintf(sfo, sizeof(sfo), "%s/sce_sys/param.sfo", filepath);
+                int sfd = open(sfo, O_RDONLY);
+                if (sfd >= 0) {
+                    uint8_t ver;
+                    if (pread(sfd, &ver, 1, 0x8) == 1 && ver == 0x0D) s->is_ps4 = 1;
+                    close(sfd);
+                }
+            }
+        }
+        closedir(td);
     }
     closedir(d);
 }
@@ -242,42 +306,21 @@ static void scan_saves(void) {
             if (ue->d_name[0] == '.') continue;
             char prospero[MAX_PATH_LEN];
             snprintf(prospero, sizeof(prospero), "/user/home/%s/savedata_prospero", ue->d_name);
-            scan_savedata_prospero(prospero);
+            scan_savedata_prospero(prospero, ue->d_name);
             char ps4[MAX_PATH_LEN];
             snprintf(ps4, sizeof(ps4), "/user/home/%s/savedata", ue->d_name);
-            scan_savedata_prospero(ps4);
+            scan_savedata_prospero(ps4, ue->d_name);
         }
         closedir(home);
     }
 
-    /* /data/save_files/ for manually placed saves */
-    DIR *d = opendir("/data/save_files");
-    if (d) {
-        struct dirent *ent;
-        while ((ent = readdir(d))) {
-            if (ent->d_name[0] == '.') continue;
-            char filepath[MAX_PATH_LEN];
-            snprintf(filepath, sizeof(filepath), "/data/save_files/%s", ent->d_name);
-            struct stat st;
-            if (stat(filepath, &st) == 0 && S_ISREG(st.st_mode)) {
-                save_entry_t *s = save_alloc();
-                if (!s) break;
-                snprintf(s->path, sizeof(s->path), "%s", filepath);
-                snprintf(s->title_id, sizeof(s->title_id), "manual");
-                snprintf(s->save_name, sizeof(s->save_name), "%s", ent->d_name);
-                snprintf(s->dir_name, sizeof(s->dir_name), "manual_%s", ent->d_name);
-                s->is_backup = (strncmp(ent->d_name, "sdimg_sce_bu_", 13) == 0);
-                s->is_ps4 = 0;
-                int hfd = open(filepath, O_RDONLY);
-                if (hfd >= 0) {
-                    uint8_t hdr;
-                    if (pread(hfd, &hdr, 1, 0) == 1 && hdr == 0x01) s->is_ps4 = 1;
-                    close(hfd);
-                }
-            }
-        }
-        closedir(d);
+    /* /mnt/usb0-7/PS5/SAVEDATA/GARLIC/<TitleId>/<savefile> */
+    for (int u = 0; u < 8; u++) {
+        char usb_path[MAX_PATH_LEN];
+        snprintf(usb_path, sizeof(usb_path), "/mnt/usb%d/PS5/SAVEDATA/GARLIC", u);
+        scan_usb_saves(usb_path);
     }
+
 }
 
 /* ── Recursive delete helper ────────────────────────────────────── */
@@ -313,6 +356,29 @@ static int copy_file(const char *src, const char *dst) {
         write(dfd, buf, n);
     close(sfd);
     close(dfd);
+    return 0;
+}
+
+/* ── Recursive directory copy ───────────────────────────────────── */
+static int copy_dir_recursive(const char *src, const char *dst) {
+    mkdir(dst, 0777);
+    DIR *d = opendir(src);
+    if (!d) return -1;
+    struct dirent *ent;
+    while ((ent = readdir(d))) {
+        if (ent->d_name[0] == '.') continue;
+        char sp[MAX_PATH_LEN], dp[MAX_PATH_LEN];
+        snprintf(sp, sizeof(sp), "%s/%s", src, ent->d_name);
+        snprintf(dp, sizeof(dp), "%s/%s", dst, ent->d_name);
+        struct stat st;
+        if (stat(sp, &st) < 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            copy_dir_recursive(sp, dp);
+        } else {
+            copy_file(sp, dp);
+        }
+    }
+    closedir(d);
     return 0;
 }
 
@@ -667,6 +733,14 @@ static int parse_sfo(const char *path, sfo_info_t *info) {
     if (!buf) { close(fd); return -1; }
     if (read(fd, buf, st.st_size) != st.st_size) { free(buf); close(fd); return -1; }
     close(fd);
+
+    /* Check if all zeros (corrupted) */
+    int all_zero = 1;
+    size_t check_len = st.st_size < 256 ? st.st_size : 256;
+    for (size_t i = 0; i < check_len; i++) {
+        if (buf[i] != 0) { all_zero = 0; break; }
+    }
+    if (all_zero) { free(buf); return -2; }
 
     /* Check magic PSF\0 */
     if (buf[0] != 0x00 || buf[1] != 0x50 || buf[2] != 0x53 || buf[3] != 0x46) {
@@ -1245,6 +1319,68 @@ static void handle_request(int sock) {
         return;
     }
 
+    /* GET /api/usb_list -> detect connected USB drives */
+    if (strcmp(method, "GET") == 0 && strcmp(url, "/api/usb_list") == 0) {
+        char json[256] = "{\"usb\":[";
+        int pos = strlen(json), first = 1;
+        for (int u = 0; u < 8; u++) {
+            char mp[32];
+            snprintf(mp, sizeof(mp), "/mnt/usb%d", u);
+            struct stat st;
+            if (stat(mp, &st) == 0 && S_ISDIR(st.st_mode)) {
+                /* Check if it's actually mounted (has contents) */
+                DIR *d = opendir(mp);
+                if (d) {
+                    struct dirent *ent;
+                    int has_files = 0;
+                    while ((ent = readdir(d))) {
+                        if (ent->d_name[0] != '.') { has_files = 1; break; }
+                    }
+                    closedir(d);
+                    if (has_files) {
+                        if (!first) json[pos++] = ',';
+                        pos += snprintf(json + pos, sizeof(json) - pos, "%d", u);
+                        first = 0;
+                    }
+                }
+            }
+        }
+        snprintf(json + pos, sizeof(json) - pos, "]}");
+        http_json(sock, json);
+        return;
+    }
+
+    /* GET /api/users -> list users with usernames */
+    if (strcmp(method, "GET") == 0 && strcmp(url, "/api/users") == 0) {
+        DIR *home = opendir("/user/home");
+        char json[2048] = "{\"users\":[";
+        int pos = strlen(json), first = 1;
+        if (home) {
+            struct dirent *ue;
+            while ((ue = readdir(home))) {
+                if (ue->d_name[0] == '.') continue;
+                char upath[MAX_PATH_LEN];
+                snprintf(upath, sizeof(upath), "/user/home/%s/username.dat", ue->d_name);
+                char uname[17] = {0};
+                int fd = open(upath, O_RDONLY);
+                if (fd >= 0) {
+                    read(fd, uname, 16);
+                    uname[16] = 0;
+                    close(fd);
+                }
+                if (!uname[0]) snprintf(uname, sizeof(uname), "User %s", ue->d_name);
+                if (!first) json[pos++] = ',';
+                pos += snprintf(json + pos, sizeof(json) - pos,
+                    "{\"id\":\"%s\",\"name\":\"%s\"}", ue->d_name, uname);
+                first = 0;
+            }
+            closedir(home);
+        }
+        snprintf(json + pos, sizeof(json) - pos, "]}");
+        http_json(sock, json);
+        return;
+    }
+
     /* GET /api/saves */
     if (strcmp(method, "GET") == 0 && strcmp(url, "/api/saves") == 0) {
         scan_saves();
@@ -1260,9 +1396,10 @@ static void handle_request(int sock) {
                     tname_esc_len += (*c == '"' || *c == '\\' || *c < 0x20) ? 2 : 1;
             }
             need += snprintf(NULL, 0,
-                "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"path\":\"%s\",\"dir\":\"%s\",\"title_name\":\"\",\"type\":\"%s\",\"backup\":%s}",
+                "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"path\":\"%s\",\"dir\":\"%s\",\"title_name\":\"\",\"type\":\"%s\",\"backup\":%s,\"usb\":%s,\"uid\":\"%s\"}",
                 g_saves[i].title_id, g_saves[i].save_name, g_saves[i].path, g_saves[i].dir_name,
-                stype, g_saves[i].is_backup ? "true" : "false");
+                stype, g_saves[i].is_backup ? "true" : "false", g_saves[i].is_usb ? "true" : "false",
+                g_saves[i].user_id);
             need += tname_esc_len;
         }
         need += snprintf(NULL, 0, "]}");
@@ -1284,9 +1421,10 @@ static void handle_request(int sock) {
                 esc_tname[tp] = 0;
             }
             pos += snprintf(json + pos, need + 1 - pos,
-                "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"path\":\"%s\",\"dir\":\"%s\",\"title_name\":\"%s\",\"type\":\"%s\",\"backup\":%s}",
+                "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"path\":\"%s\",\"dir\":\"%s\",\"title_name\":\"%s\",\"type\":\"%s\",\"backup\":%s,\"usb\":%s,\"uid\":\"%s\"}",
                 g_saves[i].title_id, g_saves[i].save_name, g_saves[i].path, g_saves[i].dir_name,
-                esc_tname, stype, g_saves[i].is_backup ? "true" : "false");
+                esc_tname, stype, g_saves[i].is_backup ? "true" : "false", g_saves[i].is_usb ? "true" : "false",
+                g_saves[i].user_id);
         }
         snprintf(json + pos, need + 1 - pos, "]}");
         http_json(sock, json);
@@ -1301,64 +1439,68 @@ static void handle_request(int sock) {
         int idx = -1;
         char *p = strstr(url, "idx=");
         if (p) idx = atoi(p + 4);
-
-        int ret = mount_save(idx);
-        if (ret < 0) {
-            char json[256];
-            snprintf(json, sizeof(json), "{\"error\":\"Mount failed: %d (0x%x)\"}", ret, ret);
-            http_json(sock, json);
-            return;
+        if (idx < 0 || idx >= g_save_count) {
+            http_json(sock, "{\"error\":\"Invalid index\"}"); return;
         }
 
-        /* Detect PS4 save for SFO offset differences */
-        int sfo_ps4 = g_saves[idx].is_ps4;
+        /* Check if this is a decrypted folder (USB) — just list contents, no mount */
+        struct stat path_st;
+        int is_dir = (stat(g_saves[idx].path, &path_st) == 0 && S_ISDIR(path_st.st_mode));
 
-        /* Read param.sfo:
-         * PS5: account_id 8B @ 0x1B8, save_title @ 0x5DC, title_id 9B @ 0xB20
-         * PS4: account_id 8B @ 0x15C
-         */
+        const char *browse_root;
+        if (is_dir) {
+            browse_root = g_saves[idx].path;
+        } else {
+            int ret = mount_save(idx);
+            if (ret < 0) {
+                char json[256];
+                snprintf(json, sizeof(json), "{\"error\":\"Mount failed: %d (0x%x)\"}", ret, ret);
+                http_json(sock, json);
+                return;
+            }
+            browse_root = g_mount_point;
+        }
+
+        /* Parse param.sfo properly using key-value parser */
         char acct_id[20] = {0};
         char save_title[64] = {0};
         char sfo_title_id[16] = {0};
         char sfo_path[MAX_PATH_LEN];
-        snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
-        int sfo_fd = open(sfo_path, O_RDONLY);
-        if (sfo_fd >= 0) {
-            uint8_t aid[8];
-            int aid_off = sfo_ps4 ? 0x15C : 0x1B8;
-            if (pread(sfo_fd, aid, 8, aid_off) == 8)
+        snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", browse_root);
+        sfo_info_t sfo_info;
+        if (parse_sfo(sfo_path, &sfo_info) == 0) {
+            if (sfo_info.account_id) {
+                uint8_t *a = (uint8_t *)&sfo_info.account_id;
                 snprintf(acct_id, sizeof(acct_id), "0x%02X%02X%02X%02X%02X%02X%02X%02X",
-                    aid[0],aid[1],aid[2],aid[3],aid[4],aid[5],aid[6],aid[7]);
-            char raw_title[0x21] = {0};
-            if (pread(sfo_fd, raw_title, 0x20, 0x5DC) > 0) {
-                raw_title[0x20] = 0;
+                    a[0],a[1],a[2],a[3],a[4],a[5],a[6],a[7]);
+            }
+            if (sfo_info.main_title[0]) {
                 int tp = 0;
-                for (int ti = 0; raw_title[ti] && tp < (int)sizeof(save_title) - 2; ti++) {
-                    char ch = raw_title[ti];
+                for (int ti = 0; sfo_info.main_title[ti] && tp < (int)sizeof(save_title) - 2; ti++) {
+                    char ch = sfo_info.main_title[ti];
                     if (ch == '"' || ch == '\\') { save_title[tp++] = '\\'; }
                     if (ch >= 0x20) save_title[tp++] = ch;
                 }
                 save_title[tp] = 0;
             }
-            if (!sfo_ps4 && pread(sfo_fd, sfo_title_id, 9, 0xB20) > 0)
-                sfo_title_id[9] = 0;
-            close(sfo_fd);
+            if (sfo_info.title_id[0])
+                strncpy(sfo_title_id, sfo_info.title_id, sizeof(sfo_title_id) - 1);
         }
 
         const char *tid = sfo_title_id[0] ? sfo_title_id : g_saves[idx].title_id;
         int need = snprintf(NULL, 0,
             "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"mount\":\"%s\","
             "\"account_id\":\"%s\",\"save_title\":\"%s\",\"files\":[",
-            tid, g_saves[idx].save_name, g_mount_point, acct_id, save_title);
-        need += json_list_dir(NULL, 0, g_mount_point, "");
+            tid, g_saves[idx].save_name, browse_root, acct_id, save_title);
+        need += json_list_dir(NULL, 0, browse_root, "");
         need += snprintf(NULL, 0, "]}");
         char *json = malloc(need + 1);
         if (!json) { http_json(sock, "{\"error\":\"Out of memory\"}"); return; }
         int pos = snprintf(json, need + 1,
             "{\"title_id\":\"%s\",\"save_name\":\"%s\",\"mount\":\"%s\","
             "\"account_id\":\"%s\",\"save_title\":\"%s\",\"files\":[",
-            tid, g_saves[idx].save_name, g_mount_point, acct_id, save_title);
-        pos += json_list_dir(json + pos, need + 1 - pos, g_mount_point, "");
+            tid, g_saves[idx].save_name, browse_root, acct_id, save_title);
+        pos += json_list_dir(json + pos, need + 1 - pos, browse_root, "");
         snprintf(json + pos, need + 1 - pos, "]}");
         http_json(sock, json);
         free(json);
@@ -1461,12 +1603,15 @@ static void handle_request(int sock) {
         return;
     }
 
-    /* GET /api/dump_usb?idx=N -> copy raw save to /mnt/usb0/saves/<titleid>/ with progress */
+    /* GET /api/dump_usb?idx=N&usb=U -> mount, copy decrypted files to USB, unmount */
     if (strcmp(method, "GET") == 0 && strncmp(url, "/api/dump_usb", 13) == 0) {
         scan_saves();
-        int idx = -1;
+        int idx = -1, usb_num = 0;
         char *p = strstr(url, "idx=");
         if (p) idx = atoi(p + 4);
+        p = strstr(url, "usb=");
+        if (p) usb_num = atoi(p + 4);
+        if (usb_num < 0 || usb_num > 7) usb_num = 0;
         if (idx < 0 || idx >= g_save_count) {
             http_json(sock, "{\"error\":\"Invalid index\"}"); return;
         }
@@ -1475,63 +1620,44 @@ static void handle_request(int sock) {
         kernel_set_ucred_uid(rpid, 0);
         kernel_set_ucred_authid(rpid, 0x4800000000000010ULL);
 
-        struct stat sst;
-        if (stat(s->path, &sst) < 0) {
-            http_json(sock, "{\"error\":\"Source file not found\"}"); return;
+        /* Mount the save */
+        if (g_mounted) unmount_save();
+        int ret = mount_save(idx);
+        if (ret < 0) {
+            char json[128];
+            snprintf(json, sizeof(json), "{\"error\":\"Mount failed: %d\"}", ret);
+            http_json(sock, json);
+            return;
         }
 
-        mkdir("/mnt/usb0/saves", 0777);
+        /* Create USB destination dirs */
+        char usb_base[64];
+        snprintf(usb_base, sizeof(usb_base), "/mnt/usb%d", usb_num);
+        char tmp[MAX_PATH_LEN];
+        snprintf(tmp, sizeof(tmp), "%s/PS5", usb_base); mkdir(tmp, 0777);
+        snprintf(tmp, sizeof(tmp), "%s/PS5/SAVEDATA", usb_base); mkdir(tmp, 0777);
+        snprintf(tmp, sizeof(tmp), "%s/PS5/SAVEDATA/GARLIC", usb_base); mkdir(tmp, 0777);
         char title_dir[MAX_PATH_LEN];
-        snprintf(title_dir, sizeof(title_dir), "/mnt/usb0/saves/%s", s->title_id);
+        snprintf(title_dir, sizeof(title_dir), "%s/PS5/SAVEDATA/GARLIC/%s", usb_base, s->title_id);
         mkdir(title_dir, 0777);
+        char save_dir[MAX_PATH_LEN];
+        snprintf(save_dir, sizeof(save_dir), "%s/%s", title_dir, s->save_name);
 
-        char dst[MAX_PATH_LEN];
-        snprintf(dst, sizeof(dst), "%s/%s", title_dir, s->save_name);
+        /* Copy decrypted files from mount point to USB */
+        int cpret = copy_dir_recursive(g_mount_point, save_dir);
 
-        int sfd = open(s->path, O_RDONLY);
-        if (sfd < 0) {
-            http_json(sock, "{\"error\":\"Cannot open source - is USB inserted?\"}"); return;
+        /* Unmount (no changes made, just reading) */
+        unmount_save();
+
+        if (cpret < 0) {
+            http_json(sock, "{\"error\":\"Failed to copy files to USB\"}");
+            return;
         }
-        int dfd = open(dst, O_CREAT | O_WRONLY | O_TRUNC, 0755);
-        if (dfd < 0) {
-            close(sfd);
-            http_json(sock, "{\"error\":\"Cannot create dest - is USB inserted?\"}"); return;
-        }
 
-        /* Stream progress as newline-delimited JSON */
-        char hdr[512];
-        int hlen = snprintf(hdr, sizeof(hdr),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/x-ndjson\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Connection: close\r\n\r\n");
-        send(sock, hdr, hlen, 0);
-
-        char *buf = g_iobuf;
-        ssize_t nr;
-        size_t copied = 0;
-        long long total = (long long)sst.st_size;
-        int last_pct = -1;
-        while ((nr = read(sfd, buf, BUF_SIZE)) > 0) {
-            write(dfd, buf, nr);
-            copied += nr;
-            int pct = total > 0 ? (int)(copied * 100 / total) : 100;
-            if (pct != last_pct) {
-                last_pct = pct;
-                char prog[128];
-                int plen = snprintf(prog, sizeof(prog),
-                    "{\"progress\":%d,\"copied\":%zu,\"total\":%lld}\n", pct, copied, total);
-                send(sock, prog, plen, 0);
-            }
-        }
-        close(sfd);
-        close(dfd);
-
-        char done[512];
-        int dlen = snprintf(done, sizeof(done),
-            "{\"ok\":true,\"path\":\"%s/%s\",\"size\":%lld}\n",
-            title_dir, s->save_name, total);
-        send(sock, done, dlen, 0);
+        char json[512];
+        snprintf(json, sizeof(json),
+            "{\"ok\":true,\"path\":\"%s\"}", save_dir);
+        http_json(sock, json);
         return;
     }
 
@@ -2513,7 +2639,12 @@ static void handle_request(int sock) {
         char sfo_path[MAX_PATH_LEN];
         snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
         sfo_info_t sfo;
-        if (parse_sfo(sfo_path, &sfo) < 0) {
+        int sfo_ret = parse_sfo(sfo_path, &sfo);
+        if (sfo_ret == -2) {
+            http_json(sock, "{\"error\":\"param.sfo is corrupted!\"}");
+            return;
+        }
+        if (sfo_ret < 0) {
             http_json(sock, "{\"error\":\"Cannot parse param.sfo — is sce_sys/param.sfo present?\"}");
             return;
         }
@@ -2595,14 +2726,15 @@ static void handle_request(int sock) {
         recursive_mkdir(sd_dir);
 
         /* Copy encrypted image to final location */
+        int from_usb = (strncmp(tmp_path, "/mnt/usb", 8) == 0);
         printf("[GarlicMgr] import: copying %s -> %s\n", tmp_path, sd_dst);
         if (copy_file(tmp_path, sd_dst) < 0) {
-            unlink(tmp_path);
+            if (!from_usb) unlink(tmp_path);
             if (icon_tmp[0]) unlink(icon_tmp);
             http_json(sock, "{\"error\":\"Failed to copy save to destination\"}");
             return;
         }
-        unlink(tmp_path);
+        if (!from_usb) unlink(tmp_path);
         chmod(sd_dst, 0644);
 
         /* Copy icon to meta directory */

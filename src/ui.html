@@ -83,6 +83,17 @@
       border-bottom: 1px solid var(--bd); flex-shrink: 0;
     }
 
+    /* ── Platform tabs ────────────────────────────────── */
+    .ptab {
+      background: none; border: 1px solid var(--bd); color: var(--dm);
+      font-size: 13px; font-weight: 700; padding: 3px 12px;
+      cursor: pointer; letter-spacing: .5px; text-transform: uppercase; transition: all .2s;
+    }
+    .ptab:first-of-type { border-radius: 10px 0 0 10px }
+    .ptab:last-of-type { border-radius: 0 10px 10px 0 }
+    .ptab.active { color: #fff; background: var(--ac); border-color: var(--ac) }
+    .ptab:hover:not(.active) { color: var(--tx) }
+
     /* ── Save list ───────────────────────────────────── */
     .svs { flex: 1; overflow-y: auto }
 
@@ -104,6 +115,7 @@
     .badge-ps4 { background:#1e6fbf; color:#fff }
     .badge-ps5 { background:#1a8a3f; color:#fff }
     .badge-bu { background:#c89b00; color:#000 }
+    .badge-usb { background:#8b5cf6; color:#fff }
 
     /* ── Right panel ─────────────────────────────────── */
     .right { flex: 1; display: flex; flex-direction: column; overflow: hidden }
@@ -339,6 +351,32 @@
       .fi { font-size: 12px; padding: 6px 10px }
       .dir-dots { opacity: .5 }
     }
+
+    /* ── User selector ────────────────────────────────── */
+    .user-sel {
+      position: relative; display: inline-flex; align-items: center;
+      margin-right: 12px;
+    }
+    .user-btn {
+      background: none; border: 1px solid var(--bd); color: var(--tx);
+      font-size: 11px; font-weight: 600; padding: 4px 10px;
+      cursor: pointer; border-radius: 12px; transition: all .2s;
+      display: flex; align-items: center; gap: 4px;
+    }
+    .user-btn:hover { border-color: var(--ac); color: var(--ac) }
+    .user-btn .arrow { font-size: 8px; color: var(--dm) }
+    .user-dd {
+      display: none; position: absolute; top: 100%; left: 0; margin-top: 4px;
+      background: var(--s1); border: 1px solid var(--bd); border-radius: 8px;
+      min-width: 140px; z-index: 100; overflow: hidden;
+      box-shadow: 0 8px 24px rgba(0,0,0,.5);
+    }
+    .user-dd.open { display: block }
+    .user-dd div {
+      padding: 8px 12px; font-size: 11px; cursor: pointer; transition: background .1s;
+    }
+    .user-dd div:hover { background: var(--gl) }
+    .user-dd div.active { color: var(--ac); font-weight: 700 }
   </style>
 </head>
 <body>
@@ -346,6 +384,10 @@
 <!-- ── Navigation ──────────────────────────────────── -->
 <nav>
   <span class="logo">GARLICMGR</span>
+  <div class="user-sel" id="usersel">
+    <button class="user-btn" onclick="toggleUserDD()"><span id="curuser">Loading...</span> <span class="arrow">&#9662;</span></button>
+    <div class="user-dd" id="userdd"></div>
+  </div>
   <button class="tab active" onclick="switchTab('browse')">Browse</button>
   <button class="tab" onclick="switchTab('decrypt')">Decrypt</button>
   <button class="tab" onclick="switchTab('encrypt')">Encrypt</button>
@@ -367,7 +409,11 @@
 <!-- ── Main layout ─────────────────────────────────── -->
 <div class="main" id="mn">
   <div class="left" id="drawer">
-    <div class="shdr desk-shdr">Saves</div>
+    <div class="shdr desk-shdr" style="display:flex;align-items:center;gap:0">
+      <span style="margin-right:auto">Saves</span>
+      <button class="ptab active" id="ptab5" onclick="setPlatform('ps5')">PS5</button>
+      <button class="ptab" id="ptab4" onclick="setPlatform('ps4')">PS4</button>
+    </div>
     <div class="drawer-toggle" onclick="toggleDrawer()" id="dtog"></div>
     <div class="svs" id="svs"><div class="empty">Loading...</div></div>
   </div>
@@ -561,14 +607,56 @@ function toggleDrawer() {
 }
 function updateDrawer() {
   const d = $('drawer');
+  const cnt = S.filter(s => s.type === platform).length;
   if (drawerOpen) {
     d.classList.remove('collapsed');
-    $('dtog').textContent = '\u25BE Saves';
+    $('dtog').innerHTML = '\u25BE Saves'
+      + ' <button class="ptab' + (platform === 'ps5' ? ' active' : '') + '" onclick="event.stopPropagation();setPlatform(\'ps5\')" style="margin-left:8px">PS5</button>'
+      + '<button class="ptab' + (platform === 'ps4' ? ' active' : '') + '" onclick="event.stopPropagation();setPlatform(\'ps4\')">PS4</button>';
   } else {
     d.classList.add('collapsed');
-    $('dtog').textContent = '\u25B8 Saves' + (S.length ? ' (' + S.length + ')' : '');
+    $('dtog').textContent = '\u25B8 ' + platform.toUpperCase() + ' Saves' + (cnt ? ' (' + cnt + ')' : '');
   }
 }
+
+/* ── User selector ─────────────────────────────────── */
+let users = [];
+let curUid = '';
+
+async function loadUsers() {
+  try {
+    const r = await fetch('/api/users');
+    const d = await r.json();
+    users = d.users || [];
+    if (users.length > 0) {
+      curUid = users[0].id;
+      $('curuser').textContent = users[0].name;
+    }
+    if (users.length <= 1) $('usersel').querySelector('.arrow').style.display = 'none';
+  } catch(e) {}
+}
+
+function toggleUserDD() {
+  if (users.length <= 1) return;
+  const dd = $('userdd');
+  dd.classList.toggle('open');
+  dd.innerHTML = users.map(u =>
+    '<div class="' + (u.id === curUid ? 'active' : '') + '" onclick="selectUser(\'' + u.id + '\')">' + esc(u.name) + '</div>'
+  ).join('');
+}
+
+function selectUser(uid) {
+  curUid = uid;
+  const u = users.find(x => x.id === uid);
+  $('curuser').textContent = u ? u.name : uid;
+  $('userdd').classList.remove('open');
+  si = -1; mt = null; cf = [];
+  renderL(); renderTB(); renderCt(); updateDrawer();
+}
+
+document.addEventListener('click', e => {
+  if (!e.target.closest('.user-sel')) $('userdd').classList.remove('open');
+});
 
 /* ── Tab switching ─────────────────────────────────── */
 function switchTab(t) {
@@ -605,50 +693,85 @@ async function load() {
 
 /* ── Render save list (left panel) ─────────────────── */
 let exG = new Set(); /* expanded groups */
+let usbDrawerOpen = false;
+let platform = 'ps5';
+
+function setPlatform(p) {
+  platform = p;
+  $('ptab5').className = 'ptab' + (p === 'ps5' ? ' active' : '');
+  $('ptab4').className = 'ptab' + (p === 'ps4' ? ' active' : '');
+  si = -1; mt = null; cf = [];
+  renderL(); renderTB(); renderCt(); updateDrawer();
+}
+
+function renderGroup(g, h) {
+  const gtype = S[g.items[0]].type || 'ps5';
+  const badge = '<span class="badge badge-' + gtype + '">' + gtype.toUpperCase() + '</span>';
+  const anyUsb = g.items.every(i => S[i].usb);
+  const tdots = anyUsb ? '' : '<span class="title-dots" onclick="event.stopPropagation();showTitleMenu(event,\'' + esc(g.title_id).replace(/'/g, "\\'") + '\')">\u22EE</span>';
+  if (g.items.length === 1) {
+    const i = g.items[0], s = S[i];
+    const bu = s.backup ? '<span class="badge badge-bu">BACKUP</span>' : '';
+    h += '<div class="sv' + (i === si ? ' sel' : '') + '" onclick="sel(' + i + ')">';
+    h += '<div class="tid">' + bu + badge + esc(g.name) + tdots + '</div>';
+    h += '<div class="sn">' + esc(s.save_name) + '</div></div>';
+  } else {
+    const open = exG.has(g.title_id);
+    const anySel = g.items.includes(si);
+    h += '<div class="sv' + (anySel ? ' sel' : '') + '" onclick="togG(\'' + esc(g.title_id) + '\')" style="cursor:pointer">';
+    h += '<div class="tid">' + badge + (open ? '\u25BE ' : '\u25B8 ') + esc(g.name) + tdots + '</div>';
+    h += '<div class="sn">' + g.items.length + ' saves</div></div>';
+    if (open) {
+      g.items.forEach(i => {
+        const s = S[i];
+        const bu = s.backup ? '<span class="badge badge-bu">BACKUP</span>' : '';
+        h += '<div class="sv' + (i === si ? ' sel' : '') + '" onclick="sel(' + i + ')" style="padding-left:28px">';
+        h += '<div class="sn" style="color:var(--tx)">' + bu + esc(s.save_name) + '</div></div>';
+      });
+    }
+  }
+  return h;
+}
 
 function renderL() {
-  if (!S.length) {
-    $('svs').innerHTML = '<div class="empty">No saves found</div>';
+  const ptype = platform === 'ps4' ? 'ps4' : 'ps5';
+  const filtered = S.map((s, i) => ({s, i})).filter(x => x.s.type === ptype && (x.s.usb || x.s.uid === curUid));
+  if (!filtered.length) {
+    $('svs').innerHTML = '<div class="empty">No ' + ptype.toUpperCase() + ' saves found</div>';
     return;
   }
-  /* Group saves by title_id */
-  const groups = [];
-  const gmap = {};
-  S.forEach((s, i) => {
-    if (!gmap[s.title_id]) {
-      gmap[s.title_id] = { title_id: s.title_id, name: s.title_name || s.title_id, items: [] };
-      groups.push(gmap[s.title_id]);
+  /* Group saves by title_id, split system vs USB */
+  const sysGroups = [], usbGroups = [];
+  const sysMap = {}, usbMap = {};
+  filtered.forEach(({s, i}) => {
+    if (s.usb) {
+      if (!usbMap[s.title_id]) {
+        usbMap[s.title_id] = { title_id: s.title_id, name: s.title_name || s.title_id, items: [] };
+        usbGroups.push(usbMap[s.title_id]);
+      }
+      usbMap[s.title_id].items.push(i);
+    } else {
+      if (!sysMap[s.title_id]) {
+        sysMap[s.title_id] = { title_id: s.title_id, name: s.title_name || s.title_id, items: [] };
+        sysGroups.push(sysMap[s.title_id]);
+      }
+      sysMap[s.title_id].items.push(i);
     }
-    gmap[s.title_id].items.push(i);
   });
 
   let h = '';
-  groups.forEach(g => {
-    const gtype = S[g.items[0]].type || 'ps5';
-    const badge = '<span class="badge badge-' + gtype + '">' + gtype.toUpperCase() + '</span>';
-    const tdots = '<span class="title-dots" onclick="event.stopPropagation();showTitleMenu(event,\'' + esc(g.title_id).replace(/'/g, "\\'") + '\')">\u22EE</span>';
-    if (g.items.length === 1) {
-      const i = g.items[0], s = S[i];
-      const bu = s.backup ? '<span class="badge badge-bu">BACKUP</span>' : '';
-      h += '<div class="sv' + (i === si ? ' sel' : '') + '" onclick="sel(' + i + ')">';
-      h += '<div class="tid">' + bu + badge + esc(g.name) + tdots + '</div>';
-      h += '<div class="sn">' + esc(s.save_name) + '</div></div>';
-    } else {
-      const open = exG.has(g.title_id);
-      const anySel = g.items.includes(si);
-      h += '<div class="sv' + (anySel ? ' sel' : '') + '" onclick="togG(\'' + esc(g.title_id) + '\')" style="cursor:pointer">';
-      h += '<div class="tid">' + badge + (open ? '\u25BE ' : '\u25B8 ') + esc(g.name) + tdots + '</div>';
-      h += '<div class="sn">' + g.items.length + ' saves</div></div>';
-      if (open) {
-        g.items.forEach(i => {
-          const s = S[i];
-          const bu = s.backup ? '<span class="badge badge-bu">BACKUP</span>' : '';
-          h += '<div class="sv' + (i === si ? ' sel' : '') + '" onclick="sel(' + i + ')" style="padding-left:28px">';
-          h += '<div class="sn" style="color:var(--tx)">' + bu + esc(s.save_name) + '</div></div>';
-        });
-      }
+  sysGroups.forEach(g => { h = renderGroup(g, h); });
+
+  if (usbGroups.length > 0) {
+    h += '<div class="sv" onclick="usbDrawerOpen=!usbDrawerOpen;renderL()" style="cursor:pointer;border-top:1px solid var(--bd);margin-top:4px">';
+    h += '<div class="tid" style="color:#8b5cf6;font-weight:700">'
+      + (usbDrawerOpen ? '\u25BE' : '\u25B8') + ' USB Saves'
+      + '<span class="badge badge-usb" style="float:none;margin-left:8px">' + usbGroups.length + '</span></div></div>';
+    if (usbDrawerOpen) {
+      usbGroups.forEach(g => { h = renderGroup(g, h); });
     }
-  });
+  }
+
   $('svs').innerHTML = h;
 }
 
@@ -745,18 +868,25 @@ function renderTB() {
     h += (mpt ? '<div style="font-size:11px;color:var(--dm);margin-top:2px;opacity:.5">FTP: ' + esc(mpt) + '</div>' : '');
     h += '</div>';
 
-    h += '<button class="btn grn desk-btn" onclick="dlZip()" ' + (bsy ? 'disabled' : '') + '>Download Decrypted Zip</button>';
-    h += '<button class="btn desk-btn" onclick="dlBin()" ' + (bsy ? 'disabled' : '') + '>Download Encrypted</button>';
-    h += '<button class="btn desk-btn" onclick="dumpUsb()" ' + (bsy ? 'disabled' : '') + '>Dump to USB</button>';
-    h += '<button class="btn red desk-btn" onclick="um()" ' + (bsy ? 'disabled' : '') + '>Unmount</button>';
+    const isUsb = si >= 0 && S[si] && S[si].usb;
+    if (!isUsb) {
+      h += '<button class="btn grn desk-btn" onclick="dlZip()" ' + (bsy ? 'disabled' : '') + '>Download Decrypted Zip</button>';
+      h += '<button class="btn desk-btn" onclick="dlBin()" ' + (bsy ? 'disabled' : '') + '>Download Encrypted</button>';
+      h += '<button class="btn desk-btn" onclick="dumpUsb()" ' + (bsy ? 'disabled' : '') + '>Dump to USB</button>';
+      h += '<button class="btn red desk-btn" onclick="um()" ' + (bsy ? 'disabled' : '') + '>Unmount</button>';
+    } else {
+      h += '<button class="btn desk-btn" style="background:#8b5cf6" onclick="importUsb()" ' + (bsy ? 'disabled' : '') + '>Import to System</button>';
+    }
     h += '<div class="mob-opts">'
       + '<button class="btn" onclick="toggleOpts()" ' + (bsy ? 'disabled' : '') + '>Options \u25BE</button>'
       + '<div class="opts-menu" id="optsmenu">'
-      + '<div onclick="closeOpts();dlZip()">Download Decrypted Zip</div>'
-      + '<div onclick="closeOpts();dlBin()">Download Encrypted</div>'
-      + '<div onclick="closeOpts();dumpUsb()">Dump to USB</div>'
-      + '<div onclick="closeOpts();ctxUpload()">Upload File</div>'
-      + '<div class="ctx-del" onclick="closeOpts();um()">Unmount</div>'
+      + (isUsb
+        ? '<div onclick="closeOpts();importUsb()" style="color:#8b5cf6">Import to System</div>'
+        : '<div onclick="closeOpts();dlZip()">Download Decrypted Zip</div>'
+          + '<div onclick="closeOpts();dlBin()">Download Encrypted</div>'
+          + '<div onclick="closeOpts();dumpUsb()">Dump to USB</div>'
+          + '<div onclick="closeOpts();ctxUpload()">Upload File</div>'
+          + '<div class="ctx-del" onclick="closeOpts();um()">Unmount</div>')
       + '</div></div>';
   }
   $('tb').innerHTML = h;
@@ -1058,6 +1188,7 @@ async function mountBrw(i) {
 /* ── Render file tree ──────────────────────────────── */
 function renderF() {
   $('ct').className = 'ct';
+  const isUsb = si >= 0 && S[si] && S[si].usb;
   let h = '';
   cf.forEach((f, i) => {
     const ps = f.name.split('/');
@@ -1075,19 +1206,25 @@ function renderF() {
       const fn = esc(f.name).replace(/'/g, "\\'");
       h += '<div class="fi dir" style="padding-left:' + (16 + d * 16) + 'px" onclick="tog(' + i + ')">';
       h += (o ? '\u25BE \u{1F4C1} ' : '\u25B8 \u{1F4C1} ') + esc(nm);
-      h += '<span class="dir-dots" onclick="event.stopPropagation();showDirMenu(event,\'' + fn + '\')">\u22EE</span>';
+      if (!isUsb) h += '<span class="dir-dots" onclick="event.stopPropagation();showDirMenu(event,\'' + fn + '\')">\u22EE</span>';
       h += '</div>';
     } else {
-      h += '<div class="fi" style="padding-left:' + (16 + d * 16) + 'px" oncontextmenu="showCtxMenu(event,\'' + esc(f.name).replace(/'/g, "\\'") + '\')">';
+      if (isUsb) {
+        h += '<div class="fi" style="padding-left:' + (16 + d * 16) + 'px">';
+      } else {
+        h += '<div class="fi" style="padding-left:' + (16 + d * 16) + 'px" oncontextmenu="showCtxMenu(event,\'' + esc(f.name).replace(/'/g, "\\'") + '\')">';
+      }
       h += '\u{1F4C4} ' + esc(nm) + '<span class="sz">' + fmtB(f.size) + '</span></div>';
     }
   });
-  h += '<div class="dh" style="opacity:1;font-size:12px">Tip: Drag & drop files here to add or replace them</div>';
+  if (!isUsb) h += '<div class="dh" style="opacity:1;font-size:12px">Tip: Drag & drop files here to add or replace them</div>';
   $('ct').innerHTML = h || '<div class="empty">Empty</div>';
-  $('ct').oncontextmenu = e => {
-    if (!e.target.closest('.fi:not(.dir)')) { e.preventDefault(); showCtxMenu(e, null); }
-  };
-  setupDZ('ct', handleBrw);
+  if (!isUsb) {
+    $('ct').oncontextmenu = e => {
+      if (!e.target.closest('.fi:not(.dir)')) { e.preventDefault(); showCtxMenu(e, null); }
+    };
+    setupDZ('ct', handleBrw);
+  }
 }
 
 /* ── Context menu for files ────────────────────────── */
@@ -1353,47 +1490,64 @@ async function dlBin() {
 /* ── Dump to USB with progress ─────────────────────── */
 async function dumpUsb() {
   if (bsy || si < 0) return;
+  /* Detect connected USB drives */
+  try {
+    const ul = await fetch('/api/usb_list');
+    const ud = await ul.json();
+    if (!ud.usb || ud.usb.length === 0) { log('No USB drive detected', 'err'); return; }
+    if (ud.usb.length === 1) {
+      dumpUsbTo(ud.usb[0]);
+    } else {
+      /* Show USB selector */
+      closeCtxMenu();
+      const m = document.createElement('div');
+      m.className = 'ctx-menu'; m.id = 'ctxmenu';
+      m.innerHTML = '<div style="padding:4px 10px;font-size:10px;color:var(--dm);font-weight:600">Select USB</div>'
+        + ud.usb.map(u => '<div onclick="closeCtxMenu();dumpUsbTo(' + u + ')">USB ' + u + ' (usb' + u + ')</div>').join('');
+      m.style.left = '50%'; m.style.top = '50%';
+      m.style.transform = 'translate(-50%,-50%)'; m.style.position = 'fixed';
+      document.body.appendChild(m);
+    }
+  } catch (e) { log('Error detecting USB: ' + e.message, 'err'); }
+}
+
+async function dumpUsbTo(usbNum) {
+  if (bsy || si < 0) return;
   bsy = true; renderTB();
   const s = S[si];
   try {
-    log('Dumping ' + s.title_id + '/' + s.save_name + ' to USB...');
-    const r = await fetch('/api/dump_usb?idx=' + si);
-    const reader = r.body.getReader();
-    const dec = new TextDecoder();
-    let buf = '', last = null;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      const lines = buf.split('\n');
-      buf = lines.pop();
-      for (const ln of lines) {
-        if (!ln) continue;
-        const j = JSON.parse(ln);
-        if (j.error) throw new Error(j.error);
-        if (j.progress !== undefined) {
-          const tb = $('tb');
-          let bar = document.getElementById('usbprog');
-          if (!bar) {
-            bar = document.createElement('div');
-            bar.id = 'usbprog';
-            bar.style.cssText = 'width:100%;height:4px;background:var(--bd);border-radius:2px;margin-top:4px';
-            bar.innerHTML = '<div style="height:100%;background:var(--ac);border-radius:2px;transition:width .1s;width:0%"></div>';
-            tb.appendChild(bar);
-          }
-          bar.firstChild.style.width = j.progress + '%';
-          log('USB dump: ' + j.progress + '% (' + fmtB(j.copied) + '/' + fmtB(j.total) + ')');
-        }
-        if (j.ok) last = j;
-      }
-    }
-    if (last) log('Dumped to ' + last.path + ' (' + fmtB(last.size) + ')', 'ok');
-    const bar = document.getElementById('usbprog');
-    if (bar) bar.remove();
+    log('Mounting & dumping decrypted ' + s.title_id + '/' + s.save_name + ' to USB ' + usbNum + '...');
+    const r = await fetch('/api/dump_usb?idx=' + si + '&usb=' + usbNum);
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    log('Dumped decrypted save to ' + d.path, 'ok');
+    mt = null; cf = []; renderTB(); renderF();
   } catch (e) {
     log('Error: ' + e.message, 'err');
-    const bar = document.getElementById('usbprog');
-    if (bar) bar.remove();
+  }
+  bsy = false; renderTB();
+}
+
+/* ── Import USB save to system ─────────────────────── */
+async function importUsb() {
+  if (bsy || si < 0) return;
+  const s = S[si];
+  /* Check if a system save with same title_id and save_name exists */
+  const exists = S.some((x, i) => i !== si && !x.usb && x.title_id === s.title_id && x.save_name === s.save_name);
+  if (exists) {
+    if (!confirm('This will overwrite your existing save!\nAre you sure?')) return;
+  }
+  bsy = true; renderTB();
+  try {
+    log('Importing ' + s.title_id + '/' + s.save_name + ' to system...');
+    const r = await fetch('/api/import_finish');
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    log('Imported ' + d.title_id + '/' + d.dir_name + (d.exists ? ' (updated)' : ' (new)'), 'ok');
+    await load();
+    renderL();
+  } catch (e) {
+    log('Error: ' + e.message, 'err');
   }
   bsy = false; renderTB();
 }
@@ -1444,7 +1598,7 @@ async function shutdown() {
 if (window.innerWidth <= 768) $('drawer').classList.add('collapsed');
 else drawerOpen = true;
 updateDrawer();
-load();
+loadUsers().then(() => load());
 renderCt();
 renderTB();
 </script>
