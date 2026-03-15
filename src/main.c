@@ -1870,7 +1870,8 @@ static void handle_request(int sock) {
         {
             char aid_db[MAX_PATH_LEN];
             snprintf(aid_db, sizeof(aid_db),
-                     "/system_data/savedata_prospero/%s/db/user/savedata.db", uid_hex);
+                     "/system_data/%s/%s/db/user/savedata.db",
+                     g_enc_ps4 ? "savedata" : "savedata_prospero", uid_hex);
             sqlite3 *adb = NULL;
             if (sqlite3_open_v2(aid_db, &adb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
                 sqlite3_stmt *astmt = NULL;
@@ -2834,7 +2835,8 @@ static void handle_request(int sock) {
         {
             char aid_db_path[MAX_PATH_LEN];
             snprintf(aid_db_path, sizeof(aid_db_path),
-                     "/system_data/savedata_prospero/%s/db/user/savedata.db", uid_hex);
+                     "/system_data/%s/%s/db/user/savedata.db",
+                     g_enc_ps4 ? "savedata" : "savedata_prospero", uid_hex);
             sqlite3 *adb = NULL;
             if (sqlite3_open_v2(aid_db_path, &adb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
                 sqlite3_stmt *astmt = NULL;
@@ -2935,16 +2937,18 @@ static void handle_request(int sock) {
             printf("[GarlicMgr] import: icon -> %s\n", icon_dst);
         }
 
-        /* Update savedata.db */
+        /* Update savedata.db — PS4: savedata/, PS5: savedata_prospero/ */
         char db_path[MAX_PATH_LEN];
         snprintf(db_path, sizeof(db_path),
-                 "/system_data/savedata_prospero/%s/db/user/savedata.db", uid_hex);
+                 "/system_data/%s/%s/db/user/savedata.db",
+                 g_enc_ps4 ? "savedata" : "savedata_prospero", uid_hex);
 
         /* Create DB dir if needed */
         {
             char db_dir[MAX_PATH_LEN];
             snprintf(db_dir, sizeof(db_dir),
-                     "/system_data/savedata_prospero/%s/db/user", uid_hex);
+                     "/system_data/%s/%s/db/user",
+                     g_enc_ps4 ? "savedata" : "savedata_prospero", uid_hex);
             recursive_mkdir(db_dir);
         }
 
