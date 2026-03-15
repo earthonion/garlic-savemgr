@@ -43,6 +43,10 @@ int sceFsUfsAllocateSaveData(int fd, uint64_t size, uint64_t flags, int ext);
 int sceUserServiceInitialize(void*);
 int sceUserServiceGetForegroundUser(int *user_id);
 
+/* Registry manager — for reading account ID */
+int sceRegMgrGetBin(int, void*, size_t);
+int sceRegMgrGetStr(int, char*, size_t);
+
 typedef struct { char unused[45]; char message[3075]; } notify_request_t;
 int sceKernelSendNotificationRequest(int, notify_request_t*, size_t, int);
 
@@ -156,6 +160,39 @@ static const char *lookup_title(const char *title_id) {
             return g_titles[i].title_name;
     }
     return NULL;
+}
+
+/* ── Account ID lookup via registry ─────────────────────────────── */
+static uint64_t get_account_id_for_user(const char *uid_hex) {
+    /* Read username from /user/home/<uid>/username.dat */
+    char upath[MAX_PATH_LEN];
+    snprintf(upath, sizeof(upath), "/user/home/%s/username.dat", uid_hex);
+    char username[17] = {0};
+    int fd = open(upath, O_RDONLY);
+    if (fd >= 0) {
+        read(fd, username, 16);
+        username[16] = 0;
+        close(fd);
+    }
+    if (!username[0]) return 0;
+
+    /* Iterate registry accounts 1-16, match by name */
+    for (int i = 1; i <= 16; i++) {
+        int key_name = (i - 1) * 65536 + 125829632;
+        char reg_name[32] = {0};
+        if (sceRegMgrGetStr(key_name, reg_name, sizeof(reg_name)) < 0) continue;
+        if (!reg_name[0]) continue;
+        if (strcmp(username, reg_name) == 0) {
+            int key_aid = (i - 1) * 65536 + 125830400;
+            uint64_t aid = 0;
+            sceRegMgrGetBin(key_aid, &aid, sizeof(aid));
+            printf("[GarlicMgr] Registry: user '%s' = account %d, aid=%llx\n",
+                   username, i, (unsigned long long)aid);
+            return aid;
+        }
+    }
+    printf("[GarlicMgr] Registry: no account found for user '%s'\n", username);
+    return 0;
 }
 
 /* ── Notification ───────────────────────────────────────────────── */
@@ -1866,24 +1903,7 @@ static void handle_request(int sock) {
             snprintf(uid_hex, sizeof(uid_hex), "%x", (uint32_t)local_uid);
         }
 
-        uint64_t user_aid = 0;
-        {
-            char aid_db[MAX_PATH_LEN];
-            snprintf(aid_db, sizeof(aid_db),
-                     "/system_data/%s/%s/db/user/savedata.db",
-                     g_enc_ps4 ? "savedata" : "savedata_prospero", uid_hex);
-            sqlite3 *adb = NULL;
-            if (sqlite3_open_v2(aid_db, &adb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
-                sqlite3_stmt *astmt = NULL;
-                if (sqlite3_prepare_v2(adb, "SELECT account_id FROM savedata LIMIT 1",
-                                       -1, &astmt, NULL) == SQLITE_OK) {
-                    if (sqlite3_step(astmt) == SQLITE_ROW)
-                        user_aid = (uint64_t)sqlite3_column_int64(astmt, 0);
-                    sqlite3_finalize(astmt);
-                }
-                sqlite3_close(adb);
-            }
-        }
+        uint64_t user_aid = get_account_id_for_user(uid_hex);
 
         int match = (user_aid != 0 && sfo.account_id == user_aid) ? 1 : 0;
 
@@ -1895,7 +1915,7 @@ static void handle_request(int sock) {
         struct stat ex_st;
         int exists = (stat(exist_path, &ex_st) == 0) ? 1 : 0;
 
-        printf("[GarlicMgr] import_encrypted: title=%s dir=%s save_aid=%llx user_aid=%llx match=%d exists=%d\n",
+        logprintf("[GarlicMgr] import_encrypted: title=%s dir=%s save_aid=%llx user_aid=%llx match=%d exists=%d\n",
                sfo.title_id, sfo.dir_name,
                (unsigned long long)sfo.account_id, (unsigned long long)user_aid, match, exists);
 
@@ -2830,24 +2850,8 @@ static void handle_request(int sock) {
             snprintf(uid_hex, sizeof(uid_hex), "%x", uid);
         }
 
-        /* Read local account_id from user's existing savedata.db */
-        uint64_t local_aid = 0;
-        {
-            char aid_db_path[MAX_PATH_LEN];
-            snprintf(aid_db_path, sizeof(aid_db_path),
-                     "/system_data/%s/%s/db/user/savedata.db",
-                     g_enc_ps4 ? "savedata" : "savedata_prospero", uid_hex);
-            sqlite3 *adb = NULL;
-            if (sqlite3_open_v2(aid_db_path, &adb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
-                sqlite3_stmt *astmt = NULL;
-                if (sqlite3_prepare_v2(adb, "SELECT account_id FROM savedata LIMIT 1", -1, &astmt, NULL) == SQLITE_OK) {
-                    if (sqlite3_step(astmt) == SQLITE_ROW)
-                        local_aid = (uint64_t)sqlite3_column_int64(astmt, 0);
-                    sqlite3_finalize(astmt);
-                }
-                sqlite3_close(adb);
-            }
-        }
+        /* Read local account_id from registry */
+        uint64_t local_aid = get_account_id_for_user(uid_hex);
 
         /* Resign: PS4 = AID at 0x15C only, PS5 = AID at 0x1B8 + UID at 0x660 */
         if (local_aid) {
