@@ -834,10 +834,11 @@ function renderCt() {
     c.className = 'ct ctr';
     c.innerHTML =
       '<div class="drop" id="dz">'
-      + '<div class="dlbl">Drag & drop a <b>decrypted save folder</b> to import</div>'
-      + '<div style="font-size:11px;color:var(--dm);margin:6px 0">Folder must contain sce_sys/param.sfo<br>PS5 saves only for now</div>'
-      + '<button class="bbtn">Browse Folder</button></div>';
-    setupFolderDZ('dz', importDrop);
+      + '<div class="dlbl">Drag & drop a <b>decrypted save folder</b> or <b>encrypted save file</b> to import</div>'
+      + '<div style="font-size:11px;color:var(--dm);margin:6px 0">Folder: must contain sce_sys/param.sfo<br>Encrypted: PS4 drop image + .bin key together</div>'
+      + '<button class="bbtn" onclick="browseFolder()" style="margin-right:8px">Browse Folder</button>'
+      + '<button class="bbtn" onclick="browseEncFile()">Browse File</button></div>';
+    setupImportDZ('dz');
 
   } else {
     if (mt) {
@@ -1074,7 +1075,8 @@ async function resignDrop(files) {
     document.body.appendChild(a); a.click(); a.remove();
     $('ct').innerHTML =
       '<div class="drop"><div class="dlbl">' + esc(name) + '<br>' + fmtB(d.size) + '</div>'
-      + '<div style="color:#0f0">Download started' + (isPS4 ? ' (.zip)' : '') + '</div></div>';
+      + '<div style="color:#0f0">Download started' + (isPS4 ? ' (.zip)' : '') + '</div>'
+      + '<button class="bbtn" style="margin-top:12px" onclick="switchTab(\'resign\')">Resign Another</button></div>';
   } catch (e) {
     log('Error: ' + e.message, 'err');
     renderCt();
@@ -1131,23 +1133,20 @@ async function importDrop(files, folderName) {
     }
     log('All ' + files.length + ' files uploaded', 'ok');
 
-    /* Step 3: finalize import (resign, unmount, copy to system, update DB) */
-    log('Finalizing import...');
-    $('ct').innerHTML = '<div class="drop"><div class="dlbl">Importing save to system...</div></div>';
-    r = await fetch('/api/import_finish');
+    /* Check if save already exists */
+    r = await fetch('/api/import_check?uid=' + encodeURIComponent(curUid));
     d = await r.json();
-    if (d.error) throw new Error(d.error);
+    if (d.exists) {
+      const ok = await showConfirmModal('This will overwrite an existing save. Are you sure?');
+      if (!ok) {
+        log('Import cancelled');
+        try { await fetch('/api/unmount'); } catch(x) {}
+        renderCt(); bsy = false; return;
+      }
+    }
 
-    log('Import complete: ' + d.title_id + '/' + d.dir_name + (d.exists ? ' (updated)' : ' (new)'), 'ok');
-    $('ct').innerHTML =
-      '<div class="drop"><div class="dlbl">'
-      + '<div style="color:var(--ok);font-size:16px;font-weight:700;margin-bottom:8px">Import Successful</div>'
-      + '<b>' + esc(d.main_title || d.title_id) + '</b><br>'
-      + esc(d.title_id) + ' / ' + esc(d.dir_name)
-      + (d.exists ? '<br><span style="color:var(--dm)">Existing save updated</span>' : '<br><span style="color:var(--dm)">New save added</span>')
-      + (d.warning ? '<br><span style="color:#c89b00">' + esc(d.warning) + '</span>' : '')
-      + '</div>'
-      + '<button class="bbtn" style="margin-top:12px" onclick="switchTab(\'import\')">Import Another</button></div>';
+    /* Step 3: finalize import (resign, unmount, copy to system, update DB) */
+    await doImportFinish();
 
   } catch (e) {
     log('Import error: ' + e.message, 'err');
@@ -1156,6 +1155,166 @@ async function importDrop(files, folderName) {
     renderCt();
   }
   bsy = false;
+}
+
+function showImportSuccess(d) {
+  $('ct').innerHTML =
+    '<div class="drop"><div class="dlbl">'
+    + '<div style="color:var(--ok);font-size:16px;font-weight:700;margin-bottom:8px">Import Successful</div>'
+    + '<b>' + esc(d.main_title || d.title_id) + '</b><br>'
+    + esc(d.title_id) + ' / ' + esc(d.dir_name)
+    + (d.exists ? '<br><span style="color:var(--dm)">Existing save updated</span>' : '<br><span style="color:var(--dm)">New save added</span>')
+    + (d.warning ? '<br><span style="color:#c89b00">' + esc(d.warning) + '</span>' : '')
+    + '</div>'
+    + '<button class="bbtn" style="margin-top:12px" onclick="switchTab(\'import\')">Import Another</button></div>';
+}
+
+/* ── Import DZ setup (accepts both folders and files) ── */
+function setupImportDZ(id) {
+  const el = $(id);
+  if (!el) return;
+  el.ondragover = e => { e.preventDefault(); el.classList.add('over') };
+  el.ondragleave = e => { e.preventDefault(); el.classList.remove('over') };
+  el.ondrop = async e => {
+    e.preventDefault(); el.classList.remove('over');
+    const items = e.dataTransfer.items;
+    const entries = [];
+    if (items) {
+      for (let i = 0; i < items.length; i++) {
+        const entry = items[i].webkitGetAsEntry ? items[i].webkitGetAsEntry() : null;
+        if (entry) entries.push(entry);
+      }
+    }
+    if (entries.length && entries[0].isDirectory) {
+      const all = await readEntryRecursive(entries[0], '');
+      if (all.length) importDrop(all, entries[0].name);
+    } else {
+      importEncrypted(e.dataTransfer.files);
+    }
+  };
+}
+
+function browseFolder() {
+  const i = document.createElement('input');
+  i.type = 'file'; i.webkitdirectory = true;
+  i.onchange = () => {
+    if (i.files.length) {
+      const prefix = i.files[0].webkitRelativePath.split('/')[0];
+      importDrop(Array.from(i.files), prefix);
+    }
+  };
+  i.click();
+}
+
+function browseEncFile() {
+  const i = document.createElement('input');
+  i.type = 'file'; i.multiple = true;
+  i.onchange = () => { if (i.files.length) importEncrypted(i.files) };
+  i.click();
+}
+
+/* ── Import encrypted save ─────────────────────────── */
+async function importEncrypted(files) {
+  if (bsy || !files.length) return;
+
+  /* Find image file (largest non-.bin) and detect PS4 */
+  let imgFile = null, binFile = null;
+  for (let i = 0; i < files.length; i++) {
+    if (files[i].name.endsWith('.bin')) binFile = files[i];
+    else if (!imgFile || files[i].size > imgFile.size) imgFile = files[i];
+  }
+  if (!imgFile) { log('No save file found', 'err'); return; }
+
+  const hdr = new Uint8Array(await imgFile.slice(0, 1).arrayBuffer());
+  const isPS4 = (hdr[0] === 0x01);
+
+  if (isPS4 && !binFile) {
+    log('PS4 save detected — drop both the save image and .bin key together', 'err');
+    return;
+  }
+
+  bsy = true;
+  $('ct').innerHTML = '<div class="drop"><div class="dlbl">Uploading encrypted save...</div></div>';
+  try {
+    /* Upload .bin key first if PS4 */
+    if (isPS4 && binFile) {
+      log('Uploading PS4 sealed key ' + binFile.name + '...');
+      const kxhr = await upload('/api/upload_key', binFile);
+      if (kxhr.status !== 200) throw new Error('Failed to upload .bin key');
+    }
+
+    log('Uploading ' + imgFile.name + ' (' + fmtB(imgFile.size) + ')...');
+    const xhr = await upload('/api/import_encrypted?uid=' + encodeURIComponent(curUid) + (isPS4 ? '&ps4=1' : ''), imgFile, (loaded, total) => {
+      showProgress(Math.round(loaded * 100 / total), loaded, total);
+    });
+    const d = JSON.parse(xhr.responseText);
+    if (d.error) throw new Error(d.error);
+
+    log('Save verified: ' + d.title_id + ' / ' + d.dir_name, 'ok');
+
+    /* Check if save already exists */
+    if (d.exists) {
+      const ok = await showConfirmModal('This will overwrite an existing save. Are you sure?');
+      if (!ok) {
+        log('Import cancelled');
+        try { await fetch('/api/unmount'); } catch(x) {}
+        renderCt(); bsy = false; return;
+      }
+    }
+
+    if (d.match) {
+      /* Account ID matches — proceed to import */
+      await doImportFinish();
+    } else {
+      /* Account ID mismatch — show modal */
+      const resign = await showConfirmModal(
+        'Account ID Mismatch!<br><br>'
+        + '<span style="font-size:13px;color:var(--dm)">'
+        + 'Save: <b style="color:var(--tx)">' + esc(d.save_aid) + '</b><br>'
+        + 'Your account: <b style="color:var(--tx)">' + esc(d.user_aid) + '</b></span><br><br>'
+        + 'Do you want to resign to your account ID?',
+        'Yes, Resign', 'Cancel');
+      if (resign) {
+        await doImportFinish();
+      } else {
+        log('Import cancelled');
+        try { await fetch('/api/unmount'); } catch(x) {}
+        renderCt();
+      }
+    }
+  } catch (e) {
+    log('Import error: ' + e.message, 'err');
+    try { await fetch('/api/unmount'); } catch(x) {}
+    renderCt();
+  }
+  bsy = false;
+}
+
+function showConfirmModal(msg, yesText, noText) {
+  return new Promise(resolve => {
+    const m = document.createElement('div');
+    m.id = 'confirmModal';
+    m.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;z-index:999';
+    m.innerHTML =
+      '<div style="background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:24px;max-width:400px;text-align:center">'
+      + '<div style="font-size:14px;color:var(--tx);margin-bottom:16px">' + msg + '</div>'
+      + '<button class="btn grn" style="margin-right:8px" id="cmYes">' + (yesText || 'Yes') + '</button>'
+      + '<button class="btn red" id="cmNo">' + (noText || 'Cancel') + '</button>'
+      + '</div>';
+    document.body.appendChild(m);
+    m.querySelector('#cmYes').onclick = () => { m.remove(); resolve(true); };
+    m.querySelector('#cmNo').onclick = () => { m.remove(); resolve(false); };
+  });
+}
+
+async function doImportFinish() {
+  log('Importing to system...');
+  $('ct').innerHTML = '<div class="drop"><div class="dlbl">Importing save to system...</div></div>';
+  const r = await fetch('/api/import_finish?uid=' + encodeURIComponent(curUid));
+  const d = await r.json();
+  if (d.error) throw new Error(d.error);
+  log('Import complete: ' + d.title_id + '/' + d.dir_name + (d.exists ? ' (updated)' : ' (new)'), 'ok');
+  showImportSuccess(d);
 }
 
 /* ── Mount & browse save ───────────────────────────── */
@@ -1404,7 +1563,7 @@ function confirmReplace(name) {
 
 /* ── Handle file drop in browse mode ───────────────── */
 async function handleBrw(files) {
-  if (bsy || !mt) return;
+  if (bsy || !mt || tab !== 'browse') return;
   bsy = true;
   try {
     for (let j = 0; j < files.length; j++) {
@@ -1540,7 +1699,7 @@ async function importUsb() {
   bsy = true; renderTB();
   try {
     log('Importing ' + s.title_id + '/' + s.save_name + ' to system...');
-    const r = await fetch('/api/import_finish');
+    const r = await fetch('/api/import_finish?uid=' + encodeURIComponent(curUid));
     const d = await r.json();
     if (d.error) throw new Error(d.error);
     log('Imported ' + d.title_id + '/' + d.dir_name + (d.exists ? ' (updated)' : ' (new)'), 'ok');
