@@ -82,6 +82,7 @@
       text-transform: uppercase; letter-spacing: 1.5px;
       border-bottom: 1px solid var(--bd); flex-shrink: 0;
     }
+    .desk-shdr { display: flex; align-items: center; gap: 0 }
 
     /* ── Platform tabs ────────────────────────────────── */
     .ptab {
@@ -336,7 +337,7 @@
       .main.full .left { display: none }
 
       .drawer-toggle { display: block }
-      .desk-shdr { display: none }
+      .desk-shdr { display: none !important }
 
       .desk-btn { display: none !important }
       .mob-opts { display: inline-block !important }
@@ -409,7 +410,7 @@
 <!-- ── Main layout ─────────────────────────────────── -->
 <div class="main" id="mn">
   <div class="left" id="drawer">
-    <div class="shdr desk-shdr" style="display:flex;align-items:center;gap:0">
+    <div class="shdr desk-shdr">
       <span style="margin-right:auto">Saves</span>
       <button class="ptab active" id="ptab5" onclick="setPlatform('ps5')">PS5</button>
       <button class="ptab" id="ptab4" onclick="setPlatform('ps4')">PS4</button>
@@ -708,6 +709,7 @@ function renderGroup(g, h) {
   const gtype = S[g.items[0]].type || 'ps5';
   const badge = '<span class="badge badge-' + gtype + '">' + gtype.toUpperCase() + '</span>';
   const anyUsb = g.items.every(i => S[i].usb);
+  const gkey = (anyUsb ? 'usb:' : '') + g.title_id;
   const tdots = anyUsb ? '' : '<span class="title-dots" onclick="event.stopPropagation();showTitleMenu(event,\'' + esc(g.title_id).replace(/'/g, "\\'") + '\')">\u22EE</span>';
   function saveDots(idx) {
     return '<span class="title-dots" onclick="event.stopPropagation();showSaveMenu(event,' + idx + ')">\u22EE</span>';
@@ -720,9 +722,10 @@ function renderGroup(g, h) {
     h += '<div class="tid">' + bu + badge + esc(g.name) + dots + '</div>';
     h += '<div class="sn">' + esc(s.save_name) + '</div></div>';
   } else {
-    const open = exG.has(g.title_id);
+    const open = exG.has(gkey);
     const anySel = g.items.includes(si);
-    h += '<div class="sv' + (anySel ? ' sel' : '') + '" onclick="togG(\'' + esc(g.title_id) + '\')" style="cursor:pointer">';
+    const gesc = esc(gkey).replace(/'/g, "\\'");
+    h += '<div class="sv' + (anySel ? ' sel' : '') + '" onclick="togG(\'' + gesc + '\',event)" style="cursor:pointer">';
     h += '<div class="tid">' + badge + (open ? '\u25BE ' : '\u25B8 ') + esc(g.name) + tdots + '</div>';
     h += '<div class="sn">' + g.items.length + ' saves</div></div>';
     if (open) {
@@ -768,7 +771,7 @@ function renderL() {
   sysGroups.forEach(g => { h = renderGroup(g, h); });
 
   if (usbGroups.length > 0) {
-    h += '<div class="sv" onclick="usbDrawerOpen=!usbDrawerOpen;renderL()" style="cursor:pointer;border-top:1px solid var(--bd);margin-top:4px">';
+    h += '<div class="sv" onclick="event.stopPropagation();usbDrawerOpen=!usbDrawerOpen;renderL()" style="cursor:pointer;border-top:1px solid var(--bd);margin-top:4px">';
     h += '<div class="tid" style="color:#8b5cf6;font-weight:700">'
       + (usbDrawerOpen ? '\u25BE' : '\u25B8') + ' USB Saves'
       + '<span class="badge badge-usb" style="float:none;margin-left:8px">' + usbGroups.length + '</span></div></div>';
@@ -780,7 +783,8 @@ function renderL() {
   $('svs').innerHTML = h;
 }
 
-function togG(tid) {
+function togG(tid, e) {
+  if (e) e.stopPropagation();
   if (exG.has(tid)) exG.delete(tid); else exG.add(tid);
   renderL();
 }
