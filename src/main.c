@@ -3320,6 +3320,236 @@ static void handle_request(int sock) {
         return;
     }
 
+    /* GET /api/delete_title?id=<title_id> -> delete all saves for a title from disk and DB */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/delete_title", 17) == 0) {
+        char tid[64] = {0};
+        char *tp = strstr(url, "id=");
+        if (tp) {
+            strncpy(tid, tp + 3, sizeof(tid) - 1);
+            char *amp = strchr(tid, '&');
+            if (amp) *amp = 0;
+            char *r = tid, *w = tid;
+            while (*r) {
+                if (*r == '%' && r[1] && r[2]) {
+                    char hex[3] = {r[1], r[2], 0};
+                    *w++ = (char)strtol(hex, NULL, 16);
+                    r += 3;
+                } else { *w++ = *r++; }
+            }
+            *w = 0;
+        }
+        if (!tid[0]) { http_json(sock, "{\"error\":\"Missing id\"}"); return; }
+
+        scan_saves();
+        pid_t rpid = getpid();
+        kernel_set_ucred_uid(rpid, 0);
+        kernel_set_ucred_authid(rpid, 0x4800000000000010ULL);
+
+        int deleted = 0;
+        /* Track unique (uid, is_ps4) pairs for DB cleanup */
+        typedef struct { char uid[16]; int is_ps4; } uid_entry_t;
+        uid_entry_t uids[32];
+        int nuid = 0;
+
+        for (int i = 0; i < g_save_count; i++) {
+            if (strcmp(g_saves[i].title_id, tid) != 0) continue;
+            if (g_saves[i].is_usb) continue; /* don't delete USB saves */
+
+            /* Delete the save file */
+            unlink(g_saves[i].path);
+            printf("[GarlicMgr] delete: %s\n", g_saves[i].path);
+
+            /* Delete .bin companion for PS4 */
+            if (g_saves[i].is_ps4 && strncmp(g_saves[i].save_name, "sdimg_", 6) == 0) {
+                const char *sname = g_saves[i].save_name + 6;
+                char dir[MAX_PATH_LEN];
+                strncpy(dir, g_saves[i].path, sizeof(dir) - 1);
+                dir[sizeof(dir) - 1] = 0;
+                char *sl = strrchr(dir, '/');
+                if (sl) *(sl + 1) = 0;
+                char bin_path[MAX_PATH_LEN];
+                snprintf(bin_path, sizeof(bin_path), "%s%s.bin", dir, sname);
+                unlink(bin_path);
+            }
+
+            /* Track uid for DB cleanup */
+            int found = 0;
+            for (int u = 0; u < nuid; u++) {
+                if (strcmp(uids[u].uid, g_saves[i].user_id) == 0 && uids[u].is_ps4 == g_saves[i].is_ps4) {
+                    found = 1; break;
+                }
+            }
+            if (!found && nuid < 32) {
+                strncpy(uids[nuid].uid, g_saves[i].user_id, sizeof(uids[nuid].uid) - 1);
+                uids[nuid].is_ps4 = g_saves[i].is_ps4;
+                nuid++;
+            }
+            deleted++;
+        }
+
+        /* Remove title directories if empty */
+        for (int u = 0; u < nuid; u++) {
+            const char *sd = uids[u].is_ps4 ? "savedata" : "savedata_prospero";
+            char title_dir[MAX_PATH_LEN];
+            snprintf(title_dir, sizeof(title_dir), "/user/home/%s/%s/%s", uids[u].uid, sd, tid);
+            rmdir(title_dir); /* only succeeds if empty */
+
+            /* Delete from savedata.db */
+            char db_path[MAX_PATH_LEN];
+            snprintf(db_path, sizeof(db_path),
+                     "/system_data/%s/%s/db/user/savedata.db", sd, uids[u].uid);
+            sqlite3 *db = NULL;
+            if (sqlite3_open(db_path, &db) == SQLITE_OK) {
+                char sql[256];
+                snprintf(sql, sizeof(sql),
+                         "DELETE FROM savedata WHERE title_id='%s'", tid);
+                char *err_msg = NULL;
+                int ret = sqlite3_exec(db, sql, NULL, 0, &err_msg);
+                if (ret != SQLITE_OK) {
+                    printf("[GarlicMgr] delete DB error: %s\n", err_msg);
+                    sqlite3_free(err_msg);
+                } else {
+                    printf("[GarlicMgr] delete: removed %s from %s DB\n", tid, sd);
+                }
+                sqlite3_close(db);
+            }
+        }
+
+        char json[128];
+        snprintf(json, sizeof(json), "{\"ok\":true,\"deleted\":%d}", deleted);
+        http_json(sock, json);
+        return;
+    }
+
+    /* GET /api/dump_title_usb?id=<title_id>&usb=N -> copy all encrypted saves for a title to USB */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/dump_title_usb", 19) == 0 && url[19] != '_') {
+        char tid[64] = {0};
+        int usb_num = 0;
+        char *tp = strstr(url, "id=");
+        if (tp) {
+            strncpy(tid, tp + 3, sizeof(tid) - 1);
+            char *amp = strchr(tid, '&');
+            if (amp) *amp = 0;
+            char *r = tid, *w = tid;
+            while (*r) {
+                if (*r == '%' && r[1] && r[2]) {
+                    char hex[3] = {r[1], r[2], 0};
+                    *w++ = (char)strtol(hex, NULL, 16);
+                    r += 3;
+                } else { *w++ = *r++; }
+            }
+            *w = 0;
+        }
+        tp = strstr(url, "usb=");
+        if (tp) usb_num = atoi(tp + 4);
+        if (usb_num < 0 || usb_num > 7) usb_num = 0;
+        if (!tid[0]) { http_json(sock, "{\"error\":\"Missing id\"}"); return; }
+
+        scan_saves();
+        kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
+
+        char usb_base[64];
+        snprintf(usb_base, sizeof(usb_base), "/mnt/usb%d", usb_num);
+        char tmp[MAX_PATH_LEN];
+        snprintf(tmp, sizeof(tmp), "%s/PS5", usb_base); mkdir(tmp, 0777);
+        snprintf(tmp, sizeof(tmp), "%s/PS5/SAVEDATA", usb_base); mkdir(tmp, 0777);
+        snprintf(tmp, sizeof(tmp), "%s/PS5/SAVEDATA/GARLIC", usb_base); mkdir(tmp, 0777);
+        char title_dir[MAX_PATH_LEN];
+        snprintf(title_dir, sizeof(title_dir), "%s/PS5/SAVEDATA/GARLIC/%s", usb_base, tid);
+        mkdir(title_dir, 0777);
+
+        int copied = 0, failed = 0;
+        for (int i = 0; i < g_save_count; i++) {
+            if (strcmp(g_saves[i].title_id, tid) != 0) continue;
+            char dst[MAX_PATH_LEN];
+            snprintf(dst, sizeof(dst), "%s/%s", title_dir, g_saves[i].save_name);
+            if (copy_file(g_saves[i].path, dst) == 0) {
+                copied++;
+                /* For PS4 saves, also copy .bin key */
+                if (g_saves[i].is_ps4 && strncmp(g_saves[i].save_name, "sdimg_", 6) == 0) {
+                    const char *savename = g_saves[i].save_name + 6;
+                    char dir[MAX_PATH_LEN];
+                    strncpy(dir, g_saves[i].path, sizeof(dir) - 1);
+                    dir[sizeof(dir) - 1] = 0;
+                    char *sl = strrchr(dir, '/');
+                    if (sl) *(sl + 1) = 0;
+                    char bin_src[MAX_PATH_LEN], bin_dst[MAX_PATH_LEN];
+                    snprintf(bin_src, sizeof(bin_src), "%s%s.bin", dir, savename);
+                    snprintf(bin_dst, sizeof(bin_dst), "%s/%s.bin", title_dir, savename);
+                    struct stat bst;
+                    if (stat(bin_src, &bst) == 0) copy_file(bin_src, bin_dst);
+                }
+            } else {
+                failed++;
+            }
+        }
+
+        char json[256];
+        snprintf(json, sizeof(json), "{\"ok\":true,\"copied\":%d,\"failed\":%d,\"path\":\"%s\"}", copied, failed, title_dir);
+        http_json(sock, json);
+        return;
+    }
+
+    /* GET /api/dump_title_dec_usb?id=<title_id>&usb=N -> mount each save, copy decrypted to USB */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/dump_title_dec_usb", 23) == 0) {
+        char tid[64] = {0};
+        int usb_num = 0;
+        char *tp = strstr(url, "id=");
+        if (tp) {
+            strncpy(tid, tp + 3, sizeof(tid) - 1);
+            char *amp = strchr(tid, '&');
+            if (amp) *amp = 0;
+            char *r = tid, *w = tid;
+            while (*r) {
+                if (*r == '%' && r[1] && r[2]) {
+                    char hex[3] = {r[1], r[2], 0};
+                    *w++ = (char)strtol(hex, NULL, 16);
+                    r += 3;
+                } else { *w++ = *r++; }
+            }
+            *w = 0;
+        }
+        tp = strstr(url, "usb=");
+        if (tp) usb_num = atoi(tp + 4);
+        if (usb_num < 0 || usb_num > 7) usb_num = 0;
+        if (!tid[0]) { http_json(sock, "{\"error\":\"Missing id\"}"); return; }
+
+        scan_saves();
+        kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
+
+        char usb_base[64];
+        snprintf(usb_base, sizeof(usb_base), "/mnt/usb%d", usb_num);
+        char tmp[MAX_PATH_LEN];
+        snprintf(tmp, sizeof(tmp), "%s/PS5", usb_base); mkdir(tmp, 0777);
+        snprintf(tmp, sizeof(tmp), "%s/PS5/SAVEDATA", usb_base); mkdir(tmp, 0777);
+        snprintf(tmp, sizeof(tmp), "%s/PS5/SAVEDATA/GARLIC", usb_base); mkdir(tmp, 0777);
+        char title_dir[MAX_PATH_LEN];
+        snprintf(title_dir, sizeof(title_dir), "%s/PS5/SAVEDATA/GARLIC/%s", usb_base, tid);
+        mkdir(title_dir, 0777);
+
+        int copied = 0, failed = 0;
+        for (int i = 0; i < g_save_count; i++) {
+            if (strcmp(g_saves[i].title_id, tid) != 0) continue;
+
+            if (g_mounted) unmount_save();
+            int ret = mount_save(i);
+            if (ret < 0) { failed++; continue; }
+
+            char save_dir[MAX_PATH_LEN];
+            snprintf(save_dir, sizeof(save_dir), "%s/%s", title_dir, g_saves[i].save_name);
+            int cpret = copy_dir_recursive(g_mount_point, save_dir);
+            unmount_save();
+
+            if (cpret == 0) copied++;
+            else failed++;
+        }
+
+        char json[256];
+        snprintf(json, sizeof(json), "{\"ok\":true,\"copied\":%d,\"failed\":%d,\"path\":\"%s\"}", copied, failed, title_dir);
+        http_json(sock, json);
+        return;
+    }
+
     /* 404 */
     http_send(sock, "404 Not Found", "application/json", "{\"error\":\"Not found\"}", 20);
 }
