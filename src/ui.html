@@ -1449,8 +1449,9 @@ function showTitleMenu(e, titleId) {
   m.className = 'ctx-menu';
   m.id = 'ctxmenu';
   const tid = titleId.replace(/'/g, "\\'");
-  m.innerHTML = '<div onclick="exportTitle(\'' + tid + '\')">Export All Saves</div>'
-    + '<div onclick="exportTitleDec(\'' + tid + '\')">Export All Decrypted</div>';
+  m.innerHTML = '<div onclick="showExportModal(\'' + tid + '\',false)">Export All Saves</div>'
+    + '<div onclick="showExportModal(\'' + tid + '\',true)">Export All Decrypted</div>'
+    + '<div class="ctx-del" onclick="deleteTitle(\'' + tid + '\')">Delete All Saves</div>';
   m.style.left = e.clientX + 'px';
   m.style.top = e.clientY + 'px';
   document.body.appendChild(m);
@@ -1459,16 +1460,79 @@ function showTitleMenu(e, titleId) {
   if (r.bottom > window.innerHeight) m.style.top = (window.innerHeight - r.height - 4) + 'px';
 }
 
-function exportTitle(titleId) {
+async function showExportModal(titleId, decrypted) {
   closeCtxMenu();
-  log('Exporting all saves for ' + titleId + '...');
-  window.location.href = '/api/export_title?id=' + encodeURIComponent(titleId);
+  const label = decrypted ? 'Export All Decrypted' : 'Export All Saves';
+  let usbHtml = '<div style="color:var(--dm);font-size:12px;margin-top:8px">Checking USB drives...</div>';
+
+  const m = document.createElement('div');
+  m.id = 'exportModal';
+  m.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;z-index:999';
+  m.innerHTML =
+    '<div style="background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:24px;max-width:400px;width:90%">'
+    + '<div style="font-size:14px;font-weight:700;color:var(--tx);margin-bottom:16px">' + label + '</div>'
+    + '<button class="btn grn" style="width:100%;margin-bottom:12px" id="emDl">Download</button>'
+    + '<div id="emUsb">' + usbHtml + '</div>'
+    + '<button class="btn red" style="width:100%;margin-top:12px" id="emCancel">Cancel</button>'
+    + '</div>';
+  document.body.appendChild(m);
+
+  m.querySelector('#emDl').onclick = () => {
+    m.remove();
+    const apiUrl = decrypted ? '/api/export_title_dec' : '/api/export_title';
+    log((decrypted ? 'Exporting all decrypted saves for ' : 'Exporting all saves for ') + titleId + '...');
+    window.location.href = apiUrl + '?id=' + encodeURIComponent(titleId);
+  };
+  m.querySelector('#emCancel').onclick = () => m.remove();
+
+  try {
+    const r = await fetch('/api/usb_list');
+    const d = await r.json();
+    const el = m.querySelector('#emUsb');
+    if (!el) return;
+    if (d.usb && d.usb.length > 0) {
+      el.innerHTML = '<div style="font-size:11px;color:var(--dm);margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">Dump to USB</div>'
+        + d.usb.map(u => '<button class="btn" style="width:100%;margin-bottom:6px;background:var(--bd);color:var(--tx)" onclick="dumpTitleUsb(\'' + titleId.replace(/'/g, "\\'") + '\',' + u + ',' + decrypted + ')">USB ' + u + '</button>').join('');
+    } else {
+      el.innerHTML = '<div style="color:var(--dm);font-size:12px">No USB drives detected</div>';
+    }
+  } catch(e) {
+    const el = m.querySelector('#emUsb');
+    if (el) el.innerHTML = '<div style="color:var(--er);font-size:12px">Failed to check USB drives</div>';
+  }
 }
 
-function exportTitleDec(titleId) {
+async function dumpTitleUsb(titleId, usbNum, decrypted) {
+  const m = document.getElementById('exportModal');
+  if (m) m.remove();
+  const apiUrl = decrypted ? '/api/dump_title_dec_usb' : '/api/dump_title_usb';
+  log((decrypted ? 'Dumping decrypted saves for ' : 'Dumping saves for ') + titleId + ' to USB ' + usbNum + '...');
+  try {
+    const r = await fetch(apiUrl + '?id=' + encodeURIComponent(titleId) + '&usb=' + usbNum);
+    const d = await r.json();
+    if (d.error) { log('Dump failed: ' + d.error, 'err'); return; }
+    log('Dumped ' + d.copied + ' save(s) to ' + d.path, 'ok');
+    load();
+  } catch(e) {
+    log('Dump failed: ' + e.message, 'err');
+  }
+}
+
+async function deleteTitle(titleId) {
   closeCtxMenu();
-  log('Exporting all decrypted saves for ' + titleId + ' (mount/dump each)...');
-  window.location.href = '/api/export_title_dec?id=' + encodeURIComponent(titleId);
+  const ok = await showConfirmModal('Delete all saves for ' + titleId + '? This cannot be undone.');
+  if (!ok) return;
+  log('Deleting all saves for ' + titleId + '...');
+  try {
+    const r = await fetch('/api/delete_title?id=' + encodeURIComponent(titleId));
+    const d = await r.json();
+    if (d.error) { log('Delete failed: ' + d.error, 'err'); return; }
+    log('Deleted ' + d.deleted + ' save(s) for ' + titleId, 'ok');
+    si = -1; mt = null; cf = [];
+    load();
+  } catch(e) {
+    log('Delete failed: ' + e.message, 'err');
+  }
 }
 
 function showCtxMenu(e, fname) {
