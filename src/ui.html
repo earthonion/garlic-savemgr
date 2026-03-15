@@ -709,11 +709,15 @@ function renderGroup(g, h) {
   const badge = '<span class="badge badge-' + gtype + '">' + gtype.toUpperCase() + '</span>';
   const anyUsb = g.items.every(i => S[i].usb);
   const tdots = anyUsb ? '' : '<span class="title-dots" onclick="event.stopPropagation();showTitleMenu(event,\'' + esc(g.title_id).replace(/'/g, "\\'") + '\')">\u22EE</span>';
+  function saveDots(idx) {
+    return '<span class="title-dots" onclick="event.stopPropagation();showSaveMenu(event,' + idx + ')">\u22EE</span>';
+  }
   if (g.items.length === 1) {
     const i = g.items[0], s = S[i];
     const bu = s.backup ? '<span class="badge badge-bu">BACKUP</span>' : '';
+    const dots = s.usb ? saveDots(i) : tdots;
     h += '<div class="sv' + (i === si ? ' sel' : '') + '" onclick="sel(' + i + ')">';
-    h += '<div class="tid">' + bu + badge + esc(g.name) + tdots + '</div>';
+    h += '<div class="tid">' + bu + badge + esc(g.name) + dots + '</div>';
     h += '<div class="sn">' + esc(s.save_name) + '</div></div>';
   } else {
     const open = exG.has(g.title_id);
@@ -725,8 +729,9 @@ function renderGroup(g, h) {
       g.items.forEach(i => {
         const s = S[i];
         const bu = s.backup ? '<span class="badge badge-bu">BACKUP</span>' : '';
+        const dots = s.usb ? saveDots(i) : '';
         h += '<div class="sv' + (i === si ? ' sel' : '') + '" onclick="sel(' + i + ')" style="padding-left:28px">';
-        h += '<div class="sn" style="color:var(--tx)">' + bu + esc(s.save_name) + '</div></div>';
+        h += '<div class="sn" style="color:var(--tx)">' + bu + esc(s.save_name) + dots + '</div></div>';
       });
     }
   }
@@ -1535,6 +1540,69 @@ async function deleteTitle(titleId) {
   }
 }
 
+function showSaveMenu(e, idx) {
+  e.preventDefault();
+  closeCtxMenu();
+  const s = S[idx];
+  const m = document.createElement('div');
+  m.className = 'ctx-menu';
+  m.id = 'ctxmenu';
+  let items = '';
+  if (s.usb) {
+    items += '<div onclick="importSingleUsb(' + idx + ')">Import to System</div>';
+  }
+  items += '<div class="ctx-del" onclick="deleteSave(' + idx + ')">Delete</div>';
+  m.innerHTML = items;
+  m.style.left = e.clientX + 'px';
+  m.style.top = e.clientY + 'px';
+  document.body.appendChild(m);
+  const r = m.getBoundingClientRect();
+  if (r.right > window.innerWidth) m.style.left = (window.innerWidth - r.width - 4) + 'px';
+  if (r.bottom > window.innerHeight) m.style.top = (window.innerHeight - r.height - 4) + 'px';
+}
+
+async function importSingleUsb(idx) {
+  closeCtxMenu();
+  if (bsy) return;
+  const s = S[idx];
+  const exists = S.some((x, i) => i !== idx && !x.usb && x.title_id === s.title_id && x.save_name === s.save_name);
+  if (exists) {
+    const ok = await showConfirmModal('This will overwrite an existing save. Are you sure?');
+    if (!ok) return;
+  }
+  bsy = true;
+  try {
+    log('Importing ' + s.title_id + '/' + s.save_name + ' to system...');
+    let r = await fetch('/api/import_usb_save?idx=' + idx + '&uid=' + encodeURIComponent(curUid));
+    let d = await r.json();
+    if (d.error) throw new Error(d.error);
+    log('Imported ' + d.title_id + '/' + d.dir_name, 'ok');
+    await load();
+    renderL();
+  } catch(e) {
+    log('Import failed: ' + e.message, 'err');
+  }
+  bsy = false;
+}
+
+async function deleteSave(idx) {
+  closeCtxMenu();
+  const s = S[idx];
+  const ok = await showConfirmModal('Delete ' + s.title_id + '/' + s.save_name + '? This cannot be undone.');
+  if (!ok) return;
+  try {
+    log('Deleting ' + s.title_id + '/' + s.save_name + '...');
+    const r = await fetch('/api/delete_save?idx=' + idx);
+    const d = await r.json();
+    if (d.error) { log('Delete failed: ' + d.error, 'err'); return; }
+    log('Deleted ' + s.save_name, 'ok');
+    if (idx === si) { si = -1; mt = null; cf = []; }
+    load();
+  } catch(e) {
+    log('Delete failed: ' + e.message, 'err');
+  }
+}
+
 function showCtxMenu(e, fname) {
   e.preventDefault();
   closeCtxMenu();
@@ -1758,15 +1826,16 @@ async function importUsb() {
   /* Check if a system save with same title_id and save_name exists */
   const exists = S.some((x, i) => i !== si && !x.usb && x.title_id === s.title_id && x.save_name === s.save_name);
   if (exists) {
-    if (!confirm('This will overwrite your existing save!\nAre you sure?')) return;
+    const ok = await showConfirmModal('This will overwrite an existing save. Are you sure?');
+    if (!ok) return;
   }
   bsy = true; renderTB();
   try {
     log('Importing ' + s.title_id + '/' + s.save_name + ' to system...');
-    const r = await fetch('/api/import_finish?uid=' + encodeURIComponent(curUid));
+    const r = await fetch('/api/import_usb_save?idx=' + si + '&uid=' + encodeURIComponent(curUid));
     const d = await r.json();
     if (d.error) throw new Error(d.error);
-    log('Imported ' + d.title_id + '/' + d.dir_name + (d.exists ? ' (updated)' : ' (new)'), 'ok');
+    log('Imported ' + d.title_id + '/' + d.dir_name, 'ok');
     await load();
     renderL();
   } catch (e) {

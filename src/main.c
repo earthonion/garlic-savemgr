@@ -271,6 +271,24 @@ static void scan_savedata_prospero(const char *prospero_path, const char *uid) {
     closedir(d);
 }
 
+/* ── SFO types (parser defined later) ──────────────────────────── */
+typedef struct sfo_info {
+    char title_id[16];
+    char dir_name[64];
+    char main_title[128];
+    char sub_title[128];
+    char detail[256];
+    char game_title_id[16];
+    uint32_t user_param;
+    uint32_t blocks;
+    uint64_t account_id;
+    uint32_t user_id;
+    uint32_t aid_offset;
+    uint32_t uid_offset;
+    char format[4];
+} sfo_info_t;
+static int parse_sfo(const char *path, sfo_info_t *info);
+
 static void scan_usb_saves(const char *garlic_path) {
     DIR *d = opendir(garlic_path);
     if (!d) return;
@@ -315,15 +333,12 @@ static void scan_usb_saves(const char *garlic_path) {
                     close(hfd);
                 }
             } else if (S_ISDIR(fst.st_mode)) {
-                /* Decrypted folder: check param.sfo byte 0x8 — 0x0D=PS4, 0x00=PS5 */
+                /* Decrypted folder: check FORMAT in param.sfo — "obs"=PS4, "ppr"=PS5 */
                 char sfo[MAX_PATH_LEN];
                 snprintf(sfo, sizeof(sfo), "%s/sce_sys/param.sfo", filepath);
-                int sfd = open(sfo, O_RDONLY);
-                if (sfd >= 0) {
-                    uint8_t ver;
-                    if (pread(sfd, &ver, 1, 0x8) == 1 && ver == 0x0D) s->is_ps4 = 1;
-                    close(sfd);
-                }
+                sfo_info_t sfo_info;
+                if (parse_sfo(sfo, &sfo_info) == 0 && strcmp(sfo_info.format, "obs") == 0)
+                    s->is_ps4 = 1;
             }
         }
         closedir(td);
@@ -746,21 +761,6 @@ static int mount_by_path(const char *path) {
 }
 
 /* ── SFO parser ────────────────────────────────────────────────── */
-typedef struct {
-    char title_id[16];
-    char dir_name[64];
-    char main_title[128];
-    char sub_title[128];
-    char detail[256];
-    char game_title_id[16];
-    uint32_t user_param;
-    uint32_t blocks;
-    uint64_t account_id;
-    uint32_t user_id;
-    uint32_t aid_offset;  /* file offset of ACCOUNT_ID value */
-    uint32_t uid_offset;  /* file offset of USER_ID value */
-} sfo_info_t;
-
 static int parse_sfo(const char *path, sfo_info_t *info) {
     memset(info, 0, sizeof(*info));
     int fd = open(path, O_RDONLY);
@@ -822,6 +822,8 @@ static int parse_sfo(const char *path, sfo_info_t *info) {
             memcpy(&info->account_id, val, 8);
         else if (strcmp(key, "USER_ID") == 0 && param_len >= 4)
             memcpy(&info->user_id, val, 4);
+        else if (strcmp(key, "FORMAT") == 0)
+            snprintf(info->format, sizeof(info->format), "%.*s", (int)param_len, (char*)val);
         else if (strcmp(key, "SAVEDATA_LIST_PARAM") == 0 || strcmp(key, "CATEGORY") == 0) {
             /* game_title_id from CATEGORY not needed, use title_id */
         }
@@ -1889,6 +1891,11 @@ static void handle_request(int sock) {
             http_json(sock, "{\"error\":\"param.sfo missing TITLE_ID or SAVEDATA_DIRECTORY\"}"); return;
         }
 
+        /* Detect PS4 vs PS5 from SFO FORMAT field: "obs"=PS4, "ppr"=PS5 */
+        g_enc_ps4 = (strcmp(sfo.format, "obs") == 0) ? 1 : 0;
+        printf("[GarlicMgr] import_encrypted: FORMAT=%s -> %s\n",
+               sfo.format, g_enc_ps4 ? "PS4" : "PS5");
+
         /* Get user's account_id for comparison */
         char uid_hex[16] = {0};
         char *uidp = strstr(url, "uid=");
@@ -2494,6 +2501,15 @@ static void handle_request(int sock) {
             http_json(sock, "{\"error\":\"No save mounted\"}"); return;
         }
 
+        /* Re-detect PS4 vs PS5 from SFO FORMAT field */
+        {
+            char sfo_chk[MAX_PATH_LEN];
+            snprintf(sfo_chk, sizeof(sfo_chk), "%s/sce_sys/param.sfo", g_mount_point);
+            sfo_info_t sfo_tmp;
+            if (parse_sfo(sfo_chk, &sfo_tmp) == 0)
+                g_enc_ps4 = (strcmp(sfo_tmp.format, "obs") == 0) ? 1 : 0;
+        }
+
         /* Optional account ID patching */
         char *ap = strstr(url, "aid=");
         if (ap) {
@@ -2806,6 +2822,360 @@ static void handle_request(int sock) {
         return;
     }
 
+    /* GET /api/import_usb_save?idx=N&uid=<hex> -> import decrypted USB save to system */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/import_usb_save", 20) == 0) {
+        scan_saves();
+        int idx = -1;
+        char *p = strstr(url, "idx=");
+        if (p) idx = atoi(p + 4);
+        if (idx < 0 || idx >= g_save_count) {
+            http_json(sock, "{\"error\":\"Invalid index\"}"); return;
+        }
+        save_entry_t *s = &g_saves[idx];
+
+        /* Verify it's a decrypted folder */
+        struct stat path_st;
+        if (stat(s->path, &path_st) < 0 || !S_ISDIR(path_st.st_mode)) {
+            http_json(sock, "{\"error\":\"Not a decrypted save folder\"}"); return;
+        }
+
+        /* Parse param.sfo */
+        char sfo_path[MAX_PATH_LEN];
+        snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", s->path);
+        sfo_info_t sfo;
+        if (parse_sfo(sfo_path, &sfo) < 0 || !sfo.title_id[0] || !sfo.dir_name[0]) {
+            http_json(sock, "{\"error\":\"Cannot parse param.sfo\"}"); return;
+        }
+
+        /* Detect PS4/PS5 from FORMAT */
+        int is_ps4 = (strcmp(sfo.format, "obs") == 0);
+        g_enc_ps4 = is_ps4;
+        printf("[GarlicMgr] import_usb: %s/%s FORMAT=%s %s\n",
+               sfo.title_id, sfo.dir_name, sfo.format, is_ps4 ? "PS4" : "PS5");
+
+        /* Get user info */
+        char uid_hex[16] = {0};
+        char *uidp = strstr(url, "uid=");
+        if (uidp) {
+            strncpy(uid_hex, uidp + 4, sizeof(uid_hex) - 1);
+            char *amp = strchr(uid_hex, '&'); if (amp) *amp = 0;
+        }
+        uint32_t uid;
+        if (uid_hex[0]) {
+            uid = (uint32_t)strtoul(uid_hex, NULL, 16);
+        } else {
+            int local_uid = 0;
+            sceUserServiceGetForegroundUser(&local_uid);
+            uid = (uint32_t)local_uid;
+            snprintf(uid_hex, sizeof(uid_hex), "%x", uid);
+        }
+
+        pid_t rpid = getpid();
+        kernel_set_ucred_uid(rpid, 0);
+        kernel_set_ucred_authid(rpid, 0x4800000000000010ULL);
+
+        /* Calculate total size of USB save folder */
+        uint64_t total_size = 0;
+        {
+            DIR *sd = opendir(s->path);
+            if (sd) {
+                struct dirent *se;
+                while ((se = readdir(sd))) {
+                    if (se->d_name[0] == '.') continue;
+                    char fp[MAX_PATH_LEN];
+                    snprintf(fp, sizeof(fp), "%s/%s", s->path, se->d_name);
+                    struct stat fst;
+                    if (stat(fp, &fst) == 0) total_size += fst.st_size;
+                }
+                closedir(sd);
+            }
+        }
+        if (total_size == 0) total_size = 1024 * 1024;
+
+        /* Create PFS image: size + 25% overhead + 4MB, min 32MB */
+        uint64_t img_size = total_size + (total_size / 4) + (4 * 1024 * 1024);
+        if (img_size < 32 * 1024 * 1024) img_size = 32 * 1024 * 1024;
+        img_size = ((img_size + 32767) / 32768) * 32768;
+
+        mkdir("/data/save_files", 0777);
+        const char *tmp = "/data/save_files/_tmp_usb_import";
+        unlink(tmp);
+
+        int imgfd = open(tmp, O_CREAT | O_TRUNC | O_RDWR, 0777);
+        if (imgfd < 0) {
+            http_json(sock, "{\"error\":\"Cannot create temp file\"}"); return;
+        }
+        int ret = sceFsUfsAllocateSaveData(imgfd, img_size, 0, 0);
+        if (ret < 0) {
+            if (ftruncate(imgfd, img_size) < 0) {
+                close(imgfd); unlink(tmp);
+                http_json(sock, "{\"error\":\"Cannot allocate image\"}"); return;
+            }
+        }
+        close(imgfd);
+
+        /* Create PFS image — PS4 and PS5 use different key/format methods */
+        uint8_t ckey[0x20] = {0};
+
+        if (is_ps4) {
+            /* PS4: generate sealed key, decrypt it */
+            uint8_t *kbuf = malloc(0x100);
+            if (!kbuf) { unlink(tmp); http_json(sock, "{\"error\":\"Out of memory\"}"); return; }
+            memset(kbuf, 0, 0x100);
+
+            int gen_ok = 0;
+            int kfd = open("/dev/sbl_srv", O_RDWR);
+            if (kfd >= 0) {
+                if (ioctl(kfd, 0x40845303, kbuf) >= 0) gen_ok = 1;
+                close(kfd);
+            }
+            if (!gen_ok) {
+                memset(kbuf, 0, 0x100);
+                kfd = open("/dev/pfsmgr", O_RDWR);
+                if (kfd >= 0) {
+                    if (ioctl(kfd, 0x40845303, kbuf) >= 0) gen_ok = 1;
+                    close(kfd);
+                }
+            }
+            if (!gen_ok) {
+                free(kbuf); unlink(tmp);
+                http_json(sock, "{\"error\":\"Cannot generate sealed key\"}"); return;
+            }
+            memcpy(g_sealed_key, kbuf, 96);
+            printf("[GarlicMgr] import_usb: PS4 sealed key generated\n");
+
+            /* Decrypt sealed key */
+            memset(kbuf, 0, 0x100);
+            memcpy(kbuf, g_sealed_key, 96);
+            int pfsmgr = open("/dev/pfsmgr", O_RDWR);
+            if (pfsmgr < 0) {
+                free(kbuf); unlink(tmp);
+                http_json(sock, "{\"error\":\"Cannot open pfsmgr\"}"); return;
+            }
+            ret = ioctl(pfsmgr, 0xc0845302, kbuf);
+            close(pfsmgr);
+            if (ret < 0) {
+                free(kbuf); unlink(tmp);
+                http_json(sock, "{\"error\":\"Cannot decrypt sealed key\"}"); return;
+            }
+            memcpy(ckey, kbuf + 0x60, 0x20);
+            free(kbuf);
+
+            /* Format with non-Ppr create */
+            CreateOpt copt;
+            memset(&copt, 0, sizeof(copt));
+            sceFsInitCreatePfsSaveDataOpt(&copt);
+            ret = sceFsCreatePfsSaveDataImage(&copt, tmp, 0, img_size, ckey);
+        } else {
+            /* PS5: PprCreate with zeroed key + compression */
+            CreateOpt copt;
+            memset(&copt, 0, sizeof(copt));
+            sceFsInitCreatePfsSaveDataOpt(&copt);
+            copt.flags[1] = 0x02;
+            if (!g_pprCreate) {
+                unlink(tmp);
+                http_json(sock, "{\"error\":\"PprCreate not available\"}"); return;
+            }
+            ret = g_pprCreate(&copt, tmp, 0, img_size, ckey);
+        }
+        if (ret < 0) {
+            unlink(tmp);
+            char json[128];
+            snprintf(json, sizeof(json), "{\"error\":\"Format PFS failed: 0x%x\"}", ret);
+            http_json(sock, json); return;
+        }
+        printf("[GarlicMgr] import_usb: PFS formatted (%s)\n", is_ps4 ? "PS4" : "PS5");
+
+        /* Mount PFS */
+        if (g_mounted) unmount_save();
+        snprintf(g_mount_point, sizeof(g_mount_point), "/data/mount_sd");
+        mkdir(g_mount_point, 0777);
+        MountOpt mopt;
+        memset(&mopt, 0, sizeof(mopt));
+        sceFsInitMountSaveDataOpt(&mopt);
+        mopt.budgetid = "system";
+        signal(SIGPIPE, SIG_DFL);
+        ret = sceFsMountSaveData(&mopt, tmp, g_mount_point, ckey);
+        signal(SIGPIPE, SIG_IGN);
+        if (ret < 0) {
+            unlink(tmp);
+            char json[128];
+            snprintf(json, sizeof(json), "{\"error\":\"Mount failed: 0x%x\"}", ret);
+            http_json(sock, json); return;
+        }
+        snprintf(g_mounted_path, sizeof(g_mounted_path), "%s", tmp);
+        g_local_copy[0] = 0;
+        g_mounted = 1;
+
+        /* Copy all files from USB save into PFS */
+        copy_dir_recursive(s->path, g_mount_point);
+        sync();
+        printf("[GarlicMgr] import_usb: copied files into PFS\n");
+
+        /* Resign param.sfo */
+        uint64_t local_aid = get_account_id_for_user(uid_hex);
+        if (local_aid) {
+            char pfs_sfo[MAX_PATH_LEN];
+            snprintf(pfs_sfo, sizeof(pfs_sfo), "%s/sce_sys/param.sfo", g_mount_point);
+            int sfo_fd = open(pfs_sfo, O_RDWR);
+            if (sfo_fd >= 0) {
+                if (is_ps4) {
+                    pwrite(sfo_fd, &local_aid, 8, 0x15C);
+                } else {
+                    pwrite(sfo_fd, &local_aid, 8, 0x1B8);
+                    pwrite(sfo_fd, &uid, 4, 0x660);
+                }
+                close(sfo_fd);
+                sync();
+                printf("[GarlicMgr] import_usb: resigned %s\n", is_ps4 ? "PS4" : "PS5");
+            }
+        }
+
+        /* Copy icon before unmount */
+        char icon_tmp[MAX_PATH_LEN] = {0};
+        {
+            char icon_src[MAX_PATH_LEN];
+            snprintf(icon_src, sizeof(icon_src), "%s/sce_sys/icon0.png", g_mount_point);
+            struct stat ist;
+            if (stat(icon_src, &ist) == 0) {
+                snprintf(icon_tmp, sizeof(icon_tmp), "/data/save_files/_tmp_icon.png");
+                copy_file(icon_src, icon_tmp);
+            }
+        }
+
+        /* Unmount (re-encrypts) */
+        unmount_save();
+
+        /* Copy encrypted image to system save location */
+        char sd_dir[MAX_PATH_LEN], sd_dst[MAX_PATH_LEN];
+        snprintf(sd_dir, sizeof(sd_dir), "/user/home/%s/%s/%s", uid_hex,
+                 is_ps4 ? "savedata" : "savedata_prospero", sfo.title_id);
+        snprintf(sd_dst, sizeof(sd_dst), "%s/sdimg_%s", sd_dir, sfo.dir_name);
+        recursive_mkdir(sd_dir);
+
+        if (copy_file(tmp, sd_dst) < 0) {
+            unlink(tmp);
+            if (icon_tmp[0]) unlink(icon_tmp);
+            http_json(sock, "{\"error\":\"Failed to copy save\"}"); return;
+        }
+        unlink(tmp);
+        chmod(sd_dst, 0644);
+
+        /* PS4: write .bin sealed key companion */
+        if (is_ps4) {
+            char bin_dst[MAX_PATH_LEN];
+            snprintf(bin_dst, sizeof(bin_dst), "%s/%s.bin", sd_dir, sfo.dir_name);
+            int bfd = open(bin_dst, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+            if (bfd >= 0) {
+                write(bfd, g_sealed_key, 96);
+                close(bfd);
+                printf("[GarlicMgr] import_usb: wrote PS4 .bin key -> %s\n", bin_dst);
+            }
+        }
+
+        /* Copy icon */
+        if (icon_tmp[0]) {
+            char icon_dir[MAX_PATH_LEN], icon_dst[MAX_PATH_LEN];
+            snprintf(icon_dir, sizeof(icon_dir),
+                     "/user/home/%s/savedata_prospero_meta/user/%s", uid_hex, sfo.title_id);
+            snprintf(icon_dst, sizeof(icon_dst), "%s/%s_icon0.png", icon_dir, sfo.dir_name);
+            recursive_mkdir(icon_dir);
+            copy_file(icon_tmp, icon_dst);
+            unlink(icon_tmp);
+        }
+
+        /* Update savedata.db */
+        char db_path[MAX_PATH_LEN];
+        snprintf(db_path, sizeof(db_path), "/system_data/%s/%s/db/user/savedata.db",
+                 is_ps4 ? "savedata" : "savedata_prospero", uid_hex);
+        {
+            char db_dir[MAX_PATH_LEN];
+            snprintf(db_dir, sizeof(db_dir), "/system_data/%s/%s/db/user",
+                     is_ps4 ? "savedata" : "savedata_prospero", uid_hex);
+            recursive_mkdir(db_dir);
+        }
+        sqlite3 *db = NULL;
+        ret = sqlite3_open(db_path, &db);
+        if (ret == SQLITE_OK) {
+            char *err_msg = NULL;
+            sqlite3_exec(db,
+                "CREATE TABLE IF NOT EXISTS savedata ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,"
+                "title_id NOT NULL, dir_name NOT NULL, main_title NOT NULL,"
+                "sub_title, detail, tmp_dir_name, is_broken, user_param,"
+                "blocks, free_blocks, size_kib, mtime NOT NULL,"
+                "fake_broken, account_id, user_id, faked_owner,"
+                "cloud_icon_url, cloud_revision, game_title_id NOT NULL, system_blocks)",
+                NULL, 0, &err_msg);
+            if (err_msg) { sqlite3_free(err_msg); err_msg = NULL; }
+
+            /* Escape strings */
+            char esc_title[256] = {0};
+            {
+                char *src = sfo.main_title, *dst = esc_title;
+                while (*src && dst < esc_title + sizeof(esc_title) - 2) {
+                    if (*src == '\'') *dst++ = '\'';
+                    *dst++ = *src++;
+                }
+                *dst = 0;
+            }
+
+            char mtime[64];
+            { time_t now = time(NULL); struct tm *tm = gmtime(&now);
+              strftime(mtime, sizeof(mtime), "%Y-%m-%dT%H:%M:%S.00Z", tm); }
+
+            uint64_t aid_val = local_aid ? local_aid : sfo.account_id;
+            uint32_t size_kib = sfo.blocks * 0x40;
+
+            /* Check if exists */
+            char check_sql[512];
+            snprintf(check_sql, sizeof(check_sql),
+                     "SELECT COUNT(*) FROM savedata WHERE title_id='%s' AND dir_name='%s'",
+                     sfo.title_id, sfo.dir_name);
+            sqlite3_stmt *stmt = NULL;
+            int db_exists = 0;
+            if (sqlite3_prepare_v2(db, check_sql, -1, &stmt, NULL) == SQLITE_OK) {
+                if (sqlite3_step(stmt) == SQLITE_ROW)
+                    db_exists = sqlite3_column_int(stmt, 0);
+                sqlite3_finalize(stmt);
+            }
+
+            char sql[2048];
+            if (db_exists) {
+                snprintf(sql, sizeof(sql),
+                    "UPDATE savedata SET main_title='%s', mtime='%s', account_id=%llu, user_id=%u "
+                    "WHERE title_id='%s' AND dir_name='%s'",
+                    esc_title, mtime, (unsigned long long)aid_val, uid,
+                    sfo.title_id, sfo.dir_name);
+            } else {
+                snprintf(sql, sizeof(sql),
+                    "INSERT INTO savedata (title_id, dir_name, main_title, sub_title, detail,"
+                    "is_broken, user_param, blocks, free_blocks, size_kib, mtime,"
+                    "fake_broken, account_id, user_id, faked_owner, cloud_revision,"
+                    "game_title_id, system_blocks) VALUES ("
+                    "'%s','%s','%s','','',0,%u,%u,%u,%u,'%s',0,%llu,%u,0,0,'%s',0)",
+                    sfo.title_id, sfo.dir_name, esc_title,
+                    sfo.user_param, sfo.blocks, sfo.blocks, size_kib, mtime,
+                    (unsigned long long)aid_val, uid, sfo.title_id);
+            }
+            ret = sqlite3_exec(db, sql, NULL, 0, &err_msg);
+            if (ret != SQLITE_OK) {
+                printf("[GarlicMgr] import_usb: DB error: %s\n", err_msg);
+                sqlite3_free(err_msg);
+            } else {
+                printf("[GarlicMgr] import_usb: DB %s OK\n", db_exists ? "updated" : "inserted");
+            }
+            sqlite3_close(db);
+        }
+
+        char json[512];
+        snprintf(json, sizeof(json),
+                 "{\"ok\":true,\"title_id\":\"%s\",\"dir_name\":\"%s\",\"main_title\":\"%s\"}",
+                 sfo.title_id, sfo.dir_name, sfo.main_title);
+        http_json(sock, json);
+        return;
+    }
+
     /* GET /api/import_finish -> parse SFO, resign, unmount, copy to final location, update DB */
     if (strcmp(method, "GET") == 0 && strncmp(url, "/api/import_finish", 18) == 0) {
         if (!g_mounted) {
@@ -2829,8 +3199,11 @@ static void handle_request(int sock) {
             http_json(sock, "{\"error\":\"param.sfo missing TITLE_ID or SAVEDATA_DIRECTORY\"}");
             return;
         }
-        printf("[GarlicMgr] import: title_id=%s dir=%s title=%s blocks=%u\n",
-               sfo.title_id, sfo.dir_name, sfo.main_title, sfo.blocks);
+        /* Detect PS4 vs PS5 from SFO FORMAT field: "obs"=PS4, "ppr"=PS5 */
+        g_enc_ps4 = (strcmp(sfo.format, "obs") == 0) ? 1 : 0;
+        printf("[GarlicMgr] import: title_id=%s dir=%s title=%s blocks=%u FORMAT=%s %s\n",
+               sfo.title_id, sfo.dir_name, sfo.main_title, sfo.blocks,
+               sfo.format, g_enc_ps4 ? "(PS4)" : "(PS5)");
 
         /* Get user info — prefer uid query param, fallback to foreground user */
         char uid_hex[16] = {0};
@@ -3317,6 +3690,79 @@ static void handle_request(int sock) {
         send(sock, ecd, 22, 0);
 
         free(all_entries);
+        return;
+    }
+
+    /* GET /api/delete_save?idx=N -> delete a single save from disk and DB */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/delete_save", 16) == 0) {
+        scan_saves();
+        int idx = -1;
+        char *p = strstr(url, "idx=");
+        if (p) idx = atoi(p + 4);
+        if (idx < 0 || idx >= g_save_count) {
+            http_json(sock, "{\"error\":\"Invalid index\"}"); return;
+        }
+
+        pid_t rpid = getpid();
+        kernel_set_ucred_uid(rpid, 0);
+        kernel_set_ucred_authid(rpid, 0x4800000000000010ULL);
+
+        save_entry_t *s = &g_saves[idx];
+
+        /* Delete the save file */
+        unlink(s->path);
+        printf("[GarlicMgr] delete_save: %s\n", s->path);
+
+        /* Delete .bin companion for PS4 */
+        if (s->is_ps4 && strncmp(s->save_name, "sdimg_", 6) == 0) {
+            const char *sname = s->save_name + 6;
+            char dir[MAX_PATH_LEN];
+            strncpy(dir, s->path, sizeof(dir) - 1);
+            dir[sizeof(dir) - 1] = 0;
+            char *sl = strrchr(dir, '/');
+            if (sl) *(sl + 1) = 0;
+            char bin_path[MAX_PATH_LEN];
+            snprintf(bin_path, sizeof(bin_path), "%s%s.bin", dir, sname);
+            unlink(bin_path);
+        }
+
+        /* Delete from DB if not a USB save */
+        if (!s->is_usb && strncmp(s->save_name, "sdimg_", 6) == 0) {
+            const char *dir_name = s->save_name + 6;
+            const char *sd = s->is_ps4 ? "savedata" : "savedata_prospero";
+            char db_path[MAX_PATH_LEN];
+            snprintf(db_path, sizeof(db_path),
+                     "/system_data/%s/%s/db/user/savedata.db", sd, s->user_id);
+            sqlite3 *db = NULL;
+            if (sqlite3_open(db_path, &db) == SQLITE_OK) {
+                char sql[512];
+                snprintf(sql, sizeof(sql),
+                         "DELETE FROM savedata WHERE title_id='%s' AND dir_name='%s'",
+                         s->title_id, dir_name);
+                char *err_msg = NULL;
+                int ret = sqlite3_exec(db, sql, NULL, 0, &err_msg);
+                if (ret != SQLITE_OK) {
+                    printf("[GarlicMgr] delete_save DB error: %s\n", err_msg);
+                    sqlite3_free(err_msg);
+                } else {
+                    printf("[GarlicMgr] delete_save: removed %s/%s from %s DB\n",
+                           s->title_id, dir_name, sd);
+                }
+                sqlite3_close(db);
+            }
+        }
+
+        /* Try to remove title dir if now empty */
+        {
+            char title_dir[MAX_PATH_LEN];
+            strncpy(title_dir, s->path, sizeof(title_dir) - 1);
+            title_dir[sizeof(title_dir) - 1] = 0;
+            char *sl = strrchr(title_dir, '/');
+            if (sl) *sl = 0;
+            rmdir(title_dir); /* only succeeds if empty */
+        }
+
+        http_json(sock, "{\"ok\":true}");
         return;
     }
 
