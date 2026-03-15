@@ -7,7 +7,7 @@ PS5_LIBDIR := $(PS5_PAYLOAD_SDK)/target/lib
 CFLAGS := -O2 -Wall -D_BSD_SOURCE -std=gnu11 -Isrc -I$(PS5_INCDIR)
 SQLITE_FLAGS := -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_WAL -w
 LDFLAGS := -L$(PS5_LIBDIR)
-LIBS := -lkernel_sys -lkernel -lSceSystemService -lSceUserService -lSceFsInternalForVsh
+LIBS := -lkernel_sys -lkernel -lSceSystemService -lSceUserService -lSceFsInternalForVsh -lSceRegMgr
 
 all: garlic-savemgr.elf
 
