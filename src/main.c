@@ -598,6 +598,7 @@ static int mount_by_path(const char *path) {
             close(hfd);
         }
     }
+    g_enc_ps4 = is_ps4;
     logprintf("[GarlicMgr] mount_by_path: %s detected as %s\n", bname, is_ps4 ? "PS4" : "PS5");
 
     kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
@@ -719,6 +720,8 @@ typedef struct {
     uint32_t blocks;
     uint64_t account_id;
     uint32_t user_id;
+    uint32_t aid_offset;  /* file offset of ACCOUNT_ID value */
+    uint32_t uid_offset;  /* file offset of USER_ID value */
 } sfo_info_t;
 
 static int parse_sfo(const char *path, sfo_info_t *info) {
@@ -1786,6 +1789,126 @@ static void handle_request(int sock) {
         return;
     }
 
+    /* POST /api/import_encrypted?uid=<hex>&ps4=1 -> upload encrypted save, mount, check SFO + AID */
+    if (strcmp(method, "POST") == 0 && strncmp(url, "/api/import_encrypted", 21) == 0) {
+        size_t clen = 0;
+        char *cl = strcasestr(req, "Content-Length:");
+        if (cl) clen = strtoul(cl + 15, NULL, 10);
+        if (clen == 0 || clen > (size_t)2 * 1024 * 1024 * 1024) {
+            http_json(sock, "{\"error\":\"Invalid size\"}"); return;
+        }
+        char *body_start = strstr(req, "\r\n\r\n");
+        if (!body_start) { http_json(sock, "{\"error\":\"Bad request\"}"); return; }
+        body_start += 4;
+        size_t body_in_buf = n - (body_start - req);
+
+        int is_ps4_imp = (strstr(url, "ps4=1") != NULL);
+        mkdir("/data/save_files", 0777);
+        const char *tmp = is_ps4_imp ? "/data/save_files/sdimg__tmp_import" : "/data/save_files/_tmp_import";
+        int fd = open(tmp, O_CREAT | O_WRONLY | O_TRUNC, 0755);
+        if (fd < 0) { http_json(sock, "{\"error\":\"Cannot create temp file\"}"); return; }
+        if (body_in_buf > clen) body_in_buf = clen;
+        write(fd, body_start, body_in_buf);
+        size_t received = body_in_buf;
+        while (received < clen) {
+            char *buf = g_iobuf;
+            size_t want = BUF_SIZE < (clen - received) ? BUF_SIZE : (clen - received);
+            ssize_t r = recv_all(sock, buf, want);
+            if (r <= 0) break;
+            write(fd, buf, r);
+            received += r;
+        }
+        close(fd);
+        printf("[GarlicMgr] import_encrypted: received %zu bytes (ps4=%d)\n", received, is_ps4_imp);
+
+        /* For PS4, rename uploaded key to match */
+        if (is_ps4_imp)
+            rename("/data/save_files/_tmp_key.bin", "/data/save_files/_tmp_import.bin");
+
+        /* Mount the encrypted image */
+        int ret = mount_by_path(tmp);
+        if (ret < 0) {
+            unlink(tmp);
+            char json[128];
+            snprintf(json, sizeof(json), "{\"error\":\"Mount failed: %d\"}", ret);
+            http_json(sock, json); return;
+        }
+
+        /* Parse param.sfo from mounted save */
+        char sfo_path[MAX_PATH_LEN];
+        snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
+        sfo_info_t sfo;
+        int sfo_ret = parse_sfo(sfo_path, &sfo);
+        if (sfo_ret == -2) {
+            unmount_save(); unlink(tmp);
+            http_json(sock, "{\"error\":\"param.sfo is corrupted!\"}"); return;
+        }
+        if (sfo_ret < 0) {
+            unmount_save(); unlink(tmp);
+            http_json(sock, "{\"error\":\"Cannot parse param.sfo\"}"); return;
+        }
+        if (!sfo.title_id[0] || !sfo.dir_name[0]) {
+            unmount_save(); unlink(tmp);
+            http_json(sock, "{\"error\":\"param.sfo missing TITLE_ID or SAVEDATA_DIRECTORY\"}"); return;
+        }
+
+        /* Get user's account_id for comparison */
+        char uid_hex[16] = {0};
+        char *uidp = strstr(url, "uid=");
+        if (uidp) {
+            strncpy(uid_hex, uidp + 4, sizeof(uid_hex) - 1);
+            char *amp = strchr(uid_hex, '&');
+            if (amp) *amp = 0;
+        }
+        if (!uid_hex[0]) {
+            int local_uid = 0;
+            sceUserServiceGetForegroundUser(&local_uid);
+            snprintf(uid_hex, sizeof(uid_hex), "%x", (uint32_t)local_uid);
+        }
+
+        uint64_t user_aid = 0;
+        {
+            char aid_db[MAX_PATH_LEN];
+            snprintf(aid_db, sizeof(aid_db),
+                     "/system_data/savedata_prospero/%s/db/user/savedata.db", uid_hex);
+            sqlite3 *adb = NULL;
+            if (sqlite3_open_v2(aid_db, &adb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+                sqlite3_stmt *astmt = NULL;
+                if (sqlite3_prepare_v2(adb, "SELECT account_id FROM savedata LIMIT 1",
+                                       -1, &astmt, NULL) == SQLITE_OK) {
+                    if (sqlite3_step(astmt) == SQLITE_ROW)
+                        user_aid = (uint64_t)sqlite3_column_int64(astmt, 0);
+                    sqlite3_finalize(astmt);
+                }
+                sqlite3_close(adb);
+            }
+        }
+
+        int match = (user_aid != 0 && sfo.account_id == user_aid) ? 1 : 0;
+
+        /* Check if save already exists on system */
+        char exist_path[MAX_PATH_LEN];
+        snprintf(exist_path, sizeof(exist_path), "/user/home/%s/%s/%s/sdimg_%s",
+                 uid_hex, g_enc_ps4 ? "savedata" : "savedata_prospero",
+                 sfo.title_id, sfo.dir_name);
+        struct stat ex_st;
+        int exists = (stat(exist_path, &ex_st) == 0) ? 1 : 0;
+
+        printf("[GarlicMgr] import_encrypted: title=%s dir=%s save_aid=%llx user_aid=%llx match=%d exists=%d\n",
+               sfo.title_id, sfo.dir_name,
+               (unsigned long long)sfo.account_id, (unsigned long long)user_aid, match, exists);
+
+        char json[512];
+        snprintf(json, sizeof(json),
+                 "{\"ok\":true,\"title_id\":\"%s\",\"dir_name\":\"%s\",\"main_title\":\"%s\","
+                 "\"save_aid\":\"%llx\",\"user_aid\":\"%llx\",\"match\":%s,\"exists\":%s}",
+                 sfo.title_id, sfo.dir_name, sfo.main_title,
+                 (unsigned long long)sfo.account_id, (unsigned long long)user_aid,
+                 match ? "true" : "false", exists ? "true" : "false");
+        http_json(sock, json);
+        return;
+    }
+
     /* POST /api/encrypt_upload?aid=<optional hex> -> upload .zip, get encrypted save */
     if (strcmp(method, "POST") == 0 && strncmp(url, "/api/encrypt_upload", 19) == 0) {
         size_t clen = 0;
@@ -2629,6 +2752,39 @@ static void handle_request(int sock) {
         return;
     }
 
+    /* GET /api/import_check?uid=<hex> -> check if mounted save already exists on system */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/import_check", 17) == 0) {
+        if (!g_mounted) { http_json(sock, "{\"error\":\"No save mounted\"}"); return; }
+        char sfo_path[MAX_PATH_LEN];
+        snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
+        sfo_info_t sfo;
+        if (parse_sfo(sfo_path, &sfo) < 0 || !sfo.title_id[0] || !sfo.dir_name[0]) {
+            http_json(sock, "{\"exists\":false}"); return;
+        }
+        char uid_hex[16] = {0};
+        char *uidp = strstr(url, "uid=");
+        if (uidp) {
+            strncpy(uid_hex, uidp + 4, sizeof(uid_hex) - 1);
+            char *amp = strchr(uid_hex, '&'); if (amp) *amp = 0;
+        }
+        if (!uid_hex[0]) {
+            int local_uid = 0; sceUserServiceGetForegroundUser(&local_uid);
+            snprintf(uid_hex, sizeof(uid_hex), "%x", (uint32_t)local_uid);
+        }
+        char dst[MAX_PATH_LEN];
+        snprintf(dst, sizeof(dst), "/user/home/%s/%s/%s/sdimg_%s",
+                 uid_hex, g_enc_ps4 ? "savedata" : "savedata_prospero",
+                 sfo.title_id, sfo.dir_name);
+        struct stat dst_st;
+        int exists = (stat(dst, &dst_st) == 0) ? 1 : 0;
+        char json[256];
+        snprintf(json, sizeof(json),
+                 "{\"exists\":%s,\"title_id\":\"%s\",\"dir_name\":\"%s\",\"main_title\":\"%s\"}",
+                 exists ? "true" : "false", sfo.title_id, sfo.dir_name, sfo.main_title);
+        http_json(sock, json);
+        return;
+    }
+
     /* GET /api/import_finish -> parse SFO, resign, unmount, copy to final location, update DB */
     if (strcmp(method, "GET") == 0 && strncmp(url, "/api/import_finish", 18) == 0) {
         if (!g_mounted) {
@@ -2655,12 +2811,23 @@ static void handle_request(int sock) {
         printf("[GarlicMgr] import: title_id=%s dir=%s title=%s blocks=%u\n",
                sfo.title_id, sfo.dir_name, sfo.main_title, sfo.blocks);
 
-        /* Get local user info */
-        int local_uid = 0;
-        sceUserServiceGetForegroundUser(&local_uid);
-        uint32_t uid = (uint32_t)local_uid;
-        char uid_hex[16];
-        snprintf(uid_hex, sizeof(uid_hex), "%x", uid);
+        /* Get user info — prefer uid query param, fallback to foreground user */
+        char uid_hex[16] = {0};
+        char *uidp = strstr(url, "uid=");
+        if (uidp) {
+            strncpy(uid_hex, uidp + 4, sizeof(uid_hex) - 1);
+            char *amp = strchr(uid_hex, '&');
+            if (amp) *amp = 0;
+        }
+        uint32_t uid;
+        if (uid_hex[0]) {
+            uid = (uint32_t)strtoul(uid_hex, NULL, 16);
+        } else {
+            int local_uid = 0;
+            sceUserServiceGetForegroundUser(&local_uid);
+            uid = (uint32_t)local_uid;
+            snprintf(uid_hex, sizeof(uid_hex), "%x", uid);
+        }
 
         /* Read local account_id from user's existing savedata.db */
         uint64_t local_aid = 0;
@@ -2680,22 +2847,23 @@ static void handle_request(int sock) {
             }
         }
 
-        /* Resign: patch account_id and user_id in param.sfo */
-        int sfo_fd = open(sfo_path, O_RDWR);
-        if (sfo_fd >= 0) {
-            if (local_aid) {
-                /* PS5 SFO: AID at 0x1B8, UID at 0x660 */
-                pwrite(sfo_fd, &local_aid, 8, 0x1B8);
-                pwrite(sfo_fd, &uid, 4, 0x660);
-                printf("[GarlicMgr] import: resigned to aid=%llu uid=0x%x\n",
-                       (unsigned long long)local_aid, uid);
-            } else {
-                /* Just patch user_id */
-                pwrite(sfo_fd, &uid, 4, 0x660);
-                printf("[GarlicMgr] import: patched uid=0x%x (no local aid found)\n", uid);
+        /* Resign: PS4 = AID at 0x15C only, PS5 = AID at 0x1B8 + UID at 0x660 */
+        if (local_aid) {
+            int sfo_fd = open(sfo_path, O_RDWR);
+            if (sfo_fd >= 0) {
+                if (g_enc_ps4) {
+                    pwrite(sfo_fd, &local_aid, 8, 0x15C);
+                    printf("[GarlicMgr] import: PS4 resigned aid=%llu at 0x15C\n",
+                           (unsigned long long)local_aid);
+                } else {
+                    pwrite(sfo_fd, &local_aid, 8, 0x1B8);
+                    pwrite(sfo_fd, &uid, 4, 0x660);
+                    printf("[GarlicMgr] import: PS5 resigned aid=%llu uid=0x%x\n",
+                           (unsigned long long)local_aid, uid);
+                }
+                close(sfo_fd);
+                sync();
             }
-            close(sfo_fd);
-            sync();
         }
 
         /* Copy icon before unmount */
@@ -2715,10 +2883,11 @@ static void handle_request(int sock) {
         /* Unmount (re-encrypts the PFS image) */
         unmount_save();
 
-        /* Build destination paths */
+        /* Build destination paths — PS4: savedata/, PS5: savedata_prospero/ */
         char sd_dir[MAX_PATH_LEN], sd_dst[MAX_PATH_LEN];
         snprintf(sd_dir, sizeof(sd_dir),
-                 "/user/home/%s/savedata_prospero/%s", uid_hex, sfo.title_id);
+                 "/user/home/%s/%s/%s", uid_hex,
+                 g_enc_ps4 ? "savedata" : "savedata_prospero", sfo.title_id);
         snprintf(sd_dst, sizeof(sd_dst),
                  "%s/sdimg_%s", sd_dir, sfo.dir_name);
 
@@ -2736,6 +2905,22 @@ static void handle_request(int sock) {
         }
         if (!from_usb) unlink(tmp_path);
         chmod(sd_dst, 0644);
+
+        /* PS4: also copy the .bin sealed key companion */
+        if (g_enc_ps4) {
+            char bin_src[MAX_PATH_LEN], bin_dst[MAX_PATH_LEN];
+            /* tmp_path was like /data/save_files/sdimg__tmp_import
+             * .bin is at /data/save_files/_tmp_import.bin */
+            snprintf(bin_src, sizeof(bin_src), "/data/save_files/_tmp_import.bin");
+            snprintf(bin_dst, sizeof(bin_dst), "%s/%s.bin", sd_dir, sfo.dir_name);
+            if (copy_file(bin_src, bin_dst) == 0) {
+                chmod(bin_dst, 0644);
+                printf("[GarlicMgr] import: PS4 .bin key -> %s\n", bin_dst);
+            } else {
+                printf("[GarlicMgr] import: WARNING - failed to copy .bin key\n");
+            }
+            if (!from_usb) unlink(bin_src);
+        }
 
         /* Copy icon to meta directory */
         if (icon_tmp[0]) {
