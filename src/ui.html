@@ -244,6 +244,82 @@
     .modal .mbtn-s { background: var(--bd); color: var(--tx) }
     .modal .mbtn-s:hover { background: var(--dm) }
 
+    /* ── Hex/Text editor ─────────────────────────────── */
+    .editor-bar {
+      display: flex; align-items: center; gap: 8px;
+      padding: 8px 16px; background: var(--s1);
+      border-bottom: 1px solid var(--bd); flex-shrink: 0;
+    }
+    .editor-bar .ebtn {
+      background: none; border: 1px solid var(--bd); color: var(--dm);
+      font-size: 11px; font-weight: 600; padding: 4px 14px;
+      cursor: pointer; border-radius: 12px; transition: all .2s;
+      letter-spacing: .4px; text-transform: uppercase;
+    }
+    .editor-bar .ebtn:hover { color: var(--tx); border-color: var(--tx) }
+    .editor-bar .ebtn.eact { color: #fff; background: var(--ac); border-color: var(--ac) }
+    .editor-bar .ename {
+      font-size: 12px; color: var(--tx); font-weight: 600;
+      flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .editor-bar .esz { font-size: 11px; color: var(--dm); margin-left: auto }
+
+    .hex-wrap {
+      flex: 1; overflow: auto; font-family: 'SF Mono', Consolas, monospace;
+      font-size: 14px; line-height: 1.6; padding: 8px 0;
+    }
+    .hex-row {
+      display: flex; padding: 0 16px; white-space: pre;
+    }
+    .hex-row:hover { background: rgba(255,255,255,.02) }
+    .hex-off { color: var(--dm); width: 80px; flex-shrink: 0; user-select: none }
+    .hex-bytes { flex-shrink: 0 }
+    .hex-bytes span { cursor: pointer; padding: 0 1px; border-radius: 2px }
+    .hex-bytes span:hover { background: rgba(0,112,255,.2) }
+    .hex-bytes span.dirty { color: var(--ok); font-weight: 700 }
+    .hex-sep { width: 12px; flex-shrink: 0 }
+    .hex-ascii { color: var(--ac2); flex-shrink: 0; flex: 1 }
+    .hex-ascii span { cursor: pointer; border-radius: 2px }
+    .hex-ascii span:hover { background: rgba(0,187,255,.15) }
+    .hex-ascii span.dirty { color: var(--ok); font-weight: 700 }
+
+    .hex-edit-input {
+      background: var(--ac); color: #fff; border: none;
+      font-family: inherit; font-size: inherit; font-weight: 700;
+      width: 20px; text-align: center; padding: 0; border-radius: 2px;
+      outline: none;
+    }
+
+    .text-wrap {
+      flex: 1; position: relative; overflow: hidden;
+    }
+    .text-wrap textarea, .text-wrap pre {
+      position: absolute; inset: 0; width: 100%; height: 100%;
+      margin: 0; padding: 12px 16px;
+      font-family: 'SF Mono', Consolas, monospace; font-size: 13px;
+      line-height: 1.6; tab-size: 4; white-space: pre-wrap; word-wrap: break-word;
+      border: none; resize: none; outline: none;
+      overflow: auto; -webkit-overflow-scrolling: touch;
+    }
+    .text-wrap textarea {
+      background: transparent; color: transparent; caret-color: var(--tx);
+      z-index: 2;
+    }
+    .text-wrap pre {
+      background: var(--bg); color: var(--tx);
+      z-index: 1; pointer-events: none;
+    }
+    /* syntax colors */
+    .hl-key { color: #7cb8ff }
+    .hl-str { color: #a5d6ff }
+    .hl-num { color: #79c0ff }
+    .hl-bool { color: #ff7b72 }
+    .hl-null { color: #ff7b72; font-style: italic }
+    .hl-tag { color: #7ee787 }
+    .hl-attr { color: #d2a8ff }
+    .hl-aval { color: #a5d6ff }
+    .hl-cmt { color: #505068; font-style: italic }
+
     /* ── Context menu ────────────────────────────────── */
     .ctx-menu {
       position: fixed; background: var(--s1); border: 1px solid var(--bd);
@@ -1377,10 +1453,12 @@ function renderF() {
       if (!isUsb) h += '<span class="dir-dots" onclick="event.stopPropagation();showDirMenu(event,\'' + fn + '\')">\u22EE</span>';
       h += '</div>';
     } else {
+      const fn = esc(f.name).replace(/'/g, "\\'");
+      const clickAttr = ' onclick="openEditor(\'' + fn + '\',' + f.size + ')" style="cursor:pointer;padding-left:' + (16 + d * 16) + 'px"';
       if (isUsb) {
-        h += '<div class="fi" style="padding-left:' + (16 + d * 16) + 'px">';
+        h += '<div class="fi"' + clickAttr + '>';
       } else {
-        h += '<div class="fi" style="padding-left:' + (16 + d * 16) + 'px" oncontextmenu="showCtxMenu(event,\'' + esc(f.name).replace(/'/g, "\\'") + '\')">';
+        h += '<div class="fi"' + clickAttr + ' oncontextmenu="showCtxMenu(event,\'' + fn + '\')">';
       }
       h += '\u{1F4C4} ' + esc(nm) + '<span class="sz">' + fmtB(f.size) + '</span></div>';
     }
@@ -1676,6 +1754,370 @@ async function ctxDelete(name) {
 function tog(i) {
   const n = cf[i].name;
   if (ex.has(n)) ex.delete(n); else ex.add(n);
+  renderF();
+}
+
+/* ── Hex / Text Editor ────────────────────────────── */
+let edName = '';           /* file path relative to mount */
+let edTotal = 0;           /* total file size */
+let edMode = 'hex';        /* 'hex' or 'text' */
+let edCache = {};          /* offset -> Uint8Array chunk cache */
+let edEdits = {};          /* offset -> byte value (user edits) */
+let edRowH = 22;           /* row height in px */
+let edFontSize = 14;      /* hex editor font size */
+let edPending = {};        /* in-flight fetch promises by chunk offset */
+const ED_CHUNK = 4096;     /* bytes per fetch chunk (4KB) */
+const ED_TEXT_MAX = 2 * 1024 * 1024; /* max file size for text mode (2MB) */
+
+async function openEditor(name, size) {
+  if (bsy) return;
+  edName = name;
+  edTotal = size;
+  edMode = 'hex';
+  edCache = {};
+  edEdits = {};
+  edPending = {};
+  renderEditorShell();
+  /* Prefetch first chunk */
+  await edFetchChunk(0);
+  edRenderRows();
+  log('Opened ' + name + ' (' + fmtB(size) + ')', 'ok');
+}
+
+function edFetchChunk(chunkOff) {
+  if (edCache[chunkOff] || edPending[chunkOff]) return edPending[chunkOff] || Promise.resolve();
+  edPending[chunkOff] = fetch('/api/read_file?name=' + encodeURIComponent(edName)
+    + '&offset=' + chunkOff + '&length=' + ED_CHUNK)
+    .then(r => r.json()).then(d => {
+      if (d.data) {
+        const bin = atob(d.data);
+        const arr = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+        edCache[chunkOff] = arr;
+      }
+      delete edPending[chunkOff];
+    }).catch(() => { delete edPending[chunkOff]; });
+  return edPending[chunkOff];
+}
+
+function edGetByte(off) {
+  if (off in edEdits) return { v: edEdits[off], dirty: true };
+  const cOff = Math.floor(off / ED_CHUNK) * ED_CHUNK;
+  const chunk = edCache[cOff];
+  if (!chunk) return null;
+  const idx = off - cOff;
+  if (idx >= chunk.length) return null;
+  return { v: chunk[idx], dirty: false };
+}
+
+function edZoom(dir) {
+  edFontSize = Math.max(10, Math.min(24, edFontSize + dir));
+  edRowH = Math.round(edFontSize * 1.6);
+  renderEditorShell();
+  if (edMode === 'hex') edRenderRows();
+}
+
+function renderEditorShell() {
+  const c = $('ct');
+  c.className = 'ct';
+  const fname = edName.split('/').pop();
+  const isUsb = si >= 0 && S[si] && S[si].usb;
+  const textOk = edTotal <= ED_TEXT_MAX;
+  let bar = '<div class="editor-bar">'
+    + '<button class="ebtn" onclick="closeEditor()">\u2190 Back</button>'
+    + '<button class="ebtn' + (edMode==='hex'?' eact':'') + '" onclick="edSwitchMode(\'hex\')">Hex</button>'
+    + '<button class="ebtn' + (edMode==='text'?' eact':'') + '"' + (textOk ? ' onclick="edSwitchMode(\'text\')"' : ' disabled title="File too large for text mode (max 2MB)"') + '>Text</button>'
+    + '<span class="ename">' + esc(fname) + '</span>'
+    + '<span class="esz">' + fmtB(edTotal) + '</span>'
+    + '<button class="ebtn" onclick="edZoom(-1)" style="padding:4px 8px;font-size:14px">\u2212</button>'
+    + '<span style="font-size:11px;color:var(--dm);min-width:30px;text-align:center">' + edFontSize + 'px</span>'
+    + '<button class="ebtn" onclick="edZoom(1)" style="padding:4px 8px;font-size:14px">+</button>';
+  if (!isUsb) bar += '<button class="ebtn" style="border-color:var(--ok);color:var(--ok)" onclick="saveEditor()">Save</button>';
+  bar += '</div>';
+
+  if (edMode === 'hex') {
+    const totalRows = Math.ceil(edTotal / 16);
+    const totalH = totalRows * edRowH;
+    c.innerHTML = bar
+      + '<div class="hex-wrap" id="hexwrap" style="position:relative;font-size:' + edFontSize + 'px">'
+      + '<div id="hexspacer" style="height:' + totalH + 'px;pointer-events:none"></div>'
+      + '<div id="hexview" style="position:absolute;top:0;left:0;right:0"></div>'
+      + '</div>';
+    const wrap = $('hexwrap');
+    wrap.onscroll = edOnScroll;
+  } else {
+    c.innerHTML = bar + '<div class="text-wrap"><pre id="texthl"></pre><textarea id="textedit" spellcheck="false" disabled>Loading...</textarea></div>';
+    edLoadFullText();
+  }
+}
+
+let edScrollTimer = null;
+function edOnScroll() {
+  if (edScrollTimer) return;
+  edScrollTimer = setTimeout(() => { edScrollTimer = null; edRenderRows(); }, 16);
+}
+
+async function edRenderRows() {
+  const wrap = $('hexwrap');
+  const view = $('hexview');
+  if (!wrap || !view) return;
+
+  const scrollTop = wrap.scrollTop;
+  const viewH = wrap.clientHeight;
+  const firstRow = Math.max(0, Math.floor(scrollTop / edRowH) - 5);
+  const lastRow = Math.min(Math.ceil(edTotal / 16), Math.ceil((scrollTop + viewH) / edRowH) + 5);
+
+  /* Determine which chunks we need */
+  const neededChunks = new Set();
+  for (let row = firstRow; row < lastRow; row++) {
+    const off = row * 16;
+    const c1 = Math.floor(off / ED_CHUNK) * ED_CHUNK;
+    const c2 = Math.floor((off + 15) / ED_CHUNK) * ED_CHUNK;
+    neededChunks.add(c1);
+    if (c2 !== c1) neededChunks.add(c2);
+  }
+
+  /* Fetch missing chunks */
+  const fetches = [];
+  for (const co of neededChunks) {
+    if (!edCache[co] && !edPending[co]) fetches.push(edFetchChunk(co));
+  }
+  if (fetches.length > 0) await Promise.all(fetches);
+
+  /* Render visible rows */
+  let h = '';
+  for (let row = firstRow; row < lastRow; row++) {
+    const off = row * 16;
+    const top = row * edRowH;
+    h += '<div class="hex-row" style="position:absolute;top:' + top + 'px;height:' + edRowH + 'px;left:0;right:0">';
+    h += '<span class="hex-off">' + off.toString(16).toUpperCase().padStart(8, '0') + '</span>';
+    h += '<span class="hex-bytes">';
+    for (let j = 0; j < 16; j++) {
+      const boff = off + j;
+      if (boff < edTotal) {
+        const b = edGetByte(boff);
+        if (b) {
+          const cls = b.dirty ? ' class="dirty"' : '';
+          h += '<span' + cls + ' onclick="editByte(' + boff + ')">' + b.v.toString(16).toUpperCase().padStart(2, '0') + '</span> ';
+        } else {
+          h += '<span style="color:var(--bd)">??</span> ';
+        }
+      } else {
+        h += '   ';
+      }
+      if (j === 7) h += ' ';
+    }
+    h += '</span><span class="hex-sep"></span><span class="hex-ascii">';
+    for (let j = 0; j < 16; j++) {
+      const boff = off + j;
+      if (boff >= edTotal) break;
+      const b = edGetByte(boff);
+      if (b) {
+        const ch = (b.v >= 32 && b.v <= 126) ? String.fromCharCode(b.v) : '.';
+        const cls = b.dirty ? ' class="dirty"' : '';
+        h += '<span' + cls + ' onclick="editByte(' + boff + ')">' + esc(ch) + '</span>';
+      } else {
+        h += '<span style="color:var(--bd)">.</span>';
+      }
+    }
+    h += '</span></div>';
+  }
+  view.innerHTML = h;
+}
+
+async function edLoadFullText() {
+  /* Load entire file for text mode (only for small files) */
+  for (let off = 0; off < edTotal; off += ED_CHUNK) {
+    if (!edCache[off]) await edFetchChunk(off);
+  }
+  /* Merge */
+  const full = new Uint8Array(edTotal);
+  for (let off = 0; off < edTotal; off += ED_CHUNK) {
+    const c = edCache[off];
+    if (c) full.set(c.subarray(0, Math.min(c.length, edTotal - off)), off);
+  }
+  /* Apply edits */
+  for (const [off, val] of Object.entries(edEdits)) full[parseInt(off)] = val;
+
+  const ta = $('textedit');
+  if (!ta) return;
+  const dec = new TextDecoder('utf-8', {fatal: false});
+  const txt = dec.decode(full);
+  ta.value = txt;
+  ta.disabled = false;
+  ta._fullData = full;
+  /* Highlight */
+  const hl = $('texthl');
+  if (hl) {
+    hl.innerHTML = hlApply(txt);
+    /* Sync scroll and re-highlight on input */
+    ta.oninput = function() {
+      hl.innerHTML = hlApply(this.value);
+    };
+    ta.onscroll = function() {
+      hl.scrollTop = this.scrollTop;
+      hl.scrollLeft = this.scrollLeft;
+    };
+  }
+}
+
+/* ── Syntax highlighting ──────────────────────────── */
+function hlDetect(txt) {
+  const t = txt.trimStart();
+  if (t[0] === '{' || t[0] === '[') return 'json';
+  if (t[0] === '<') return 'xml';
+  return 'plain';
+}
+
+function hlApply(txt) {
+  const lang = hlDetect(txt);
+  if (lang === 'json') return hlJSON(txt);
+  if (lang === 'xml') return hlXML(txt);
+  return esc(txt) + '\n';
+}
+
+function hlJSON(txt) {
+  /* Tokenize JSON with regex — handles keys, strings, numbers, booleans, null */
+  return esc(txt).replace(
+    /(&quot;)((?:[^&]|&(?!quot;))*?)(&quot;)\s*:/g,
+    '<span class="hl-key">$1$2$3</span>:'
+  ).replace(
+    /:\s*(&quot;)((?:[^&]|&(?!quot;))*?)(&quot;)/g,
+    ': <span class="hl-str">$1$2$3</span>'
+  ).replace(
+    /(&quot;)((?:[^&]|&(?!quot;))*?)(&quot;)/g,
+    '<span class="hl-str">$1$2$3</span>'
+  ).replace(
+    /\b(-?\d+\.?\d*(?:[eE][+-]?\d+)?)\b/g,
+    '<span class="hl-num">$1</span>'
+  ).replace(
+    /\b(true|false)\b/g,
+    '<span class="hl-bool">$1</span>'
+  ).replace(
+    /\b(null)\b/g,
+    '<span class="hl-null">$1</span>'
+  ) + '\n';
+}
+
+function hlXML(txt) {
+  return esc(txt).replace(
+    /(&lt;!--)([\s\S]*?)(--&gt;)/g,
+    '<span class="hl-cmt">$1$2$3</span>'
+  ).replace(
+    /(&lt;\/?)([\w:.-]+)/g,
+    '$1<span class="hl-tag">$2</span>'
+  ).replace(
+    /\b([\w:.-]+)(=)(&quot;)((?:[^&]|&(?!quot;))*?)(&quot;)/g,
+    '<span class="hl-attr">$1</span>$2<span class="hl-aval">$3$4$5</span>'
+  ) + '\n';
+}
+
+function edSwitchMode(mode) {
+  if (mode === edMode) return;
+  /* If leaving text mode, capture edits */
+  if (edMode === 'text') {
+    const ta = $('textedit');
+    if (ta && ta._fullData) {
+      const enc = new TextEncoder();
+      const newData = enc.encode(ta.value);
+      /* Store changed bytes as edits */
+      for (let i = 0; i < Math.max(newData.length, ta._fullData.length); i++) {
+        const orig = i < ta._fullData.length ? ta._fullData[i] : undefined;
+        const nv = i < newData.length ? newData[i] : undefined;
+        if (nv !== undefined && nv !== orig) edEdits[i] = nv;
+      }
+      /* Update total if size changed */
+      if (newData.length !== edTotal) edTotal = newData.length;
+    }
+  }
+  edMode = mode;
+  renderEditorShell();
+  if (mode === 'hex') edRenderRows();
+}
+
+function editByte(off) {
+  const isUsb = si >= 0 && S[si] && S[si].usb;
+  if (isUsb) return;
+  const b = edGetByte(off);
+  if (!b) return;
+  const cur = b.v.toString(16).toUpperCase().padStart(2, '0');
+  const val = prompt('Edit byte at 0x' + off.toString(16).toUpperCase() + ' (hex):', cur);
+  if (val === null) return;
+  const parsed = parseInt(val, 16);
+  if (isNaN(parsed) || parsed < 0 || parsed > 255) { log('Invalid byte value', 'err'); return; }
+  edEdits[off] = parsed;
+  /* Check if same as original - remove edit if unchanged */
+  const cOff = Math.floor(off / ED_CHUNK) * ED_CHUNK;
+  const chunk = edCache[cOff];
+  if (chunk && chunk[off - cOff] === parsed) delete edEdits[off];
+  edRenderRows();
+}
+
+async function saveEditor() {
+  if (bsy) return;
+  bsy = true;
+  try {
+    /* Build full file content */
+    let fullData;
+    if (edMode === 'text') {
+      const ta = $('textedit');
+      if (ta) {
+        const enc = new TextEncoder();
+        fullData = enc.encode(ta.value);
+      }
+    }
+    if (!fullData) {
+      /* Load all chunks + apply edits */
+      for (let off = 0; off < edTotal; off += ED_CHUNK) {
+        if (!edCache[off]) await edFetchChunk(off);
+      }
+      fullData = new Uint8Array(edTotal);
+      let pos = 0;
+      for (let off = 0; off < edTotal; off += ED_CHUNK) {
+        const c = edCache[off];
+        if (c) { fullData.set(c, off); pos = off + c.length; }
+      }
+      for (const [off, val] of Object.entries(edEdits)) {
+        const o = parseInt(off);
+        if (o < fullData.length) fullData[o] = val;
+      }
+    }
+
+    /* base64 encode in chunks */
+    let b64 = '';
+    const bchunk = 8192;
+    for (let i = 0; i < fullData.length; i += bchunk) {
+      const slice = fullData.subarray(i, Math.min(i + bchunk, fullData.length));
+      b64 += btoa(String.fromCharCode.apply(null, slice));
+    }
+    log('Saving ' + edName + ' (' + fmtB(fullData.length) + ')...');
+    const r = await fetch('/api/write_file?name=' + encodeURIComponent(edName), {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: b64
+    });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    /* Invalidate cache and reload visible area */
+    edCache = {};
+    edEdits = {};
+    edTotal = d.size;
+    log('Saved ' + edName + ' (' + d.size + ' bytes)', 'ok');
+    if (edMode === 'hex') {
+      await edFetchChunk(0);
+      edRenderRows();
+    } else {
+      await edLoadFullText();
+    }
+  } catch(e) { log('Save failed: ' + e.message, 'err'); }
+  bsy = false;
+}
+
+function closeEditor() {
+  if (Object.keys(edEdits).length > 0) {
+    if (!confirm('You have unsaved changes. Discard?')) return;
+  }
+  edName = ''; edTotal = 0; edCache = {}; edEdits = {}; edPending = {};
   renderF();
 }
 

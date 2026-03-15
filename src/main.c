@@ -434,6 +434,51 @@ static int copy_dir_recursive(const char *src, const char *dst) {
     return 0;
 }
 
+/* ── Base64 encode/decode ───────────────────────────────────────── */
+static const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static int b64_encode(const uint8_t *in, size_t len, char *out, size_t out_sz) {
+    size_t needed = 4 * ((len + 2) / 3) + 1;
+    if (out_sz < needed) return -1;
+    char *p = out;
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t v = (uint32_t)in[i] << 16;
+        if (i + 1 < len) v |= (uint32_t)in[i+1] << 8;
+        if (i + 2 < len) v |= (uint32_t)in[i+2];
+        *p++ = b64_table[(v >> 18) & 0x3F];
+        *p++ = b64_table[(v >> 12) & 0x3F];
+        *p++ = (i + 1 < len) ? b64_table[(v >> 6) & 0x3F] : '=';
+        *p++ = (i + 2 < len) ? b64_table[v & 0x3F] : '=';
+    }
+    *p = 0;
+    return (int)(p - out);
+}
+
+static int b64_decode_char(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static int b64_decode(const char *in, size_t in_len, uint8_t *out, size_t out_sz) {
+    size_t j = 0;
+    for (size_t i = 0; i + 3 < in_len; i += 4) {
+        if (in[i] == '=' || in[i] == 0) break;
+        int a = b64_decode_char(in[i]);
+        int b = b64_decode_char(in[i+1]);
+        int c = (in[i+2] != '=') ? b64_decode_char(in[i+2]) : 0;
+        int d = (in[i+3] != '=') ? b64_decode_char(in[i+3]) : 0;
+        if (a < 0 || b < 0) break;
+        if (j < out_sz) out[j++] = (a << 2) | (b >> 4);
+        if (in[i+2] != '=' && j < out_sz) out[j++] = ((b & 0xF) << 4) | (c >> 2);
+        if (in[i+3] != '=' && j < out_sz) out[j++] = ((c & 3) << 6) | d;
+    }
+    return (int)j;
+}
+
 /* ── Mount / unmount ────────────────────────────────────────────── */
 static int mount_save(int idx) {
     if (g_mounted) return -1;
@@ -1317,6 +1362,133 @@ static void handle_request(int sock) {
         return;
     }
 
+    /* GET /api/read_file?name=<path>&offset=N&length=N -> read chunk as base64 JSON */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/read_file", 14) == 0) {
+        if (!g_mounted) { http_json(sock, "{\"error\":\"No save mounted\"}"); return; }
+        char fname[512] = {0};
+        char *np = strstr(url, "name=");
+        if (np) {
+            strncpy(fname, np + 5, sizeof(fname) - 1);
+            char *r = fname, *w = fname;
+            while (*r && *r != '&') {
+                if (*r == '%' && r[1] && r[2]) {
+                    char hex[3] = {r[1], r[2], 0};
+                    *w++ = (char)strtol(hex, NULL, 16);
+                    r += 3;
+                } else { *w++ = *r++; }
+            }
+            *w = 0;
+        }
+        if (!fname[0]) { http_json(sock, "{\"error\":\"Missing name\"}"); return; }
+
+        /* Parse optional offset and length */
+        off_t req_off = 0;
+        size_t req_len = 0; /* 0 = whole file */
+        char *op = strstr(url, "offset=");
+        if (op) req_off = (off_t)atoll(op + 7);
+        char *lp = strstr(url, "length=");
+        if (lp) req_len = (size_t)atoll(lp + 7);
+
+        char filepath[MAX_PATH_LEN];
+        snprintf(filepath, sizeof(filepath), "%s/%s", g_mount_point, fname);
+        struct stat st;
+        if (stat(filepath, &st) < 0 || !S_ISREG(st.st_mode)) {
+            http_json(sock, "{\"error\":\"File not found\"}"); return;
+        }
+
+        /* Clamp offset/length */
+        if (req_off >= st.st_size) req_off = st.st_size;
+        if (req_len == 0 || req_len > (size_t)(st.st_size - req_off))
+            req_len = (size_t)(st.st_size - req_off);
+        /* Cap single read at 64KB */
+        if (req_len > 65536) req_len = 65536;
+
+        int fd = open(filepath, O_RDONLY);
+        if (fd < 0) { http_json(sock, "{\"error\":\"Cannot read file\"}"); return; }
+        uint8_t *fbuf = malloc(req_len);
+        if (!fbuf) { close(fd); http_json(sock, "{\"error\":\"Out of memory\"}"); return; }
+        ssize_t nr = pread(fd, fbuf, req_len, req_off);
+        close(fd);
+        if (nr < 0) { free(fbuf); http_json(sock, "{\"error\":\"Read error\"}"); return; }
+
+        size_t b64_len = 4 * ((nr + 2) / 3) + 1;
+        size_t json_len = b64_len + 128;
+        char *json = malloc(json_len);
+        if (!json) { free(fbuf); http_json(sock, "{\"error\":\"Out of memory\"}"); return; }
+        int pos = snprintf(json, json_len, "{\"total\":%lld,\"offset\":%lld,\"length\":%d,\"data\":\"",
+                           (long long)st.st_size, (long long)req_off, (int)nr);
+        b64_encode(fbuf, nr, json + pos, json_len - pos);
+        pos += strlen(json + pos);
+        snprintf(json + pos, json_len - pos, "\"}");
+        free(fbuf);
+        http_json(sock, json);
+        free(json);
+        return;
+    }
+
+    /* POST /api/write_file?name=<path> -> write base64 JSON body to file */
+    if (strcmp(method, "POST") == 0 && strncmp(url, "/api/write_file", 15) == 0) {
+        if (!g_mounted) { http_json(sock, "{\"error\":\"No save mounted\"}"); return; }
+        char fname[512] = {0};
+        char *np = strstr(url, "name=");
+        if (np) {
+            strncpy(fname, np + 5, sizeof(fname) - 1);
+            char *r = fname, *w = fname;
+            while (*r && *r != '&') {
+                if (*r == '%' && r[1] && r[2]) {
+                    char hex[3] = {r[1], r[2], 0};
+                    *w++ = (char)strtol(hex, NULL, 16);
+                    r += 3;
+                } else { *w++ = *r++; }
+            }
+            *w = 0;
+        }
+        if (!fname[0]) { http_json(sock, "{\"error\":\"Missing name\"}"); return; }
+
+        /* Read POST body */
+        char *cl_hdr = strcasestr(req, "Content-Length:");
+        size_t body_len = 0;
+        if (cl_hdr) body_len = (size_t)atol(cl_hdr + 15);
+        if (body_len == 0 || body_len > 4 * 1024 * 1024) {
+            http_json(sock, "{\"error\":\"Invalid body\"}"); return;
+        }
+        char *body = malloc(body_len + 1);
+        if (!body) { http_json(sock, "{\"error\":\"Out of memory\"}"); return; }
+        char *hdr_end = strstr(req, "\r\n\r\n");
+        size_t hdr_len = hdr_end ? (hdr_end + 4 - req) : n;
+        size_t already = (n > (int)hdr_len) ? n - hdr_len : 0;
+        if (already > body_len) already = body_len;
+        if (already) memcpy(body, req + hdr_len, already);
+        size_t got = already;
+        while (got < body_len) {
+            ssize_t r2 = recv(sock, body + got, body_len - got, 0);
+            if (r2 <= 0) break;
+            got += r2;
+        }
+        body[got] = 0;
+
+        /* Body is base64 string */
+        size_t dec_sz = (got * 3) / 4 + 4;
+        uint8_t *dec = malloc(dec_sz);
+        if (!dec) { free(body); http_json(sock, "{\"error\":\"Out of memory\"}"); return; }
+        int dec_len = b64_decode(body, got, dec, dec_sz);
+        free(body);
+
+        char filepath[MAX_PATH_LEN];
+        snprintf(filepath, sizeof(filepath), "%s/%s", g_mount_point, fname);
+        int fd = open(filepath, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (fd < 0) { free(dec); http_json(sock, "{\"error\":\"Cannot write file\"}"); return; }
+        write(fd, dec, dec_len);
+        close(fd);
+        sync();
+        free(dec);
+        printf("[GarlicMgr] Wrote %d bytes to %s\n", dec_len, fname);
+        char json[128];
+        snprintf(json, sizeof(json), "{\"ok\":true,\"size\":%d}", dec_len);
+        http_json(sock, json);
+        return;
+    }
+
     /* GET /api/files → file listing of mounted save */
     if (strcmp(method, "GET") == 0 && strcmp(url, "/api/files") == 0) {
         if (!g_mounted) { http_json(sock, "{\"files\":[]}"); return; }
@@ -1492,6 +1664,11 @@ static void handle_request(int sock) {
         const char *browse_root;
         if (is_dir) {
             browse_root = g_saves[idx].path;
+            /* Set mount point so read_file/write_file work on USB folders */
+            snprintf(g_mount_point, sizeof(g_mount_point), "%s", browse_root);
+            g_mounted = 1;
+            g_mounted_path[0] = 0;
+            g_local_copy[0] = 0;
         } else {
             int ret = mount_save(idx);
             if (ret < 0) {
