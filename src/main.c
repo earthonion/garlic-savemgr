@@ -2833,13 +2833,207 @@ static void handle_request(int sock) {
         }
         save_entry_t *s = &g_saves[idx];
 
-        /* Verify it's a decrypted folder */
+        /* Check if encrypted file or decrypted folder */
         struct stat path_st;
-        if (stat(s->path, &path_st) < 0 || !S_ISDIR(path_st.st_mode)) {
-            http_json(sock, "{\"error\":\"Not a decrypted save folder\"}"); return;
+        if (stat(s->path, &path_st) < 0) {
+            http_json(sock, "{\"error\":\"Save not found\"}"); return;
+        }
+        int is_encrypted = S_ISREG(path_st.st_mode);
+
+        if (is_encrypted) {
+            /* Encrypted USB save: mount, then use import_finish logic */
+            if (g_mounted) unmount_save();
+            int ret = mount_save(idx);
+            if (ret < 0) {
+                char json[128];
+                snprintf(json, sizeof(json), "{\"error\":\"Mount failed: %d\"}", ret);
+                http_json(sock, json); return;
+            }
+
+            /* Parse param.sfo from mounted save */
+            char sfo_path[MAX_PATH_LEN];
+            snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
+            sfo_info_t sfo;
+            if (parse_sfo(sfo_path, &sfo) < 0 || !sfo.title_id[0] || !sfo.dir_name[0]) {
+                unmount_save();
+                http_json(sock, "{\"error\":\"Cannot parse param.sfo\"}"); return;
+            }
+
+            /* Detect PS4/PS5 from FORMAT */
+            g_enc_ps4 = (strcmp(sfo.format, "obs") == 0) ? 1 : 0;
+            printf("[GarlicMgr] import_usb: encrypted %s/%s FORMAT=%s %s\n",
+                   sfo.title_id, sfo.dir_name, sfo.format, g_enc_ps4 ? "PS4" : "PS5");
+
+            /* Get user info */
+            char uid_hex[16] = {0};
+            char *uidp = strstr(url, "uid=");
+            if (uidp) {
+                strncpy(uid_hex, uidp + 4, sizeof(uid_hex) - 1);
+                char *amp = strchr(uid_hex, '&'); if (amp) *amp = 0;
+            }
+            uint32_t uid;
+            if (uid_hex[0]) {
+                uid = (uint32_t)strtoul(uid_hex, NULL, 16);
+            } else {
+                int local_uid = 0;
+                sceUserServiceGetForegroundUser(&local_uid);
+                uid = (uint32_t)local_uid;
+                snprintf(uid_hex, sizeof(uid_hex), "%x", uid);
+            }
+
+            /* Resign */
+            uint64_t local_aid = get_account_id_for_user(uid_hex);
+            if (local_aid) {
+                int sfo_fd = open(sfo_path, O_RDWR);
+                if (sfo_fd >= 0) {
+                    if (g_enc_ps4) {
+                        pwrite(sfo_fd, &local_aid, 8, 0x15C);
+                    } else {
+                        pwrite(sfo_fd, &local_aid, 8, 0x1B8);
+                        pwrite(sfo_fd, &uid, 4, 0x660);
+                    }
+                    close(sfo_fd); sync();
+                }
+            }
+
+            /* Copy icon before unmount */
+            char icon_tmp[MAX_PATH_LEN] = {0};
+            {
+                char icon_src[MAX_PATH_LEN];
+                snprintf(icon_src, sizeof(icon_src), "%s/sce_sys/icon0.png", g_mount_point);
+                struct stat ist;
+                if (stat(icon_src, &ist) == 0) {
+                    snprintf(icon_tmp, sizeof(icon_tmp), "/data/save_files/_tmp_icon.png");
+                    copy_file(icon_src, icon_tmp);
+                }
+            }
+
+            /* Save path before unmount */
+            char tmp_path[MAX_PATH_LEN];
+            snprintf(tmp_path, sizeof(tmp_path), "%s", g_mounted_path);
+            unmount_save();
+
+            /* Copy to system */
+            char sd_dir[MAX_PATH_LEN], sd_dst[MAX_PATH_LEN];
+            snprintf(sd_dir, sizeof(sd_dir), "/user/home/%s/%s/%s", uid_hex,
+                     g_enc_ps4 ? "savedata" : "savedata_prospero", sfo.title_id);
+            snprintf(sd_dst, sizeof(sd_dst), "%s/sdimg_%s", sd_dir, sfo.dir_name);
+            recursive_mkdir(sd_dir);
+
+            int from_usb = (strncmp(tmp_path, "/mnt/usb", 8) == 0);
+            if (copy_file(tmp_path, sd_dst) < 0) {
+                if (!from_usb) unlink(tmp_path);
+                if (icon_tmp[0]) unlink(icon_tmp);
+                http_json(sock, "{\"error\":\"Failed to copy save\"}"); return;
+            }
+            if (!from_usb) unlink(tmp_path);
+            chmod(sd_dst, 0644);
+
+            /* PS4: copy .bin key */
+            if (g_enc_ps4 && strncmp(s->save_name, "sdimg_", 6) == 0) {
+                const char *savename = s->save_name + 6;
+                char src_dir[MAX_PATH_LEN];
+                strncpy(src_dir, s->path, sizeof(src_dir) - 1);
+                src_dir[sizeof(src_dir) - 1] = 0;
+                char *sl = strrchr(src_dir, '/');
+                if (sl) *(sl + 1) = 0;
+                char bin_src[MAX_PATH_LEN], bin_dst[MAX_PATH_LEN];
+                snprintf(bin_src, sizeof(bin_src), "%s%s.bin", src_dir, savename);
+                snprintf(bin_dst, sizeof(bin_dst), "%s/%s.bin", sd_dir, sfo.dir_name);
+                struct stat bst;
+                if (stat(bin_src, &bst) == 0) copy_file(bin_src, bin_dst);
+            }
+
+            /* Copy icon */
+            if (icon_tmp[0]) {
+                char icon_dir[MAX_PATH_LEN], icon_dst[MAX_PATH_LEN];
+                snprintf(icon_dir, sizeof(icon_dir),
+                         "/user/home/%s/savedata_prospero_meta/user/%s", uid_hex, sfo.title_id);
+                snprintf(icon_dst, sizeof(icon_dst), "%s/%s_icon0.png", icon_dir, sfo.dir_name);
+                recursive_mkdir(icon_dir);
+                copy_file(icon_tmp, icon_dst);
+                unlink(icon_tmp);
+            }
+
+            /* Update DB */
+            char db_path[MAX_PATH_LEN];
+            snprintf(db_path, sizeof(db_path), "/system_data/%s/%s/db/user/savedata.db",
+                     g_enc_ps4 ? "savedata" : "savedata_prospero", uid_hex);
+            { char db_dir[MAX_PATH_LEN];
+              snprintf(db_dir, sizeof(db_dir), "/system_data/%s/%s/db/user",
+                       g_enc_ps4 ? "savedata" : "savedata_prospero", uid_hex);
+              recursive_mkdir(db_dir); }
+            sqlite3 *db = NULL;
+            if (sqlite3_open(db_path, &db) == SQLITE_OK) {
+                char *err_msg = NULL;
+                sqlite3_exec(db,
+                    "CREATE TABLE IF NOT EXISTS savedata ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,"
+                    "title_id NOT NULL, dir_name NOT NULL, main_title NOT NULL,"
+                    "sub_title, detail, tmp_dir_name, is_broken, user_param,"
+                    "blocks, free_blocks, size_kib, mtime NOT NULL,"
+                    "fake_broken, account_id, user_id, faked_owner,"
+                    "cloud_icon_url, cloud_revision, game_title_id NOT NULL, system_blocks)",
+                    NULL, 0, &err_msg);
+                if (err_msg) { sqlite3_free(err_msg); err_msg = NULL; }
+
+                char esc_title[256] = {0};
+                { char *src2 = sfo.main_title, *dst2 = esc_title;
+                  while (*src2 && dst2 < esc_title + sizeof(esc_title) - 2) {
+                      if (*src2 == '\'') *dst2++ = '\'';
+                      *dst2++ = *src2++;
+                  }
+                  *dst2 = 0; }
+
+                char mtime[64];
+                { time_t now = time(NULL); struct tm *tm = gmtime(&now);
+                  strftime(mtime, sizeof(mtime), "%Y-%m-%dT%H:%M:%S.00Z", tm); }
+
+                uint64_t aid_val = local_aid ? local_aid : sfo.account_id;
+
+                char check_sql[512];
+                snprintf(check_sql, sizeof(check_sql),
+                         "SELECT COUNT(*) FROM savedata WHERE title_id='%s' AND dir_name='%s'",
+                         sfo.title_id, sfo.dir_name);
+                sqlite3_stmt *stmt = NULL;
+                int db_exists = 0;
+                if (sqlite3_prepare_v2(db, check_sql, -1, &stmt, NULL) == SQLITE_OK) {
+                    if (sqlite3_step(stmt) == SQLITE_ROW) db_exists = sqlite3_column_int(stmt, 0);
+                    sqlite3_finalize(stmt);
+                }
+
+                char sql[2048];
+                if (db_exists) {
+                    snprintf(sql, sizeof(sql),
+                        "UPDATE savedata SET main_title='%s', mtime='%s', account_id=%llu, user_id=%u "
+                        "WHERE title_id='%s' AND dir_name='%s'",
+                        esc_title, mtime, (unsigned long long)aid_val, uid, sfo.title_id, sfo.dir_name);
+                } else {
+                    snprintf(sql, sizeof(sql),
+                        "INSERT INTO savedata (title_id, dir_name, main_title, sub_title, detail,"
+                        "is_broken, user_param, blocks, free_blocks, size_kib, mtime,"
+                        "fake_broken, account_id, user_id, faked_owner, cloud_revision,"
+                        "game_title_id, system_blocks) VALUES ("
+                        "'%s','%s','%s','','',0,%u,%u,%u,%u,'%s',0,%llu,%u,0,0,'%s',0)",
+                        sfo.title_id, sfo.dir_name, esc_title,
+                        sfo.user_param, sfo.blocks, sfo.blocks, sfo.blocks * 0x40, mtime,
+                        (unsigned long long)aid_val, uid, sfo.title_id);
+                }
+                ret = sqlite3_exec(db, sql, NULL, 0, &err_msg);
+                if (ret != SQLITE_OK) { printf("[GarlicMgr] import_usb: DB error: %s\n", err_msg); sqlite3_free(err_msg); }
+                else printf("[GarlicMgr] import_usb: DB %s OK\n", db_exists ? "updated" : "inserted");
+                sqlite3_close(db);
+            }
+
+            char json[512];
+            snprintf(json, sizeof(json),
+                     "{\"ok\":true,\"title_id\":\"%s\",\"dir_name\":\"%s\",\"main_title\":\"%s\"}",
+                     sfo.title_id, sfo.dir_name, sfo.main_title);
+            http_json(sock, json);
+            return;
         }
 
-        /* Parse param.sfo */
+        /* Decrypted folder: parse param.sfo directly */
         char sfo_path[MAX_PATH_LEN];
         snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", s->path);
         sfo_info_t sfo;
