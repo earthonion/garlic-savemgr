@@ -305,6 +305,9 @@
       background: transparent; color: transparent; caret-color: var(--tx);
       z-index: 2;
     }
+    .text-wrap textarea.text-plain {
+      background: var(--bg); color: var(--tx); z-index: 1;
+    }
     .text-wrap pre {
       background: var(--bg); color: var(--tx);
       z-index: 1; pointer-events: none;
@@ -1757,57 +1760,84 @@ function tog(i) {
   renderF();
 }
 
-/* ── Hex / Text Editor ────────────────────────────── */
+/* ── Hex / Text Editor (server-side) ──────────────── */
 let edName = '';           /* file path relative to mount */
 let edTotal = 0;           /* total file size */
 let edMode = 'hex';        /* 'hex' or 'text' */
-let edCache = {};          /* offset -> Uint8Array chunk cache */
-let edEdits = {};          /* offset -> byte value (user edits) */
+let edOpen = false;        /* file open on server */
 let edRowH = 22;           /* row height in px */
-let edFontSize = 14;      /* hex editor font size */
-let edPending = {};        /* in-flight fetch promises by chunk offset */
-const ED_CHUNK = 4096;     /* bytes per fetch chunk (4KB) */
-const ED_TEXT_MAX = 2 * 1024 * 1024; /* max file size for text mode (2MB) */
+let edFontSize = 14;       /* hex editor font size */
+let edCache = {};          /* local cache: offset → Uint8Array */
+let edDirty = {};          /* dirty bytes: offset → value */
+let edTextDirty = false;   /* text mode has unsaved edits */
+let edTextLoaded = 0;      /* bytes loaded into textarea so far */
+let edTextLoading = false; /* currently fetching next chunk */
+const ED_TEXT_CHUNK = 65536; /* bytes per text chunk */
 
 async function openEditor(name, size) {
   if (bsy) return;
-  edName = name;
-  edTotal = size;
-  edMode = 'hex';
-  edCache = {};
-  edEdits = {};
-  edPending = {};
+  edName = name; edTotal = size; edMode = 'hex';
+  edOpen = false; edCache = {}; edDirty = {}; edTextDirty = false; edTextLoaded = 0;
   renderEditorShell();
-  /* Prefetch first chunk */
-  await edFetchChunk(0);
-  edRenderRows();
-  log('Opened ' + name + ' (' + fmtB(size) + ')', 'ok');
+  try {
+    const r = await fetch('/api/editor/open?name=' + encodeURIComponent(name));
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    edTotal = d.size;
+    edOpen = true;
+    renderEditorShell();
+    if (edMode === 'hex') edRenderRows();
+    log('Opened ' + name + ' (' + fmtB(edTotal) + ')', 'ok');
+  } catch(e) { log('Error: ' + e.message, 'err'); }
 }
 
-function edFetchChunk(chunkOff) {
-  if (edCache[chunkOff] || edPending[chunkOff]) return edPending[chunkOff] || Promise.resolve();
-  edPending[chunkOff] = fetch('/api/read_file?name=' + encodeURIComponent(edName)
-    + '&offset=' + chunkOff + '&length=' + ED_CHUNK)
-    .then(r => r.json()).then(d => {
-      if (d.data) {
-        const bin = atob(d.data);
-        const arr = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-        edCache[chunkOff] = arr;
+/* Fetch a range of bytes from server, with caching */
+const ED_PAGE = 4096;
+async function edFetchRange(off, len) {
+  /* Align to page boundaries */
+  const pageStart = Math.floor(off / ED_PAGE) * ED_PAGE;
+  const pageEnd = Math.min(Math.ceil((off + len) / ED_PAGE) * ED_PAGE, edTotal);
+  /* Check if all pages cached */
+  let allCached = true;
+  for (let p = pageStart; p < pageEnd; p += ED_PAGE) {
+    if (!edCache[p]) { allCached = false; break; }
+  }
+  if (!allCached) {
+    try {
+      const r = await fetch('/api/editor/read?offset=' + pageStart + '&length=' + (pageEnd - pageStart));
+      const ab = await r.arrayBuffer();
+      const data = new Uint8Array(ab);
+      /* Split into pages */
+      for (let p = pageStart; p < pageEnd; p += ED_PAGE) {
+        const poff = p - pageStart;
+        const plen = Math.min(ED_PAGE, data.length - poff);
+        if (plen > 0) edCache[p] = data.slice(poff, poff + plen);
       }
-      delete edPending[chunkOff];
-    }).catch(() => { delete edPending[chunkOff]; });
-  return edPending[chunkOff];
+    } catch(e) { return null; }
+  }
+  /* Assemble result from cache */
+  const result = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    const addr = off + i;
+    if (addr >= edTotal) break;
+    /* Check dirty bytes first */
+    if (edDirty[addr] !== undefined) { result[i] = edDirty[addr]; continue; }
+    const page = Math.floor(addr / ED_PAGE) * ED_PAGE;
+    const c = edCache[page];
+    if (c) result[i] = c[addr - page];
+  }
+  return result;
 }
 
-function edGetByte(off) {
-  if (off in edEdits) return { v: edEdits[off], dirty: true };
-  const cOff = Math.floor(off / ED_CHUNK) * ED_CHUNK;
-  const chunk = edCache[cOff];
-  if (!chunk) return null;
-  const idx = off - cOff;
-  if (idx >= chunk.length) return null;
-  return { v: chunk[idx], dirty: false };
+function edGetCachedByte(off) {
+  if (off >= edTotal) return null;
+  if (edDirty[off] !== undefined) return { v: edDirty[off], dirty: true };
+  const page = Math.floor(off / ED_PAGE) * ED_PAGE;
+  const c = edCache[page];
+  if (!c) return null;
+  const idx = off - page;
+  if (idx >= c.length) return null;
+  return { v: c[idx], dirty: false };
 }
 
 function edZoom(dir) {
@@ -1822,11 +1852,10 @@ function renderEditorShell() {
   c.className = 'ct';
   const fname = edName.split('/').pop();
   const isUsb = si >= 0 && S[si] && S[si].usb;
-  const textOk = edTotal <= ED_TEXT_MAX;
   let bar = '<div class="editor-bar">'
     + '<button class="ebtn" onclick="closeEditor()">\u2190 Back</button>'
     + '<button class="ebtn' + (edMode==='hex'?' eact':'') + '" onclick="edSwitchMode(\'hex\')">Hex</button>'
-    + '<button class="ebtn' + (edMode==='text'?' eact':'') + '"' + (textOk ? ' onclick="edSwitchMode(\'text\')"' : ' disabled title="File too large for text mode (max 2MB)"') + '>Text</button>'
+    + '<button class="ebtn' + (edMode==='text'?' eact':'') + '" onclick="edSwitchMode(\'text\')">Text</button>'
     + '<span class="ename">' + esc(fname) + '</span>'
     + '<span class="esz">' + fmtB(edTotal) + '</span>'
     + '<button class="ebtn" onclick="edZoom(-1)" style="padding:4px 8px;font-size:14px">\u2212</button>'
@@ -1844,10 +1873,16 @@ function renderEditorShell() {
       + '<div id="hexview" style="position:absolute;top:0;left:0;right:0"></div>'
       + '</div>';
     const wrap = $('hexwrap');
-    wrap.onscroll = edOnScroll;
+    if (wrap) wrap.onscroll = edOnScroll;
   } else {
-    c.innerHTML = bar + '<div class="text-wrap"><pre id="texthl"></pre><textarea id="textedit" spellcheck="false" disabled>Loading...</textarea></div>';
-    edLoadFullText();
+    c.innerHTML = bar
+      + '<div class="text-wrap">'
+      + '<pre id="texthl"></pre>'
+      + '<textarea id="textedit" spellcheck="false">Loading...</textarea>'
+      + '</div>'
+      + '<div id="etload" style="display:none;text-align:center;padding:4px;font-size:11px;color:var(--dm)">Loading more...</div>';
+    edTextLoaded = 0;
+    edLoadTextChunk();
   }
 }
 
@@ -1860,31 +1895,18 @@ function edOnScroll() {
 async function edRenderRows() {
   const wrap = $('hexwrap');
   const view = $('hexview');
-  if (!wrap || !view) return;
+  if (!wrap || !view || !edOpen) return;
 
   const scrollTop = wrap.scrollTop;
   const viewH = wrap.clientHeight;
   const firstRow = Math.max(0, Math.floor(scrollTop / edRowH) - 5);
   const lastRow = Math.min(Math.ceil(edTotal / 16), Math.ceil((scrollTop + viewH) / edRowH) + 5);
 
-  /* Determine which chunks we need */
-  const neededChunks = new Set();
-  for (let row = firstRow; row < lastRow; row++) {
-    const off = row * 16;
-    const c1 = Math.floor(off / ED_CHUNK) * ED_CHUNK;
-    const c2 = Math.floor((off + 15) / ED_CHUNK) * ED_CHUNK;
-    neededChunks.add(c1);
-    if (c2 !== c1) neededChunks.add(c2);
-  }
+  /* Prefetch visible range */
+  const startOff = firstRow * 16;
+  const endOff = Math.min(lastRow * 16, edTotal);
+  await edFetchRange(startOff, endOff - startOff);
 
-  /* Fetch missing chunks */
-  const fetches = [];
-  for (const co of neededChunks) {
-    if (!edCache[co] && !edPending[co]) fetches.push(edFetchChunk(co));
-  }
-  if (fetches.length > 0) await Promise.all(fetches);
-
-  /* Render visible rows */
   let h = '';
   for (let row = firstRow; row < lastRow; row++) {
     const off = row * 16;
@@ -1895,7 +1917,7 @@ async function edRenderRows() {
     for (let j = 0; j < 16; j++) {
       const boff = off + j;
       if (boff < edTotal) {
-        const b = edGetByte(boff);
+        const b = edGetCachedByte(boff);
         if (b) {
           const cls = b.dirty ? ' class="dirty"' : '';
           h += '<span' + cls + ' onclick="editByte(' + boff + ')">' + b.v.toString(16).toUpperCase().padStart(2, '0') + '</span> ';
@@ -1911,7 +1933,7 @@ async function edRenderRows() {
     for (let j = 0; j < 16; j++) {
       const boff = off + j;
       if (boff >= edTotal) break;
-      const b = edGetByte(boff);
+      const b = edGetCachedByte(boff);
       if (b) {
         const ch = (b.v >= 32 && b.v <= 126) ? String.fromCharCode(b.v) : '.';
         const cls = b.dirty ? ' class="dirty"' : '';
@@ -1925,40 +1947,73 @@ async function edRenderRows() {
   view.innerHTML = h;
 }
 
-async function edLoadFullText() {
-  /* Load entire file for text mode (only for small files) */
-  for (let off = 0; off < edTotal; off += ED_CHUNK) {
-    if (!edCache[off]) await edFetchChunk(off);
+/* Load next text chunk from server and append */
+async function edLoadTextChunk() {
+  if (!edOpen || edTextLoading || edTextLoaded >= edTotal) return;
+  edTextLoading = true;
+  const loadEl = $('etload');
+  if (loadEl) loadEl.style.display = 'block';
+  const ta = $('textedit');
+  if (!ta) { edTextLoading = false; return; }
+  const len = Math.min(ED_TEXT_CHUNK, edTotal - edTextLoaded);
+  try {
+    const r = await fetch('/api/editor/read?offset=' + edTextLoaded + '&length=' + len);
+    const ab = await r.arrayBuffer();
+    const dec = new TextDecoder('utf-8', {fatal: false});
+    const chunk = dec.decode(new Uint8Array(ab));
+    if (edTextLoaded === 0) {
+      ta.value = chunk;
+      ta._origText = chunk;
+      edTextDirty = false;
+    } else {
+      const scrollPos = ta.scrollTop;
+      const selStart = ta.selectionStart;
+      const selEnd = ta.selectionEnd;
+      ta.value += chunk;
+      ta.scrollTop = scrollPos;
+      ta.setSelectionRange(selStart, selEnd);
+    }
+    /* Update highlighting */
+    const hl = $('texthl');
+    if (hl) {
+      try { hl.innerHTML = hlApply(ta.value); } catch(e) { hl.textContent = ta.value; }
+    }
+    ta.oninput = function() {
+      edTextDirty = true;
+      hlDebounce();
+    };
+    edTextLoaded += ab.byteLength;
+    ta.onscroll = function() {
+      const hl = $('texthl');
+      if (hl) { hl.scrollTop = this.scrollTop; hl.scrollLeft = this.scrollLeft; }
+      if (edTextLoaded < edTotal && !edTextLoading) {
+        if (this.scrollTop + this.clientHeight >= this.scrollHeight - 200) {
+          edLoadTextChunk();
+        }
+      }
+    };
+  } catch(e) {
+    if (edTextLoaded === 0) ta.value = 'Error: ' + e.message;
   }
-  /* Merge */
-  const full = new Uint8Array(edTotal);
-  for (let off = 0; off < edTotal; off += ED_CHUNK) {
-    const c = edCache[off];
-    if (c) full.set(c.subarray(0, Math.min(c.length, edTotal - off)), off);
-  }
-  /* Apply edits */
-  for (const [off, val] of Object.entries(edEdits)) full[parseInt(off)] = val;
+  if (loadEl) loadEl.style.display = (edTextLoaded < edTotal) ? 'none' : 'none';
+  edTextLoading = false;
+}
 
+async function edFlushText() {
+  if (!edTextDirty) return;
   const ta = $('textedit');
   if (!ta) return;
-  const dec = new TextDecoder('utf-8', {fatal: false});
-  const txt = dec.decode(full);
-  ta.value = txt;
-  ta.disabled = false;
-  ta._fullData = full;
-  /* Highlight */
-  const hl = $('texthl');
-  if (hl) {
-    hl.innerHTML = hlApply(txt);
-    /* Sync scroll and re-highlight on input */
-    ta.oninput = function() {
-      hl.innerHTML = hlApply(this.value);
-    };
-    ta.onscroll = function() {
-      hl.scrollTop = this.scrollTop;
-      hl.scrollLeft = this.scrollLeft;
-    };
-  }
+  const enc = new TextEncoder();
+  const data = enc.encode(ta.value);
+  try {
+    await fetch('/api/editor/patch?offset=0', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/octet-stream'},
+      body: data
+    });
+    edTextDirty = false;
+    edCache = {};
+  } catch(e) { log('Flush failed: ' + e.message, 'err'); }
 }
 
 /* ── Syntax highlighting ──────────────────────────── */
@@ -1969,15 +2024,29 @@ function hlDetect(txt) {
   return 'plain';
 }
 
+let edHlTimer = null;
 function hlApply(txt) {
   const lang = hlDetect(txt);
-  if (lang === 'json') return hlJSON(txt);
-  if (lang === 'xml') return hlXML(txt);
+  try {
+    if (lang === 'json') return hlJSON(txt);
+    if (lang === 'xml') return hlXML(txt);
+  } catch(e) {}
   return esc(txt) + '\n';
 }
 
+/* Debounced highlight update — avoids freezing on large files */
+function hlDebounce() {
+  if (edHlTimer) clearTimeout(edHlTimer);
+  edHlTimer = setTimeout(() => {
+    edHlTimer = null;
+    const ta = $('textedit');
+    const hl = $('texthl');
+    if (!ta || !hl) return;
+    try { hl.innerHTML = hlApply(ta.value); } catch(e) { hl.textContent = ta.value; }
+  }, 300);
+}
+
 function hlJSON(txt) {
-  /* Tokenize JSON with regex — handles keys, strings, numbers, booleans, null */
   return esc(txt).replace(
     /(&quot;)((?:[^&]|&(?!quot;))*?)(&quot;)\s*:/g,
     '<span class="hl-key">$1$2$3</span>:'
@@ -2012,44 +2081,66 @@ function hlXML(txt) {
   ) + '\n';
 }
 
-function edSwitchMode(mode) {
+function edHasEdits() {
+  if (Object.keys(edDirty).length > 0) return true;
+  if (edTextDirty) return true;
+  return false;
+}
+
+async function edSwitchMode(mode) {
   if (mode === edMode) return;
-  /* If leaving text mode, capture edits */
-  if (edMode === 'text') {
-    const ta = $('textedit');
-    if (ta && ta._fullData) {
-      const enc = new TextEncoder();
-      const newData = enc.encode(ta.value);
-      /* Store changed bytes as edits */
-      for (let i = 0; i < Math.max(newData.length, ta._fullData.length); i++) {
-        const orig = i < ta._fullData.length ? ta._fullData[i] : undefined;
-        const nv = i < newData.length ? newData[i] : undefined;
-        if (nv !== undefined && nv !== orig) edEdits[i] = nv;
-      }
-      /* Update total if size changed */
-      if (newData.length !== edTotal) edTotal = newData.length;
-    }
+  /* If switching from text, flush current page edits */
+  if (edMode === 'text') await edFlushText();
+  /* If switching from hex with dirty bytes, send patches */
+  if (edMode === 'hex' && Object.keys(edDirty).length > 0) {
+    await edFlushDirty();
   }
   edMode = mode;
   renderEditorShell();
   if (mode === 'hex') edRenderRows();
 }
 
+async function edFlushDirty() {
+  const keys = Object.keys(edDirty).map(Number).sort((a,b) => a - b);
+  if (keys.length === 0) return;
+  /* Group consecutive dirty bytes into patches */
+  let start = keys[0], prev = keys[0];
+  const patches = [];
+  for (let i = 1; i <= keys.length; i++) {
+    if (i < keys.length && keys[i] === prev + 1) { prev = keys[i]; continue; }
+    const len = prev - start + 1;
+    const data = new Uint8Array(len);
+    for (let j = 0; j < len; j++) data[j] = edDirty[start + j];
+    patches.push({off: start, data: data});
+    if (i < keys.length) { start = keys[i]; prev = keys[i]; }
+  }
+  for (const p of patches) {
+    try {
+      await fetch('/api/editor/patch?offset=' + p.off, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/octet-stream'},
+        body: p.data
+      });
+    } catch(e) {}
+  }
+  /* Update cache with dirty values */
+  for (const k of keys) {
+    const page = Math.floor(k / ED_PAGE) * ED_PAGE;
+    if (edCache[page]) edCache[page][k - page] = edDirty[k];
+  }
+  edDirty = {};
+}
+
 function editByte(off) {
   const isUsb = si >= 0 && S[si] && S[si].usb;
-  if (isUsb) return;
-  const b = edGetByte(off);
-  if (!b) return;
-  const cur = b.v.toString(16).toUpperCase().padStart(2, '0');
+  if (isUsb || !edOpen || off >= edTotal) return;
+  const b = edGetCachedByte(off);
+  const cur = b ? b.v.toString(16).toUpperCase().padStart(2, '0') : '00';
   const val = prompt('Edit byte at 0x' + off.toString(16).toUpperCase() + ' (hex):', cur);
   if (val === null) return;
   const parsed = parseInt(val, 16);
   if (isNaN(parsed) || parsed < 0 || parsed > 255) { log('Invalid byte value', 'err'); return; }
-  edEdits[off] = parsed;
-  /* Check if same as original - remove edit if unchanged */
-  const cOff = Math.floor(off / ED_CHUNK) * ED_CHUNK;
-  const chunk = edCache[cOff];
-  if (chunk && chunk[off - cOff] === parsed) delete edEdits[off];
+  edDirty[off] = parsed;
   edRenderRows();
 }
 
@@ -2057,67 +2148,30 @@ async function saveEditor() {
   if (bsy) return;
   bsy = true;
   try {
-    /* Build full file content */
-    let fullData;
-    if (edMode === 'text') {
-      const ta = $('textedit');
-      if (ta) {
-        const enc = new TextEncoder();
-        fullData = enc.encode(ta.value);
-      }
-    }
-    if (!fullData) {
-      /* Load all chunks + apply edits */
-      for (let off = 0; off < edTotal; off += ED_CHUNK) {
-        if (!edCache[off]) await edFetchChunk(off);
-      }
-      fullData = new Uint8Array(edTotal);
-      let pos = 0;
-      for (let off = 0; off < edTotal; off += ED_CHUNK) {
-        const c = edCache[off];
-        if (c) { fullData.set(c, off); pos = off + c.length; }
-      }
-      for (const [off, val] of Object.entries(edEdits)) {
-        const o = parseInt(off);
-        if (o < fullData.length) fullData[o] = val;
-      }
-    }
+    /* Flush any pending edits to server buffer */
+    if (edMode === 'text') await edFlushText();
+    if (edMode === 'hex') await edFlushDirty();
 
-    /* base64 encode in chunks */
-    let b64 = '';
-    const bchunk = 8192;
-    for (let i = 0; i < fullData.length; i += bchunk) {
-      const slice = fullData.subarray(i, Math.min(i + bchunk, fullData.length));
-      b64 += btoa(String.fromCharCode.apply(null, slice));
-    }
-    log('Saving ' + edName + ' (' + fmtB(fullData.length) + ')...');
-    const r = await fetch('/api/write_file?name=' + encodeURIComponent(edName), {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain' },
-      body: b64
-    });
+    /* Tell server to write buffer to file */
+    log('Saving ' + edName + '...');
+    const r = await fetch('/api/editor/save');
     const d = await r.json();
     if (d.error) throw new Error(d.error);
-    /* Invalidate cache and reload visible area */
-    edCache = {};
-    edEdits = {};
-    edTotal = d.size;
-    log('Saved ' + edName + ' (' + d.size + ' bytes)', 'ok');
-    if (edMode === 'hex') {
-      await edFetchChunk(0);
-      edRenderRows();
-    } else {
-      await edLoadFullText();
+    log('Saved ' + edName + ' (' + fmtB(d.written) + ')', 'ok');
+    if (edMode === 'text') {
+      const ta = $('textedit');
+      if (ta) ta._origText = ta.value;
     }
   } catch(e) { log('Save failed: ' + e.message, 'err'); }
   bsy = false;
 }
 
-function closeEditor() {
-  if (Object.keys(edEdits).length > 0) {
+async function closeEditor() {
+  if (edHasEdits()) {
     if (!confirm('You have unsaved changes. Discard?')) return;
   }
-  edName = ''; edTotal = 0; edCache = {}; edEdits = {}; edPending = {};
+  try { await fetch('/api/editor/close'); } catch(e) {}
+  edName = ''; edTotal = 0; edOpen = false; edCache = {}; edDirty = {}; edTextDirty = false;
   renderF();
 }
 
