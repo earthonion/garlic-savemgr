@@ -17,8 +17,10 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <dlfcn.h>
+#include <pthread.h>
 
 #include <ps5/kernel.h>
 #include "sqlite3.h"
@@ -57,7 +59,10 @@ int sceKernelSendNotificationRequest(int, notify_request_t*, size_t, int);
 #define MAX_REQ         8192
 #define MAX_PATH_LEN    1024
 
-static char g_iobuf[BUF_SIZE];
+/* Mutex for state-mutating operations (mount/unmount/scan) */
+static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
+/* Separate mutex for log buffer */
+static pthread_mutex_t g_log_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 /* Ring log buffer for remote debug */
 #define LOG_BUF_SIZE (32 * 1024)
@@ -71,8 +76,10 @@ static void logprintf(const char *fmt, ...) {
     va_end(ap);
     printf("%s", tmp);
     if (n > 0) {
+        pthread_mutex_lock(&g_log_mtx);
         for (int i = 0; i < n && g_logpos < LOG_BUF_SIZE - 1; i++)
             g_logbuf[g_logpos++] = tmp[i];
+        pthread_mutex_unlock(&g_log_mtx);
     }
 }
 
@@ -108,6 +115,12 @@ static int g_mounted = 0;
 static char g_local_copy[MAX_PATH_LEN] = {0};
 static uint8_t g_sealed_key[96] = {0};
 static int g_enc_ps4 = 0;
+
+/* ── Server-side editor buffer ─────────────────────────────────── */
+static char  g_ed_name[512] = {0};   /* file path relative to mount */
+static char *g_ed_buf = NULL;        /* file contents in memory */
+static size_t g_ed_size = 0;         /* buffer size */
+static int   g_ed_dirty = 0;        /* has unsaved edits */
 
 /* ── Title name lookup from app.db ──────────────────────────────── */
 typedef struct {
@@ -402,10 +415,12 @@ static int copy_file(const char *src, const char *dst) {
     if (sfd < 0) return -1;
     int dfd = open(dst, O_CREAT | O_WRONLY | O_TRUNC, 0755);
     if (dfd < 0) { close(sfd); return -2; }
-    char *buf = g_iobuf;
+    char *buf = malloc(BUF_SIZE);
+    if (!buf) { close(sfd); close(dfd); return -3; }
     ssize_t n;
     while ((n = read(sfd, buf, BUF_SIZE)) > 0)
         write(dfd, buf, n);
+    free(buf);
     close(sfd);
     close(dfd);
     return 0;
@@ -1019,7 +1034,7 @@ static void zip_send(int sock, const char *base) {
 /* ── Zip streaming for specific files by path ──────────────────── */
 typedef struct { const char *path; const char *name; } zip_file_t;
 
-static void zip_send_files(int sock, const zip_file_t *files, int nfiles) {
+static void zip_send_files(int sock, const zip_file_t *files, int nfiles, char *iobuf) {
     zip_entry_t *entries = malloc(nfiles * sizeof(zip_entry_t));
     if (!entries) return;
 
@@ -1048,7 +1063,7 @@ static void zip_send_files(int sock, const zip_file_t *files, int nfiles) {
         send(sock, e->name, nlen, 0);
 
         uint32_t crc = 0xFFFFFFFF;
-        char *buf = g_iobuf;
+        char *buf = iobuf;
         ssize_t nr;
         while ((nr = read(fd, buf, BUF_SIZE)) > 0) {
             for (ssize_t j = 0; j < nr; j++) {
@@ -1223,8 +1238,16 @@ static void http_send(int sock, const char *status_line, const char *content_typ
         "\r\n",
         status_line, content_type, body_len);
     send(sock, hdr, hlen, 0);
-    if (body && body_len > 0)
-        send(sock, body, body_len, 0);
+    if (body && body_len > 0) {
+        int off = 0;
+        while (off < body_len) {
+            int chunk = body_len - off;
+            if (chunk > 262144) chunk = 262144;
+            ssize_t s = send(sock, body + off, chunk, 0);
+            if (s <= 0) break;
+            off += s;
+        }
+    }
 }
 
 static void http_json(int sock, const char *json) {
@@ -1235,11 +1258,159 @@ static void http_json(int sock, const char *json) {
 #include "ui.h"
 
 /* ── Request handler ────────────────────────────────────────────── */
-static void handle_request(int sock) {
+static void handle_request_inner(int sock, char *iobuf, char *req, int n);
+
+/* Thread entry — receives socket fd via malloc'd int */
+static void *request_thread(void *arg) {
+    int sock = *(int *)arg;
+    free(arg);
+
+    int rcvbuf = 1024 * 1024;
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &rcvbuf, sizeof(rcvbuf));
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &(int){1}, sizeof(int));
+
     char req[MAX_REQ];
     int n = recv(sock, req, sizeof(req) - 1, 0);
-    if (n <= 0) return;
+    if (n <= 0) { close(sock); return NULL; }
     req[n] = 0;
+
+    /* Serve static HTML without lock */
+    char method[8] = {0}, url[2048] = {0};
+    sscanf(req, "%7s %2047s", method, url);
+
+    if (strcmp(method, "OPTIONS") == 0) {
+        http_send(sock, "204 No Content", "text/plain", NULL, 0);
+        close(sock);
+        return NULL;
+    }
+    if (strcmp(method, "GET") == 0 && (strcmp(url, "/") == 0 || strcmp(url, "/index.html") == 0)) {
+        http_send(sock, "200 OK", "text/html", (const char *)src_ui_html, src_ui_html_len);
+        close(sock);
+        return NULL;
+    }
+    /* Favicon — return 404 immediately without lock */
+    if (strcmp(method, "GET") == 0 && strcmp(url, "/favicon.ico") == 0) {
+        http_send(sock, "404 Not Found", "text/plain", "", 0);
+        close(sock);
+        return NULL;
+    }
+    /* Only /api/ requests should proceed — reject anything else without lock */
+    if (strncmp(url, "/api/", 5) != 0) {
+        http_send(sock, "404 Not Found", "text/plain", "Not found", 9);
+        close(sock);
+        return NULL;
+    }
+
+    /* Shutdown — must not wait for mutex */
+    if (strcmp(method, "GET") == 0 && strcmp(url, "/api/shutdown") == 0) {
+        if (g_mounted) unmount_save();
+        UmountOpt uclean;
+        memset(&uclean, 0, sizeof(uclean));
+        sceFsInitUmountSaveDataOpt(&uclean);
+        sceFsUmountSaveData(&uclean, "/data/mount_sd", 0, 0);
+        sync();
+        http_json(sock, "{\"ok\":true}");
+        close(sock);
+        notify("Garlic SaveMgr: Shutting down");
+        kill(getpid(), SIGKILL);
+        return NULL;
+    }
+
+    /* Read-only file download — no lock needed */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/download_file", 18) == 0) {
+        if (!g_mounted) { http_json(sock, "{\"error\":\"No save mounted\"}"); close(sock); return NULL; }
+        char fname[512] = {0};
+        char *np = strstr(url, "name=");
+        if (np) {
+            strncpy(fname, np + 5, sizeof(fname) - 1);
+            char *r = fname, *w = fname;
+            while (*r && *r != '&') {
+                if (*r == '%' && r[1] && r[2]) {
+                    char hex[3] = {r[1], r[2], 0};
+                    *w++ = (char)strtol(hex, NULL, 16);
+                    r += 3;
+                } else { *w++ = *r++; }
+            }
+            *w = 0;
+        }
+        if (!fname[0]) { http_json(sock, "{\"error\":\"Missing name\"}"); close(sock); return NULL; }
+        char filepath[MAX_PATH_LEN];
+        snprintf(filepath, sizeof(filepath), "%s/%s", g_mount_point, fname);
+        struct stat st;
+        if (stat(filepath, &st) < 0 || !S_ISREG(st.st_mode)) {
+            http_json(sock, "{\"error\":\"File not found\"}"); close(sock); return NULL;
+        }
+        int fd = open(filepath, O_RDONLY);
+        if (fd < 0) { http_json(sock, "{\"error\":\"Cannot read file\"}"); close(sock); return NULL; }
+        const char *bname = strrchr(fname, '/');
+        bname = bname ? bname + 1 : fname;
+        char hdr[1024];
+        int hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            "Content-Disposition: attachment; filename=\"%s\"\r\n"
+            "Content-Length: %lld\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n\r\n", bname, (long long)st.st_size);
+        send(sock, hdr, hlen, 0);
+        /* Stream read→send */
+        char *buf = malloc(BUF_SIZE);
+        if (buf) {
+            ssize_t nr;
+            while ((nr = read(fd, buf, BUF_SIZE)) > 0) {
+                ssize_t off = 0;
+                while (off < nr) {
+                    ssize_t s = send(sock, buf + off, nr - off, 0);
+                    if (s <= 0) goto dl_done;
+                    off += s;
+                }
+            }
+            dl_done:
+            free(buf);
+        }
+        close(fd);
+        close(sock);
+        return NULL;
+    }
+
+    /* Read-only editor read — no lock needed (reads from server buffer) */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/editor/read", 16) == 0) {
+        if (!g_ed_buf) { http_json(sock, "{\"error\":\"No file open\"}"); close(sock); return NULL; }
+        size_t off = 0, len = 4096;
+        char *op = strstr(url, "offset=");
+        char *lp = strstr(url, "length=");
+        if (op) off = strtoul(op + 7, NULL, 10);
+        if (lp) len = strtoul(lp + 7, NULL, 10);
+        if (off >= g_ed_size) { http_send(sock, "200 OK", "application/octet-stream", "", 0); close(sock); return NULL; }
+        if (off + len > g_ed_size) len = g_ed_size - off;
+        http_send(sock, "200 OK", "application/octet-stream", g_ed_buf + off, len);
+        close(sock);
+        return NULL;
+    }
+
+    /* Editor status — no lock needed */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/editor/status", 18) == 0) {
+        char json[512];
+        snprintf(json, sizeof(json), "{\"open\":%s,\"name\":\"%s\",\"size\":%zu,\"dirty\":%s}",
+            g_ed_buf ? "true" : "false", g_ed_name, g_ed_size, g_ed_dirty ? "true" : "false");
+        http_json(sock, json);
+        close(sock);
+        return NULL;
+    }
+
+    /* All other requests go through the handler with mutex */
+    char *iobuf = malloc(BUF_SIZE);
+    if (!iobuf) { close(sock); return NULL; }
+    pthread_mutex_lock(&g_mtx);
+    handle_request_inner(sock, iobuf, req, n);
+    pthread_mutex_unlock(&g_mtx);
+    free(iobuf);
+    close(sock);
+    return NULL;
+}
+
+static void handle_request_inner(int sock, char *iobuf, char *req, int n) {
 
     char method[8] = {0}, url[2048] = {0};
     sscanf(req, "%7s %2047s", method, url);
@@ -1325,10 +1496,17 @@ static void handle_request(int sock) {
             "Access-Control-Allow-Origin: *\r\n"
             "Connection: close\r\n\r\n", basename, (long long)st.st_size);
         send(sock, hdr, hlen, 0);
-        char *buf = g_iobuf;
+        char *buf = iobuf;
         ssize_t nr;
-        while ((nr = read(fd, buf, BUF_SIZE)) > 0)
-            send(sock, buf, nr, 0);
+        while ((nr = read(fd, buf, BUF_SIZE)) > 0) {
+            ssize_t off = 0;
+            while (off < nr) {
+                ssize_t s = send(sock, buf + off, nr - off, 0);
+                if (s <= 0) break;
+                off += s;
+            }
+            if (off < nr) break;
+        }
         close(fd);
         return;
     }
@@ -1401,7 +1579,7 @@ static void handle_request(int sock) {
         if (req_len == 0 || req_len > (size_t)(st.st_size - req_off))
             req_len = (size_t)(st.st_size - req_off);
         /* Cap single read at 64KB */
-        if (req_len > 65536) req_len = 65536;
+        if (req_len > 262144) req_len = 262144; /* 256KB max per read */
 
         int fd = open(filepath, O_RDONLY);
         if (fd < 0) { http_json(sock, "{\"error\":\"Cannot read file\"}"); return; }
@@ -1489,6 +1667,73 @@ static void handle_request(int sock) {
         return;
     }
 
+    /* POST /api/patch_file?name=<path>&offset=N&length=N -> patch bytes in file */
+    if (strcmp(method, "POST") == 0 && strncmp(url, "/api/patch_file", 15) == 0) {
+        if (!g_mounted) { http_json(sock, "{\"error\":\"No save mounted\"}"); return; }
+        char fname[512] = {0};
+        char *np = strstr(url, "name=");
+        if (np) {
+            strncpy(fname, np + 5, sizeof(fname) - 1);
+            char *r = fname, *w = fname;
+            while (*r && *r != '&') {
+                if (*r == '%' && r[1] && r[2]) {
+                    char hex[3] = {r[1], r[2], 0};
+                    *w++ = (char)strtol(hex, NULL, 16);
+                    r += 3;
+                } else { *w++ = *r++; }
+            }
+            *w = 0;
+        }
+        if (!fname[0]) { http_json(sock, "{\"error\":\"Missing name\"}"); return; }
+
+        off_t patch_off = 0;
+        char *op = strstr(url, "offset=");
+        if (op) patch_off = (off_t)atoll(op + 7);
+
+        /* Read POST body (base64) */
+        char *cl_hdr = strcasestr(req, "Content-Length:");
+        size_t body_len = 0;
+        if (cl_hdr) body_len = (size_t)atol(cl_hdr + 15);
+        if (body_len == 0 || body_len > 1024 * 1024) {
+            http_json(sock, "{\"error\":\"Invalid body\"}"); return;
+        }
+        char *body = malloc(body_len + 1);
+        if (!body) { http_json(sock, "{\"error\":\"Out of memory\"}"); return; }
+        char *hdr_end = strstr(req, "\r\n\r\n");
+        size_t hdr_len = hdr_end ? (hdr_end + 4 - req) : n;
+        size_t already = (n > (int)hdr_len) ? n - hdr_len : 0;
+        if (already > body_len) already = body_len;
+        if (already) memcpy(body, req + hdr_len, already);
+        size_t got = already;
+        while (got < body_len) {
+            ssize_t r2 = recv(sock, body + got, body_len - got, 0);
+            if (r2 <= 0) break;
+            got += r2;
+        }
+        body[got] = 0;
+
+        /* Decode base64 */
+        size_t dec_sz = (got * 3) / 4 + 4;
+        uint8_t *dec = malloc(dec_sz);
+        if (!dec) { free(body); http_json(sock, "{\"error\":\"Out of memory\"}"); return; }
+        int dec_len = b64_decode(body, got, dec, dec_sz);
+        free(body);
+
+        char filepath[MAX_PATH_LEN];
+        snprintf(filepath, sizeof(filepath), "%s/%s", g_mount_point, fname);
+        int fd = open(filepath, O_WRONLY);
+        if (fd < 0) { free(dec); http_json(sock, "{\"error\":\"Cannot open file\"}"); return; }
+        ssize_t written = pwrite(fd, dec, dec_len, patch_off);
+        close(fd);
+        sync();
+        free(dec);
+        printf("[GarlicMgr] Patched %d bytes at offset %lld in %s\n", (int)written, (long long)patch_off, fname);
+        char json[128];
+        snprintf(json, sizeof(json), "{\"ok\":true,\"written\":%d}", (int)written);
+        http_json(sock, json);
+        return;
+    }
+
     /* GET /api/files → file listing of mounted save */
     if (strcmp(method, "GET") == 0 && strcmp(url, "/api/files") == 0) {
         if (!g_mounted) { http_json(sock, "{\"files\":[]}"); return; }
@@ -1525,7 +1770,7 @@ static void handle_request(int sock) {
             "Cache-Control: no-cache\r\n"
             "Connection: close\r\n\r\n", (long long)st.st_size);
         send(sock, hdr, hlen, 0);
-        char *buf = g_iobuf;
+        char *buf = iobuf;
         ssize_t nr;
         while ((nr = read(fd, buf, BUF_SIZE)) > 0)
             send(sock, buf, nr, 0);
@@ -1780,7 +2025,7 @@ static void handle_request(int sock) {
                 "Connection: close\r\n"
                 "\r\n", zip_name);
             send(sock, hdr, hlen, 0);
-            zip_send_files(sock, zfiles, nfiles);
+            zip_send_files(sock, zfiles, nfiles, iobuf);
         } else {
             /* PS5: stream raw image */
             int fd = open(s->path, O_RDONLY);
@@ -1798,7 +2043,7 @@ static void handle_request(int sock) {
                 "Connection: close\r\n"
                 "\r\n", s->save_name, (long long)st.st_size);
             send(sock, hdr, hlen, 0);
-            char *buf = g_iobuf;
+            char *buf = iobuf;
             ssize_t nr;
             while ((nr = read(fd, buf, BUF_SIZE)) > 0)
                 send(sock, buf, nr, 0);
@@ -1896,6 +2141,156 @@ static void handle_request(int sock) {
         return;
     }
 
+    /* ── Server-side editor APIs ─────────────────────────────────── */
+
+    /* GET /api/editor/open?name=<path> — load file into server memory */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/editor/open", 16) == 0) {
+        if (!g_mounted) { http_json(sock, "{\"error\":\"No save mounted\"}"); return; }
+        char fname[512] = {0};
+        char *np = strstr(url, "name=");
+        if (np) {
+            strncpy(fname, np + 5, sizeof(fname) - 1);
+            char *r = fname, *w = fname;
+            while (*r && *r != '&') {
+                if (*r == '%' && r[1] && r[2]) {
+                    char hex[3] = {r[1], r[2], 0};
+                    *w++ = (char)strtol(hex, NULL, 16);
+                    r += 3;
+                } else { *w++ = *r++; }
+            }
+            *w = 0;
+        }
+        if (!fname[0]) { http_json(sock, "{\"error\":\"Missing name\"}"); return; }
+
+        /* Close previous editor buffer */
+        if (g_ed_buf) { free(g_ed_buf); g_ed_buf = NULL; }
+        g_ed_size = 0; g_ed_dirty = 0; g_ed_name[0] = 0;
+
+        char filepath[MAX_PATH_LEN];
+        snprintf(filepath, sizeof(filepath), "%s/%s", g_mount_point, fname);
+        struct stat st;
+        if (stat(filepath, &st) < 0 || !S_ISREG(st.st_mode)) {
+            http_json(sock, "{\"error\":\"File not found\"}"); return;
+        }
+        g_ed_buf = malloc(st.st_size);
+        if (!g_ed_buf) { http_json(sock, "{\"error\":\"Out of memory\"}"); return; }
+        int fd = open(filepath, O_RDONLY);
+        if (fd < 0) { free(g_ed_buf); g_ed_buf = NULL; http_json(sock, "{\"error\":\"Cannot read\"}"); return; }
+        ssize_t total = 0;
+        while (total < st.st_size) {
+            ssize_t nr = read(fd, g_ed_buf + total, st.st_size - total);
+            if (nr <= 0) break;
+            total += nr;
+        }
+        close(fd);
+        g_ed_size = total;
+        strncpy(g_ed_name, fname, sizeof(g_ed_name) - 1);
+        logprintf("[GarlicMgr] Editor opened: %s (%zu bytes)\n", fname, g_ed_size);
+        char json[256];
+        snprintf(json, sizeof(json), "{\"ok\":true,\"size\":%zu}", g_ed_size);
+        http_json(sock, json);
+        return;
+    }
+
+    /* GET /api/editor/read?offset=N&length=N — return raw bytes from buffer */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/editor/read", 16) == 0) {
+        if (!g_ed_buf) { http_json(sock, "{\"error\":\"No file open\"}"); return; }
+        size_t off = 0, len = 4096;
+        char *op = strstr(url, "offset=");
+        char *lp = strstr(url, "length=");
+        if (op) off = strtoul(op + 7, NULL, 10);
+        if (lp) len = strtoul(lp + 7, NULL, 10);
+        if (off >= g_ed_size) { http_send(sock, "200 OK", "application/octet-stream", "", 0); return; }
+        if (off + len > g_ed_size) len = g_ed_size - off;
+        http_send(sock, "200 OK", "application/octet-stream", g_ed_buf + off, len);
+        return;
+    }
+
+    /* POST /api/editor/patch — body: raw bytes, query: offset=N */
+    if (strcmp(method, "POST") == 0 && strncmp(url, "/api/editor/patch", 17) == 0) {
+        if (!g_ed_buf) { http_json(sock, "{\"error\":\"No file open\"}"); return; }
+        size_t off = 0;
+        char *op = strstr(url, "offset=");
+        if (op) off = strtoul(op + 7, NULL, 10);
+
+        size_t clen = 0;
+        char *cl = strcasestr(req, "Content-Length:");
+        if (cl) clen = strtoul(cl + 15, NULL, 10);
+
+        char *body_start = strstr(req, "\r\n\r\n");
+        if (!body_start) { http_json(sock, "{\"error\":\"Bad request\"}"); return; }
+        body_start += 4;
+        size_t body_in_buf = n - (body_start - req);
+
+        /* Read remaining body if needed */
+        char *patch = malloc(clen);
+        if (!patch) { http_json(sock, "{\"error\":\"Out of memory\"}"); return; }
+        size_t got = body_in_buf < clen ? body_in_buf : clen;
+        memcpy(patch, body_start, got);
+        while (got < clen) {
+            ssize_t r = recv(sock, patch + got, clen - got, 0);
+            if (r <= 0) break;
+            got += r;
+        }
+
+        if (off + got > g_ed_size) {
+            /* Grow buffer if patching past end */
+            char *nb = realloc(g_ed_buf, off + got);
+            if (!nb) { free(patch); http_json(sock, "{\"error\":\"Out of memory\"}"); return; }
+            g_ed_buf = nb;
+            if (off > g_ed_size) memset(g_ed_buf + g_ed_size, 0, off - g_ed_size);
+            g_ed_size = off + got;
+        }
+        memcpy(g_ed_buf + off, patch, got);
+        free(patch);
+        g_ed_dirty = 1;
+        char json[128];
+        snprintf(json, sizeof(json), "{\"ok\":true,\"size\":%zu}", g_ed_size);
+        http_json(sock, json);
+        return;
+    }
+
+    /* GET /api/editor/save — write buffer back to file */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/editor/save", 16) == 0) {
+        if (!g_ed_buf || !g_ed_name[0]) { http_json(sock, "{\"error\":\"No file open\"}"); return; }
+        if (!g_mounted) { http_json(sock, "{\"error\":\"No save mounted\"}"); return; }
+        char filepath[MAX_PATH_LEN];
+        snprintf(filepath, sizeof(filepath), "%s/%s", g_mount_point, g_ed_name);
+        int fd = open(filepath, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (fd < 0) { http_json(sock, "{\"error\":\"Cannot write file\"}"); return; }
+        ssize_t written = 0;
+        while ((size_t)written < g_ed_size) {
+            ssize_t w = write(fd, g_ed_buf + written, g_ed_size - written);
+            if (w <= 0) break;
+            written += w;
+        }
+        close(fd);
+        sync();
+        g_ed_dirty = 0;
+        logprintf("[GarlicMgr] Editor saved: %s (%zu bytes)\n", g_ed_name, g_ed_size);
+        char json[128];
+        snprintf(json, sizeof(json), "{\"ok\":true,\"written\":%zd}", written);
+        http_json(sock, json);
+        return;
+    }
+
+    /* GET /api/editor/close — free buffer */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/editor/close", 17) == 0) {
+        if (g_ed_buf) { free(g_ed_buf); g_ed_buf = NULL; }
+        g_ed_size = 0; g_ed_dirty = 0; g_ed_name[0] = 0;
+        http_json(sock, "{\"ok\":true}");
+        return;
+    }
+
+    /* GET /api/editor/status — check editor state */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/editor/status", 18) == 0) {
+        char json[512];
+        snprintf(json, sizeof(json), "{\"open\":%s,\"name\":\"%s\",\"size\":%zu,\"dirty\":%s}",
+            g_ed_buf ? "true" : "false", g_ed_name, g_ed_size, g_ed_dirty ? "true" : "false");
+        http_json(sock, json);
+        return;
+    }
+
     /* GET /api/shutdown */
     if (strcmp(method, "GET") == 0 && strcmp(url, "/api/shutdown") == 0) {
         if (g_mounted) unmount_save();
@@ -1942,7 +2337,7 @@ static void handle_request(int sock) {
         write(fd, body_start, body_in_buf);
         size_t received = body_in_buf;
         while (received < clen) {
-            char *buf = g_iobuf;
+            char *buf = iobuf;
             size_t want = BUF_SIZE < (clen - received) ? BUF_SIZE : (clen - received);
             ssize_t r = recv_all(sock, buf, want);
             if (r <= 0) break;
@@ -1977,7 +2372,7 @@ static void handle_request(int sock) {
         write(fd, body_start, body_in_buf);
         size_t received = body_in_buf;
         while (received < clen) {
-            char *buf = g_iobuf;
+            char *buf = iobuf;
             size_t want = BUF_SIZE < (clen - received) ? BUF_SIZE : (clen - received);
             ssize_t r = recv_all(sock, buf, want);
             if (r <= 0) break;
@@ -2027,7 +2422,7 @@ static void handle_request(int sock) {
         write(fd, body_start, body_in_buf);
         size_t received = body_in_buf;
         while (received < clen) {
-            char *buf = g_iobuf;
+            char *buf = iobuf;
             size_t want = BUF_SIZE < (clen - received) ? BUF_SIZE : (clen - received);
             ssize_t r = recv_all(sock, buf, want);
             if (r <= 0) break;
@@ -2298,7 +2693,7 @@ static void handle_request(int sock) {
             "Access-Control-Allow-Origin: *\r\n"
             "Connection: close\r\n\r\n", dlname, (long long)est.st_size);
         send(sock, hdr, hlen, 0);
-        char *buf = g_iobuf;
+        char *buf = iobuf;
         ssize_t nr;
         while ((nr = read(fd, buf, BUF_SIZE)) > 0)
             send(sock, buf, nr, 0);
@@ -2354,7 +2749,7 @@ static void handle_request(int sock) {
                 "Access-Control-Allow-Origin: *\r\n"
                 "Connection: close\r\n\r\n", zip_name);
             send(sock, hdr, hlen, 0);
-            zip_send_files(sock, zfiles, 2);
+            zip_send_files(sock, zfiles, 2, iobuf);
             unlink(tmp);
             unlink(bin_tmp);
         } else {
@@ -2371,7 +2766,7 @@ static void handle_request(int sock) {
                 "Access-Control-Allow-Origin: *\r\n"
                 "Connection: close\r\n\r\n", dlname, (long long)rst.st_size);
             send(sock, hdr, hlen, 0);
-            char *buf = g_iobuf;
+            char *buf = iobuf;
             ssize_t nr;
             while ((nr = read(fd, buf, BUF_SIZE)) > 0)
                 send(sock, buf, nr, 0);
@@ -2434,7 +2829,7 @@ static void handle_request(int sock) {
         write(fd, body_start, body_in_buf);
         size_t received = body_in_buf;
         while (received < clen) {
-            char *buf = g_iobuf;
+            char *buf = iobuf;
             size_t want = BUF_SIZE < (clen - received) ? BUF_SIZE : (clen - received);
             ssize_t r = recv_all(sock, buf, want);
             if (r <= 0) break;
@@ -2785,7 +3180,7 @@ static void handle_request(int sock) {
                 "Access-Control-Allow-Origin: *\r\n"
                 "Connection: close\r\n\r\n", zip_name);
             send(sock, hdr, hlen, 0);
-            zip_send_files(sock, zfiles, 2);
+            zip_send_files(sock, zfiles, 2, iobuf);
             unlink(tmp_path);
             unlink(bin_tmp);
         } else {
@@ -2804,7 +3199,7 @@ static void handle_request(int sock) {
                 "Access-Control-Allow-Origin: *\r\n"
                 "Connection: close\r\n\r\n", dlname, (long long)st.st_size);
             send(sock, hdr, hlen, 0);
-            char *buf = g_iobuf;
+            char *buf = iobuf;
             ssize_t nr;
             while ((nr = read(fd, buf, BUF_SIZE)) > 0)
                 send(sock, buf, nr, 0);
@@ -2869,7 +3264,7 @@ static void handle_request(int sock) {
         write(fd, body_start, body_in_buf);
         size_t received = body_in_buf;
         while (received < clen) {
-            char *buf = g_iobuf;
+            char *buf = iobuf;
             size_t want = BUF_SIZE < (clen - received) ? BUF_SIZE : (clen - received);
             ssize_t r = recv_all(sock, buf, want);
             if (r <= 0) break;
@@ -3905,7 +4300,7 @@ static void handle_request(int sock) {
             "Access-Control-Allow-Origin: *\r\n"
             "Connection: close\r\n\r\n", zip_name);
         send(sock, hdr, hlen, 0);
-        zip_send_files(sock, zfiles, nfiles);
+        zip_send_files(sock, zfiles, nfiles, iobuf);
 
         for (int i = 0; i < nfiles; i++) free(names[i]);
         for (int i = 0; i < nallocs; i++) free(allocs[i]);
@@ -4409,7 +4804,7 @@ int main(void) {
     if (bind(srvfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("bind"); close(srvfd); return 1;
     }
-    if (listen(srvfd, 5) < 0) {
+    if (listen(srvfd, 16) < 0) {
         perror("listen"); close(srvfd); return 1;
     }
 
@@ -4420,11 +4815,36 @@ int main(void) {
         socklen_t clen = sizeof(client);
         int conn = accept(srvfd, (struct sockaddr*)&client, &clen);
         if (conn < 0) continue;
-        int rcvbuf = 1024 * 1024;
-        setsockopt(conn, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-        setsockopt(conn, SOL_SOCKET, SO_SNDBUF, &rcvbuf, sizeof(rcvbuf));
-        handle_request(conn);
-        close(conn);
+
+        int *fd_ptr = malloc(sizeof(int));
+        if (!fd_ptr) { close(conn); continue; }
+        *fd_ptr = conn;
+
+        pthread_t tid;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 2 * 1024 * 1024);
+        if (pthread_create(&tid, &attr, request_thread, fd_ptr) != 0) {
+            /* Fallback: handle inline if thread creation fails */
+            free(fd_ptr);
+            int rcvbuf = 1024 * 1024;
+            setsockopt(conn, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+            setsockopt(conn, SOL_SOCKET, SO_SNDBUF, &rcvbuf, sizeof(rcvbuf));
+            char req[MAX_REQ];
+            int n = recv(conn, req, sizeof(req) - 1, 0);
+            if (n > 0) {
+                req[n] = 0;
+                char *iobuf = malloc(BUF_SIZE);
+                if (iobuf) {
+                    handle_request_inner(conn, iobuf, req, n);
+                    free(iobuf);
+                }
+            }
+            close(conn);
+        } else {
+            pthread_detach(tid);
+        }
+        pthread_attr_destroy(&attr);
     }
 
     return 0;
