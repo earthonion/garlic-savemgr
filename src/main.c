@@ -2130,6 +2130,9 @@ static void handle_request_inner(int sock, char *iobuf, char *req, int n) {
         int sfo_zeroed = (sfo_ret == -2);
         int sfo_db_found = 0;
         if (sfo_zeroed) {
+            /* Strip sdimg_ prefix for DB dir_name lookup */
+            const char *db_dir = g_saves[idx].save_name;
+            if (strncmp(db_dir, "sdimg_", 6) == 0) db_dir += 6;
             const char *db_types[] = {"savedata_prospero", "savedata"};
             for (int dt = 0; dt < 2 && !sfo_db_found; dt++) {
                 char db_path[MAX_PATH_LEN];
@@ -2140,7 +2143,7 @@ static void handle_request_inner(int sock, char *iobuf, char *req, int n) {
                     char sql[512];
                     snprintf(sql, sizeof(sql),
                         "SELECT 1 FROM savedata WHERE title_id='%s' AND dir_name='%s' LIMIT 1",
-                        g_saves[idx].title_id, g_saves[idx].save_name);
+                        g_saves[idx].title_id, db_dir);
                     sqlite3_stmt *st = NULL;
                     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK &&
                         sqlite3_step(st) == SQLITE_ROW) sfo_db_found = 1;
@@ -2191,21 +2194,134 @@ static void handle_request_inner(int sock, char *iobuf, char *req, int n) {
         return;
     }
 
+    /* GET /api/db_titles -> list all title_id/dir_name combos from savedata DBs */
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/db_titles", 14) == 0) {
+        char uid_hex[16] = {0};
+        char *uidp = strstr(url, "uid=");
+        if (uidp) { strncpy(uid_hex, uidp + 4, sizeof(uid_hex) - 1);
+            char *amp = strchr(uid_hex, '&'); if (amp) *amp = 0; }
+        if (!uid_hex[0]) {
+            int lu = 0; sceUserServiceGetForegroundUser(&lu);
+            snprintf(uid_hex, sizeof(uid_hex), "%x", (uint32_t)lu);
+        }
+
+        char resp[32768];
+        int pos = 0;
+        pos += snprintf(resp + pos, sizeof(resp) - pos, "{\"titles\":[");
+
+        const char *db_types[] = {"savedata_prospero", "savedata"};
+        int first = 1;
+        for (int dt = 0; dt < 2; dt++) {
+            char db_path[MAX_PATH_LEN];
+            snprintf(db_path, sizeof(db_path),
+                     "/system_data/%s/%s/db/user/savedata.db", db_types[dt], uid_hex);
+            sqlite3 *db = NULL;
+            if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) continue;
+            sqlite3_stmt *stmt = NULL;
+            const char *sql = "SELECT title_id, dir_name, main_title FROM savedata ORDER BY title_id, dir_name";
+            if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+                while (sqlite3_step(stmt) == SQLITE_ROW) {
+                    const char *tid = (const char *)sqlite3_column_text(stmt, 0);
+                    const char *dir = (const char *)sqlite3_column_text(stmt, 1);
+                    const char *title = (const char *)sqlite3_column_text(stmt, 2);
+                    if (!tid || !dir) continue;
+                    if (!first) pos += snprintf(resp + pos, sizeof(resp) - pos, ",");
+                    first = 0;
+                    /* Escape title for JSON */
+                    char esc_title[256] = {0};
+                    if (title) {
+                        int j = 0;
+                        for (int k = 0; title[k] && j < (int)sizeof(esc_title) - 2; k++) {
+                            if (title[k] == '"' || title[k] == '\\') esc_title[j++] = '\\';
+                            esc_title[j++] = title[k];
+                        }
+                    }
+                    pos += snprintf(resp + pos, sizeof(resp) - pos,
+                        "{\"tid\":\"%s\",\"dir\":\"%s\",\"title\":\"%s\",\"ps4\":%d}",
+                        tid, dir, esc_title, dt == 1 ? 1 : 0);
+                    if (pos >= (int)sizeof(resp) - 256) break;
+                }
+            }
+            if (stmt) sqlite3_finalize(stmt);
+            sqlite3_close(db);
+        }
+        pos += snprintf(resp + pos, sizeof(resp) - pos, "]}");
+        http_json(sock, resp);
+        return;
+    }
+
     /* GET /api/regen_sfo -> regenerate param.sfo from savedata DB for mounted save */
-    if (strcmp(method, "GET") == 0 && strcmp(url, "/api/regen_sfo") == 0) {
-        if (!g_mounted || g_mounted_idx < 0) {
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/api/regen_sfo", 14) == 0) {
+        if (!g_mounted) {
             http_json(sock, "{\"error\":\"No save mounted\"}"); return;
         }
-        save_entry_t *s = &g_saves[g_mounted_idx];
-        const char *sd = s->is_ps4 ? "savedata" : "savedata_prospero";
-        char db_path[MAX_PATH_LEN];
-        snprintf(db_path, sizeof(db_path),
-                 "/system_data/%s/%s/db/user/savedata.db", sd, s->user_id);
 
+        /* Accept title_id and dir_name from query params (for zeroed SFO where we can't detect) */
+        char q_title_id[32] = {0}, q_dir_name[256] = {0};
+        char *tp = strstr(url, "title_id=");
+        if (tp) { tp += 9; int i = 0;
+            while (tp[i] && tp[i] != '&' && i < (int)sizeof(q_title_id) - 1) { q_title_id[i] = tp[i]; i++; }
+            q_title_id[i] = 0;
+        }
+        char *dp = strstr(url, "dir_name=");
+        if (dp) { dp += 9; int i = 0;
+            while (dp[i] && dp[i] != '&' && i < (int)sizeof(q_dir_name) - 1) { q_dir_name[i] = dp[i]; i++; }
+            q_dir_name[i] = 0;
+        }
+
+        /* Use query params if provided, else fall back to save entry */
+        const char *lookup_tid = q_title_id[0] ? q_title_id : (g_mounted_idx >= 0 ? g_saves[g_mounted_idx].title_id : "");
+        const char *lookup_dir = q_dir_name[0] ? q_dir_name : (g_mounted_idx >= 0 ? g_saves[g_mounted_idx].save_name : "");
+        /* Strip sdimg_ prefix for DB lookup */
+        if (strncmp(lookup_dir, "sdimg_", 6) == 0) lookup_dir += 6;
+
+        if (!lookup_tid[0] || !lookup_dir[0]) {
+            http_json(sock, "{\"error\":\"Missing title_id or dir_name\"}"); return;
+        }
+
+        /* Get uid — from save entry or foreground user */
+        char uid_hex[16] = {0};
+        if (g_mounted_idx >= 0 && g_saves[g_mounted_idx].user_id[0]) {
+            strncpy(uid_hex, g_saves[g_mounted_idx].user_id, sizeof(uid_hex) - 1);
+        } else {
+            char *uidp = strstr(url, "uid=");
+            if (uidp) { strncpy(uid_hex, uidp + 4, sizeof(uid_hex) - 1);
+                char *amp = strchr(uid_hex, '&'); if (amp) *amp = 0; }
+            if (!uid_hex[0]) {
+                int lu = 0; sceUserServiceGetForegroundUser(&lu);
+                snprintf(uid_hex, sizeof(uid_hex), "%x", (uint32_t)lu);
+            }
+        }
+
+        int is_ps4 = (g_mounted_idx >= 0) ? g_saves[g_mounted_idx].is_ps4 : 0;
+
+        /* Try both PS5 and PS4 DBs */
         sqlite3 *db = NULL;
-        if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
-            http_json(sock, "{\"error\":\"Cannot open savedata.db\"}");
-            if (db) sqlite3_close(db);
+        int db_opened = 0;
+        const char *db_types[] = {"savedata_prospero", "savedata"};
+        for (int dt = 0; dt < 2 && !db_opened; dt++) {
+            char db_path[MAX_PATH_LEN];
+            snprintf(db_path, sizeof(db_path),
+                     "/system_data/%s/%s/db/user/savedata.db", db_types[dt], uid_hex);
+            if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+                /* Check if entry exists */
+                char chk[512];
+                snprintf(chk, sizeof(chk), "SELECT 1 FROM savedata WHERE title_id='%s' AND dir_name='%s' LIMIT 1",
+                         lookup_tid, lookup_dir);
+                sqlite3_stmt *chk_st = NULL;
+                if (sqlite3_prepare_v2(db, chk, -1, &chk_st, NULL) == SQLITE_OK &&
+                    sqlite3_step(chk_st) == SQLITE_ROW) {
+                    db_opened = 1;
+                    is_ps4 = (dt == 1);
+                }
+                if (chk_st) sqlite3_finalize(chk_st);
+                if (!db_opened) { sqlite3_close(db); db = NULL; }
+            }
+        }
+        if (!db_opened) {
+            char err[256];
+            snprintf(err, sizeof(err), "{\"error\":\"No DB entry for %s/%s\"}", lookup_tid, lookup_dir);
+            http_json(sock, err);
             return;
         }
 
@@ -2218,13 +2334,13 @@ static void handle_request_inner(int sock, char *iobuf, char *req, int n) {
             sqlite3_close(db);
             return;
         }
-        sqlite3_bind_text(stmt, 1, s->title_id, -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 2, s->save_name, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 1, lookup_tid, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, lookup_dir, -1, SQLITE_STATIC);
 
         if (sqlite3_step(stmt) != SQLITE_ROW) {
             char err[256];
             snprintf(err, sizeof(err), "{\"error\":\"No DB entry for %s/%s\"}",
-                     s->title_id, s->save_name);
+                     lookup_tid, lookup_dir);
             http_json(sock, err);
             sqlite3_finalize(stmt);
             sqlite3_close(db);
@@ -2242,15 +2358,15 @@ static void handle_request_inner(int sock, char *iobuf, char *req, int n) {
         char sfo_path[MAX_PATH_LEN];
         snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
         logprintf("[GarlicMgr] Regenerating param.sfo from DB: %s/%s title='%s' aid=%lld uid=%u\n",
-                  s->title_id, s->save_name,
+                  lookup_tid, lookup_dir,
                   main_title ? main_title : "", (long long)account_id_db, db_user_id);
 
-        generate_sfo(sfo_path, s->title_id, s->save_name,
-                     main_title ? main_title : s->title_id,
+        generate_sfo(sfo_path, lookup_tid, lookup_dir,
+                     main_title ? main_title : lookup_tid,
                      sub_title ? sub_title : "",
                      (uint64_t)account_id_db, (uint64_t)blocks,
                      (uint64_t)system_blocks, db_user_id,
-                     db_gtid, s->is_ps4,
+                     db_gtid, is_ps4,
                      g_params_hmac_valid ? g_params_hmac : NULL);
 
         /* Re-read to verify and return info */

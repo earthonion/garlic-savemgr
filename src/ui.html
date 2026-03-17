@@ -1403,50 +1403,72 @@ function showConfirmModal(msg, yesText, noText) {
   });
 }
 
+/* Show zeroed SFO modal with DB title picker. Returns {type:'anyway'|'regen', tid, dir} or 'cancel' */
+async function showSfoModal(opts) {
+  const hasAnyway = opts && opts.anyway;
+  let titles = [];
+  try {
+    const r = await fetch('/api/db_titles?uid=' + encodeURIComponent(curUid));
+    const d = await r.json();
+    titles = d.titles || [];
+  } catch(e) {}
+  return new Promise(resolve => {
+    const m = document.createElement('div');
+    m.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;z-index:999';
+    const listHtml = titles.length ? titles.map((t,i) =>
+      '<div class="sfo-row" data-i="'+i+'" style="display:flex;align-items:center;padding:8px 10px;cursor:pointer;border-bottom:1px solid var(--bd);transition:background .15s"'
+      + ' onmouseenter="this.style.background=\'var(--s2)\'" onmouseleave="this.style.background=\'\'">'
+      + '<div style="flex:1;text-align:left"><div style="font-size:13px;color:var(--tx)">' + (t.title||t.tid) + '</div>'
+      + '<div style="font-size:11px;color:var(--dm)">' + t.tid + ' / ' + t.dir + (t.ps4?' (PS4)':'') + '</div></div></div>'
+    ).join('') : '<div style="padding:16px;color:var(--dm);font-size:12px">No titles found in database</div>';
+    m.innerHTML =
+      '<div style="background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:0;max-width:420px;width:90%;max-height:80vh;display:flex;flex-direction:column">'
+      + '<div style="padding:16px 20px 12px;border-bottom:1px solid var(--bd)">'
+      + '<div style="font-size:14px;color:var(--tx);font-weight:600">Zeroed param.sfo detected</div>'
+      + '<div style="font-size:12px;color:var(--dm);margin-top:4px">Select a title from the database to regenerate</div></div>'
+      + '<div id="sfList" style="overflow-y:auto;max-height:40vh">' + listHtml + '</div>'
+      + '<div id="sfStatus" style="font-size:11px;color:var(--dm);padding:4px 20px;min-height:16px"></div>'
+      + '<div style="padding:12px 20px 16px;border-top:1px solid var(--bd);display:flex;gap:8px">'
+      + (hasAnyway ? '<button class="btn grn" style="flex:1" id="sfAnyway">Import Anyway</button>' : '')
+      + '<button class="btn red" style="flex:1" id="sfCancel">Cancel</button></div></div>';
+    document.body.appendChild(m);
+    m.querySelectorAll('.sfo-row').forEach(row => {
+      row.onclick = async () => {
+        const t = titles[parseInt(row.dataset.i)];
+        m.querySelectorAll('.sfo-row').forEach(r => r.style.background = '');
+        row.style.background = 'var(--ac)';
+        row.style.borderRadius = '6px';
+        m.querySelector('#sfStatus').textContent = 'Regenerating from ' + t.tid + '/' + t.dir + '...';
+        try {
+          const rr = await fetch('/api/regen_sfo?title_id=' + encodeURIComponent(t.tid) + '&dir_name=' + encodeURIComponent(t.dir));
+          const rd = await rr.json();
+          if (rd.error) { m.querySelector('#sfStatus').innerHTML = '<span style="color:#f44">' + rd.error + '</span>'; return; }
+          m.remove(); resolve({type:'regen', tid:t.tid, dir:t.dir});
+        } catch(e) { m.querySelector('#sfStatus').innerHTML = '<span style="color:#f44">Error: ' + e.message + '</span>'; }
+      };
+    });
+    if (hasAnyway) {
+      m.querySelector('#sfAnyway').onclick = () => { m.remove(); resolve({type:'anyway', tid:'', dir:''}); };
+    }
+    m.querySelector('#sfCancel').onclick = () => { m.remove(); resolve('cancel'); };
+  });
+}
+
 async function doImportFinish() {
   log('Importing to system...');
   $('ct').innerHTML = '<div class="drop"><div class="dlbl">Importing save to system...</div></div>';
   let r = await fetch('/api/import_finish?uid=' + encodeURIComponent(curUid));
   let d = await r.json();
   if (d.sfo_zeroed) {
-    const choice = await new Promise(resolve => {
-      const m = document.createElement('div');
-      m.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;z-index:999';
-      let fields = '<input id="sfTid" placeholder="Title ID (e.g. PPSA07836)" style="width:100%;margin-bottom:8px;padding:8px;border:1px solid var(--bd);border-radius:6px;background:var(--s2);color:var(--tx);font-size:13px;box-sizing:border-box">'
-        + '<input id="sfDir" placeholder="Dir Name (e.g. PLAYSAVEDATA01)" style="width:100%;margin-bottom:12px;padding:8px;border:1px solid var(--bd);border-radius:6px;background:var(--s2);color:var(--tx);font-size:13px;box-sizing:border-box">';
-      let btns = '<button class="btn grn" style="width:100%;margin-bottom:8px" id="sfAnyway">Import Anyway</button>';
-      if (d.db_found) {
-        btns += '<button class="btn" style="width:100%;margin-bottom:8px;background:var(--bd);color:var(--tx)" id="sfRegen">Regenerate from DB <span style="font-size:9px;opacity:.7;font-style:italic">(experimental)</span></button>';
-      }
-      btns += '<button class="btn red" style="width:100%" id="sfCancel">Cancel</button>';
-      m.innerHTML =
-        '<div style="background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:24px;max-width:400px;text-align:center">'
-        + '<div style="font-size:14px;color:var(--tx);margin-bottom:16px">This save has a zeroed param.sfo file.</div>'
-        + fields + btns + '</div>';
-      document.body.appendChild(m);
-      if (d.db_found) m.querySelector('#sfRegen').onclick = () => { m.remove(); resolve('regen'); };
-      m.querySelector('#sfAnyway').onclick = () => {
-        const tid = m.querySelector('#sfTid').value.trim();
-        const dir = m.querySelector('#sfDir').value.trim();
-        if (!tid || !dir) { m.querySelector('#sfTid').style.borderColor = tid ? 'var(--bd)' : '#f44'; m.querySelector('#sfDir').style.borderColor = dir ? 'var(--bd)' : '#f44'; return; }
-        m.remove(); resolve({type:'anyway', tid, dir});
-      };
-      m.querySelector('#sfCancel').onclick = () => { m.remove(); resolve('cancel'); };
-    });
-    if (choice === 'regen') {
-      log('Regenerating param.sfo...');
-      let rr = await fetch('/api/regen_sfo');
-      let rd = await rr.json();
-      if (rd.error) throw new Error('SFO regen failed: ' + rd.error);
+    const choice = await showSfoModal({anyway: true});
+    if (choice && choice.type === 'regen') {
       log('param.sfo regenerated', 'ok');
       r = await fetch('/api/import_finish?uid=' + encodeURIComponent(curUid));
       d = await r.json();
       if (d.error) throw new Error(d.error);
     } else if (choice && choice.type === 'anyway') {
       log('Importing with zeroed param.sfo...');
-      r = await fetch('/api/import_finish?uid=' + encodeURIComponent(curUid)
-        + '&force=1&title_id=' + encodeURIComponent(choice.tid)
-        + '&dir_name=' + encodeURIComponent(choice.dir));
+      r = await fetch('/api/import_finish?uid=' + encodeURIComponent(curUid) + '&force=1');
       d = await r.json();
       if (d.error) throw new Error(d.error);
     } else {
@@ -1481,30 +1503,19 @@ async function mountBrw(i) {
     /* folders start collapsed */
     log('Mounted ' + (mtid ? mtid + ' ' : '') + (stitle ? stitle + ' ' : '') + (aid ? '[' + aid + ']' : ''), 'ok');
     renderF();
-    if (d.sfo_zeroed && d.db_found) {
-      const fix = await showConfirmModal(
-        'This save has a zeroed param.sfo file. Generate a new one from the savedata database?',
-        'Regenerate (experimental)', 'Skip');
-      if (fix) {
-        log('Regenerating param.sfo...');
-        try {
-          let rr = await fetch('/api/regen_sfo');
-          let rd = await rr.json();
-          if (rd.ok) {
-            log('param.sfo regenerated: ' + (rd.title || '') + (rd.subtitle ? ' - ' + rd.subtitle : ''), 'ok');
-            let r2 = await fetch('/api/mount?idx=' + i);
-            let d2 = await r2.json();
-            if (!d2.error) {
-              cf = d2.files || [];
-              aid = d2.account_id || '';
-              stitle = d2.save_title || '';
-              mtid = d2.title_id || '';
-              renderF();
-            }
-          } else {
-            log('SFO regen failed: ' + (rd.error || 'unknown'), 'err');
-          }
-        } catch (e2) { log('SFO regen error: ' + e2.message, 'err'); }
+    if (d.sfo_zeroed) {
+      const result = await showSfoModal({anyway: false});
+      if (result && result.type === 'regen') {
+        log('param.sfo regenerated', 'ok');
+        let r2 = await fetch('/api/mount?idx=' + i);
+        let d2 = await r2.json();
+        if (!d2.error) {
+          cf = d2.files || [];
+          aid = d2.account_id || '';
+          stitle = d2.save_title || '';
+          mtid = d2.title_id || '';
+          renderF();
+        }
       }
     }
   } catch (e) {
