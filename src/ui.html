@@ -185,9 +185,9 @@
     .title-dots {
       color: var(--dm); font-size: 18px;
       cursor: pointer; padding: 0 4px; margin-left: 6px;
-      opacity: .3; transition: opacity .15s; border-radius: 4px;
+      opacity: .7; transition: opacity .15s; border-radius: 4px;
     }
-    .sv:hover .title-dots { opacity: .7 }
+    .sv:hover .title-dots { opacity: .9 }
     .title-dots:hover { opacity: 1 !important; color: var(--tx); background: rgba(255,255,255,.05) }
 
     .empty { padding: 40px; text-align: center; color: var(--dm); font-size: 12px; letter-spacing: .3px }
@@ -475,6 +475,7 @@
   <button class="tab" onclick="switchTab('import')">Import</button>
   <span class="spacer"></span>
   <button class="shut" onclick="shutdown()">Kill GarlicMgr</button>
+  <span style="font-size:10px;color:#ffeb3b;margin-left:4px">__VERSION__</span>
   <button class="hamburger" onclick="toggleMenu()">&#9776;</button>
 </nav>
 <div class="mob-menu" id="mobmenu">
@@ -484,6 +485,7 @@
   <button class="tab" onclick="switchTab('resign')">Resign</button>
   <button class="tab" onclick="switchTab('import')">Import</button>
   <button class="shut" onclick="shutdown()">Kill GarlicMgr</button>
+  <span style="font-size:10px;color:#ffeb3b">__VERSION__</span>
 </div>
 
 <!-- ── Main layout ─────────────────────────────────── -->
@@ -789,16 +791,15 @@ function renderGroup(g, h) {
   const badge = '<span class="badge badge-' + gtype + '">' + gtype.toUpperCase() + '</span>';
   const anyUsb = g.items.every(i => S[i].usb);
   const gkey = (anyUsb ? 'usb:' : '') + g.title_id;
-  const tdots = anyUsb ? '' : '<span class="title-dots" onclick="event.stopPropagation();showTitleMenu(event,\'' + esc(g.title_id).replace(/'/g, "\\'") + '\')">\u22EE</span>';
+  const tdots = '<span class="title-dots" onclick="event.stopPropagation();showTitleMenu(event,\'' + esc(g.title_id).replace(/'/g, "\\'") + '\',' + anyUsb + ')">\u22EE</span>';
   function saveDots(idx) {
     return '<span class="title-dots" onclick="event.stopPropagation();showSaveMenu(event,' + idx + ')">\u22EE</span>';
   }
   if (g.items.length === 1) {
     const i = g.items[0], s = S[i];
     const bu = s.backup ? '<span class="badge badge-bu">BACKUP</span>' : '';
-    const dots = s.usb ? saveDots(i) : tdots;
     h += '<div class="sv' + (i === si ? ' sel' : '') + '" onclick="sel(' + i + ')">';
-    h += '<div class="tid">' + bu + badge + esc(g.name) + dots + '</div>';
+    h += '<div class="tid">' + bu + badge + esc(g.name) + tdots + '</div>';
     h += '<div class="sn">' + esc(s.save_name) + '</div></div>';
   } else {
     const open = exG.has(gkey);
@@ -811,7 +812,7 @@ function renderGroup(g, h) {
       g.items.forEach(i => {
         const s = S[i];
         const bu = s.backup ? '<span class="badge badge-bu">BACKUP</span>' : '';
-        const dots = s.usb ? saveDots(i) : '';
+        const dots = saveDots(i);
         h += '<div class="sv' + (i === si ? ' sel' : '') + '" onclick="sel(' + i + ')" style="padding-left:28px">';
         h += '<div class="sn" style="color:var(--tx)">' + bu + esc(s.save_name) + dots + '</div></div>';
       });
@@ -1398,8 +1399,47 @@ function showConfirmModal(msg, yesText, noText) {
 async function doImportFinish() {
   log('Importing to system...');
   $('ct').innerHTML = '<div class="drop"><div class="dlbl">Importing save to system...</div></div>';
-  const r = await fetch('/api/import_finish?uid=' + encodeURIComponent(curUid));
-  const d = await r.json();
+  let r = await fetch('/api/import_finish?uid=' + encodeURIComponent(curUid));
+  let d = await r.json();
+  if (d.sfo_zeroed) {
+    const choice = await new Promise(resolve => {
+      const m = document.createElement('div');
+      m.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;z-index:999';
+      let btns = '<button class="btn grn" style="width:100%;margin-bottom:8px" id="sfAnyway">Import Anyway</button>';
+      if (d.db_found) {
+        btns += '<button class="btn" style="width:100%;margin-bottom:8px;background:var(--bd);color:var(--tx)" id="sfRegen">Regenerate from DB <span style="font-size:9px;opacity:.7;font-style:italic">(experimental)</span></button>';
+      }
+      btns += '<button class="btn red" style="width:100%" id="sfCancel">Cancel</button>';
+      m.innerHTML =
+        '<div style="background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:24px;max-width:400px;text-align:center">'
+        + '<div style="font-size:14px;color:var(--tx);margin-bottom:16px">This save has a zeroed param.sfo file.</div>'
+        + btns + '</div>';
+      document.body.appendChild(m);
+      if (d.db_found) m.querySelector('#sfRegen').onclick = () => { m.remove(); resolve('regen'); };
+      m.querySelector('#sfAnyway').onclick = () => { m.remove(); resolve('anyway'); };
+      m.querySelector('#sfCancel').onclick = () => { m.remove(); resolve('cancel'); };
+    });
+    if (choice === 'regen') {
+      log('Regenerating param.sfo...');
+      let rr = await fetch('/api/regen_sfo');
+      let rd = await rr.json();
+      if (rd.error) throw new Error('SFO regen failed: ' + rd.error);
+      log('param.sfo regenerated', 'ok');
+      r = await fetch('/api/import_finish?uid=' + encodeURIComponent(curUid));
+      d = await r.json();
+      if (d.error) throw new Error(d.error);
+    } else if (choice === 'anyway') {
+      log('Importing with zeroed param.sfo...');
+      r = await fetch('/api/import_finish?uid=' + encodeURIComponent(curUid) + '&force=1');
+      d = await r.json();
+      if (d.error) throw new Error(d.error);
+    } else {
+      log('Import cancelled');
+      try { await fetch('/api/unmount'); } catch(x) {}
+      renderCt();
+      return;
+    }
+  }
   if (d.error) throw new Error(d.error);
   log('Import complete: ' + d.title_id + '/' + d.dir_name + (d.exists ? ' (updated)' : ' (new)'), 'ok');
   showImportSuccess(d);
@@ -1425,6 +1465,32 @@ async function mountBrw(i) {
     /* folders start collapsed */
     log('Mounted ' + (mtid ? mtid + ' ' : '') + (stitle ? stitle + ' ' : '') + (aid ? '[' + aid + ']' : ''), 'ok');
     renderF();
+    if (d.sfo_zeroed && d.db_found) {
+      const fix = await showConfirmModal(
+        'This save has a zeroed param.sfo file. Generate a new one from the savedata database?',
+        'Regenerate (experimental)', 'Skip');
+      if (fix) {
+        log('Regenerating param.sfo...');
+        try {
+          let rr = await fetch('/api/regen_sfo');
+          let rd = await rr.json();
+          if (rd.ok) {
+            log('param.sfo regenerated: ' + (rd.title || '') + (rd.subtitle ? ' - ' + rd.subtitle : ''), 'ok');
+            let r2 = await fetch('/api/mount?idx=' + i);
+            let d2 = await r2.json();
+            if (!d2.error) {
+              cf = d2.files || [];
+              aid = d2.account_id || '';
+              stitle = d2.save_title || '';
+              mtid = d2.title_id || '';
+              renderF();
+            }
+          } else {
+            log('SFO regen failed: ' + (rd.error || 'unknown'), 'err');
+          }
+        } catch (e2) { log('SFO regen error: ' + e2.message, 'err'); }
+      }
+    }
   } catch (e) {
     log('Error: ' + e.message, 'err');
   }
@@ -1463,7 +1529,9 @@ function renderF() {
       } else {
         h += '<div class="fi"' + clickAttr + ' oncontextmenu="showCtxMenu(event,\'' + fn + '\')">';
       }
-      h += '\u{1F4C4} ' + esc(nm) + '<span class="sz">' + fmtB(f.size) + '</span></div>';
+      h += '\u{1F4C4} ' + esc(nm)
+        + '<span class="dir-dots" onclick="event.stopPropagation();showCtxMenu(event,\'' + fn + '\')">\u22EE</span>'
+        + '<span class="sz">' + fmtB(f.size) + '</span></div>';
     }
   });
   if (!isUsb) h += '<div class="dh" style="opacity:1;font-size:12px">Tip: Drag & drop files here to add or replace them</div>';
@@ -1532,16 +1600,22 @@ function uploadToDir(dirName) {
   i.click();
 }
 
-function showTitleMenu(e, titleId) {
+function showTitleMenu(e, titleId, isUsb) {
   e.preventDefault();
   closeCtxMenu();
   const m = document.createElement('div');
   m.className = 'ctx-menu';
   m.id = 'ctxmenu';
   const tid = titleId.replace(/'/g, "\\'");
-  m.innerHTML = '<div onclick="showExportModal(\'' + tid + '\',false)">Export All Saves</div>'
-    + '<div onclick="showExportModal(\'' + tid + '\',true)">Export All Decrypted</div>'
-    + '<div class="ctx-del" onclick="deleteTitle(\'' + tid + '\')">Delete All Saves</div>';
+  let items = '';
+  if (isUsb) {
+    items += '<div onclick="importAllUsb(\'' + tid + '\')">Import All to System</div>';
+  } else {
+    items += '<div onclick="showExportModal(\'' + tid + '\',false)">Export All Saves</div>';
+    items += '<div onclick="showExportModal(\'' + tid + '\',true)">Export All Decrypted</div>';
+  }
+  items += '<div class="ctx-del" onclick="deleteTitle(\'' + tid + '\')">Delete All Saves</div>';
+  m.innerHTML = items;
   m.style.left = e.clientX + 'px';
   m.style.top = e.clientY + 'px';
   document.body.appendChild(m);
@@ -1668,6 +1742,58 @@ async function importSingleUsb(idx) {
     log('Import failed: ' + e.message, 'err');
   }
   bsy = false;
+}
+
+async function importAllUsb(titleId) {
+  closeCtxMenu();
+  if (bsy) return;
+  const usbSaves = S.map((s, i) => ({s, i})).filter(x => x.s.usb && x.s.title_id === titleId);
+  if (usbSaves.length === 0) { log('No USB saves found for ' + titleId, 'err'); return; }
+  const existingAny = usbSaves.some(x => S.some((s2, j) => j !== x.i && !s2.usb && s2.title_id === x.s.title_id && s2.save_name === x.s.save_name));
+  const msg = 'Import ' + usbSaves.length + ' save(s) for ' + titleId + ' to system?' + (existingAny ? '\n\nSome saves already exist and will be overwritten.' : '');
+  const ok = await showConfirmModal(msg, 'Import All', 'Cancel');
+  if (!ok) return;
+  bsy = true; renderTB();
+  let imported = 0, failed = 0;
+  for (const x of usbSaves) {
+    try {
+      log('Importing ' + x.s.save_name + '...');
+      const r = await fetch('/api/import_usb_save?idx=' + x.i + '&uid=' + encodeURIComponent(curUid));
+      const d = await r.json();
+      if (d.error) throw new Error(d.error);
+      imported++;
+      log('Imported ' + d.title_id + '/' + d.dir_name, 'ok');
+    } catch(e) {
+      failed++;
+      log('Failed to import ' + x.s.save_name + ': ' + e.message, 'err');
+    }
+  }
+  log('Import complete: ' + imported + ' imported' + (failed ? ', ' + failed + ' failed' : ''), imported > 0 ? 'ok' : 'err');
+  await load();
+  renderL();
+  bsy = false; renderTB();
+}
+
+async function deleteCurrentSave() {
+  if (bsy || si < 0) return;
+  const s = S[si];
+  const ok = await showConfirmModal('Delete ' + s.title_id + '/' + s.save_name + '? This cannot be undone.');
+  if (!ok) return;
+  bsy = true; renderTB();
+  try {
+    if (mt) { await fetch('/api/unmount'); mt = false; }
+    log('Deleting ' + s.title_id + '/' + s.save_name + '...');
+    const r = await fetch('/api/delete_save?idx=' + si);
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    log('Deleted ' + s.save_name, 'ok');
+    si = -1; mt = null; cf = [];
+    await load();
+    renderL(); renderTB(); renderCt();
+  } catch(e) {
+    log('Delete failed: ' + e.message, 'err');
+  }
+  bsy = false; renderTB();
 }
 
 async function deleteSave(idx) {
