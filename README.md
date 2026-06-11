@@ -32,6 +32,22 @@ You can also create the file manually:
     "settle_seconds": 15,
     "queue_for_browser_drive": true
   },
+  "backup_targets": {
+    "local": {
+      "enabled": false,
+      "path": "/data/garlic/backups"
+    },
+    "usb": {
+      "enabled": true,
+      "path": "/mnt/usb0/garlic-backups"
+    },
+    "ftp": {
+      "enabled": true
+    },
+    "google_drive": {
+      "enabled": false
+    }
+  },
   "google_drive": {
     "mode": "browser",
     "folder_id": "drive_folder_id_shared_with_service_account",
@@ -54,11 +70,15 @@ You can also create the file manually:
 
 The Browse tab exposes Cloud Backup actions for a selected save and for all saves under a title. Backups are encrypted/restorable ZIP archives. PS5 archives contain the raw save image; PS4 archives include the `sdimg_...` image and its `.bin` key companion when present.
 
-Supported providers:
+Supported destinations:
 
+- `local`: writes encrypted/restorable ZIP archives on the PS5, defaulting to `/data/garlic/backups`.
+- `usb`: writes encrypted/restorable ZIP archives to a connected USB drive, defaulting to `/mnt/usb0/garlic-backups`.
 - `ftp`: uploads from the PS5 to a passive plain FTP server.
 - `google_drive` with `"mode": "browser"`: the browser fetches the backup ZIP from the PS5 and uploads it to Google Drive. Use service-account auth for Shared Drives, or Browser OAuth Token auth for normal personal My Drive folders.
 - `google_drive` with `"mode": "direct"`: configurable, but disabled in this payload build because the PS5 SDK image exposes `libSceSsl.so` without public SSL headers for a safe HTTPS implementation.
+
+The legacy top-level `provider` field still works, but `backup_targets` can enable multiple destinations at once. Manual and auto title backups package one encrypted/restorable ZIP under `/data/garlic/tmp`, then distribute that same ZIP to every enabled PS5-side destination (`local`, `usb`, `ftp`). Google Drive browser mode remains a browser/queue destination.
 
 For Google Drive browser mode, the Drive folder ID is required. Folder names like `ps5_saves` are not accepted as IDs. Service accounts do not have storage quota in normal My Drive folders, so they can only upload to Shared Drives or Workspace delegated drives. For a personal My Drive folder, select Browser OAuth Token in Settings and paste a Drive-scoped access token. Settings -> Test Drive Access verifies the selected auth can see and upload to the folder.
 
@@ -67,6 +87,7 @@ When `auto_backup.enabled` is true, Garlic SaveMgr starts a watcher thread. It p
 Auto upload behavior:
 
 - FTP uploads immediately from the PS5 using the same encrypted/restorable title ZIP as Cloud Backup All.
+- Local and USB targets write immediately from the PS5 using the same encrypted/restorable title ZIP as Cloud Backup All. Files are written as `.tmp` first, then renamed to `.zip` when complete.
 - Google Drive browser mode writes pending ZIPs to `/data/garlic/cloud_queue/`. The Settings page polls the queue and uploads pending backups when the browser is open with valid Drive auth.
 - Google Drive direct mode remains unsupported, but can still queue browser uploads when `queue_for_browser_drive` is true.
 
