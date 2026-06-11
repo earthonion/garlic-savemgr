@@ -1,5 +1,5 @@
 PS5_PAYLOAD_SDK ?= /opt/ps5-payload-sdk
-VERSION ?= 1.82b
+VERSION ?= 1.9
 
 PS5_CC := $(PS5_PAYLOAD_SDK)/bin/prospero-clang
 PS5_INCDIR := $(PS5_PAYLOAD_SDK)/target/include
