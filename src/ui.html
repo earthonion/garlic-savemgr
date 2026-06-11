@@ -1058,6 +1058,11 @@ async function renderSettings() {
     const ftp = cfg.ftp || {};
     const gd = cfg.google_drive || {};
     const auto = cfg.auto_backup || {};
+    const targets = cfg.backup_targets || {};
+    const localTarget = targets.local || {};
+    const usbTarget = targets.usb || {};
+    const ftpTarget = targets.ftp || {};
+    const driveTarget = targets.google_drive || {};
     let driveAuth = gd.auth_mode || localStorage.getItem('gdrive_auth_mode') || 'oauth_refresh';
     if (driveAuth === 'oauth_token') driveAuth = 'oauth_refresh';
     const accessToken = gd.access_token || localStorage.getItem('gdrive_access_token') || '';
@@ -1096,6 +1101,20 @@ async function renderSettings() {
       + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx);font-weight:700;margin-top:10px">'
       + '<input id="setAutoQueueDrive" type="checkbox" ' + (auto.queue_for_browser_drive !== false ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> Queue Google Drive backups for browser upload</label>'
       + '<div id="autoStatus" style="font-size:11px;color:var(--dm);margin-top:8px">Auto status loading...</div>'
+      + '</div>'
+      + '<div style="margin-top:14px">'
+      + '<div style="font-size:13px;font-weight:700;color:var(--tx);margin-bottom:8px">Backup Destinations</div>'
+      + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx);font-weight:700;margin-top:10px">'
+      + '<input id="setTargetLocal" type="checkbox" ' + (localTarget.enabled ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> Local PS5 folder</label>'
+      + settingsInput('setTargetLocalPath', 'Local Folder', localTarget.path || '/data/garlic/backups')
+      + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx);font-weight:700;margin-top:10px">'
+      + '<input id="setTargetUsb" type="checkbox" ' + (usbTarget.enabled ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> USB folder</label>'
+      + settingsInput('setTargetUsbPath', 'USB Folder', usbTarget.path || '/mnt/usb0/garlic-backups')
+      + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx);font-weight:700;margin-top:10px">'
+      + '<input id="setTargetFtp" type="checkbox" ' + (ftpTarget.enabled || (!targets.ftp && cfg.provider === 'ftp') ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> FTP</label>'
+      + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx);font-weight:700;margin-top:10px">'
+      + '<input id="setTargetDrive" type="checkbox" ' + (driveTarget.enabled || (!targets.google_drive && cfg.provider === 'google_drive') ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> Google Drive browser upload</label>'
+      + '<div style="font-size:11px;color:var(--dm);margin-top:6px">Manual and auto title backups write one encrypted/restorable ZIP to every enabled destination. Drive uploads are handled by the browser queue.</div>'
       + '</div>'
       + '<div id="driveSettings" style="margin-top:14px">'
       + '<div style="font-size:13px;font-weight:700;color:var(--tx);margin-bottom:8px">Google Drive</div>'
@@ -1192,6 +1211,18 @@ async function saveCloudSettings() {
       pass: $('setFtpPass').value,
       remote_path: $('setFtpPath').value.trim() || '/',
       use_tls: $('setFtpTls').checked
+    },
+    backup_targets: {
+      local: {
+        enabled: $('setTargetLocal').checked,
+        path: $('setTargetLocalPath').value.trim() || '/data/garlic/backups'
+      },
+      usb: {
+        enabled: $('setTargetUsb').checked,
+        path: $('setTargetUsbPath').value.trim() || '/mnt/usb0/garlic-backups'
+      },
+      ftp: { enabled: $('setTargetFtp').checked },
+      google_drive: { enabled: $('setTargetDrive').checked }
     },
     google_drive: {
       mode: $('setDriveMode').value,
@@ -3191,7 +3222,9 @@ async function loadCloudConfigForAction() {
 async function googleDriveBackup(packageUrl, fallbackName, label) {
   const cfg = await loadCloudConfigForAction();
   const gd = cfg.google_drive || {};
-  if (cfg.provider !== 'google_drive' || (gd.mode || 'browser') !== 'browser') return false;
+  const targets = cfg.backup_targets || {};
+  const driveTarget = (targets.google_drive && targets.google_drive.enabled) || cfg.provider === 'google_drive';
+  if (!driveTarget || (gd.mode || 'browser') !== 'browser') return false;
   log('Packaging ' + label + ' for Google Drive...');
   const pr = await fetch(packageUrl);
   const ct = pr.headers.get('Content-Type') || '';
@@ -3206,6 +3239,14 @@ async function googleDriveBackup(packageUrl, fallbackName, label) {
   const result = await uploadBlobToDrive(blob, filename, cfg);
   log('Google Drive upload complete' + (result.id ? ': ' + result.id : ''), 'ok');
   return true;
+}
+
+function hasPs5BackupTargets(cfg) {
+  const targets = cfg.backup_targets || {};
+  return !!((targets.local && targets.local.enabled)
+    || (targets.usb && targets.usb.enabled)
+    || (targets.ftp && targets.ftp.enabled)
+    || (!targets.ftp && cfg.provider === 'ftp'));
 }
 
 let queueDraining = false;
@@ -3289,10 +3330,11 @@ async function cloudBackupSave(idx) {
       mt = false; cf = [];
       bsy = false; renderTB();
     }
+    const cfg = await loadCloudConfigForAction();
     const handled = await googleDriveBackup('/api/cloud/package?idx=' + idx,
       s.title_id + '_' + s.save_name + '_enc.zip',
       s.title_id + '/' + s.save_name);
-    if (handled) return;
+    if (handled && !hasPs5BackupTargets(cfg)) return;
     cloudBusy = true;
     log('Starting cloud backup for ' + s.title_id + '/' + s.save_name + '...');
     const r = await fetch('/api/cloud/upload?idx=' + idx + '&mode=enc');
@@ -3318,10 +3360,11 @@ async function cloudBackupTitle(titleId) {
       mt = false; cf = [];
       bsy = false; renderTB();
     }
+    const cfg = await loadCloudConfigForAction();
     const handled = await googleDriveBackup('/api/cloud/package_title?id=' + encodeURIComponent(titleId),
       titleId + '_all_enc.zip',
       'all saves in ' + titleId);
-    if (handled) return;
+    if (handled && !hasPs5BackupTargets(cfg)) return;
     cloudBusy = true;
     log('Starting cloud backup for all saves in ' + titleId + '...');
     const r = await fetch('/api/cloud/upload_title?id=' + encodeURIComponent(titleId) + '&mode=enc');

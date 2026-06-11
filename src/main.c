@@ -74,6 +74,9 @@
  #define MAX_PATH_LEN    1024
  #define CLOUD_CONFIG_PATH "/data/garlic/cloud.json"
  #define CLOUD_QUEUE_DIR "/data/garlic/cloud_queue"
+ #define BACKUP_TMP_DIR "/data/garlic/tmp"
+ #define BACKUP_DEFAULT_LOCAL_DIR "/data/garlic/backups"
+ #define BACKUP_DEFAULT_USB_DIR "/mnt/usb0/garlic-backups"
  #define CLOUD_MAX_TITLES 64
  
  /* Mutex for state-mutating operations (mount/unmount/scan) */
@@ -283,12 +286,25 @@
  
  typedef struct {
      int enabled;
+     char path[MAX_PATH_LEN];
+ } cloud_file_target_t;
+
+ typedef struct {
+     cloud_file_target_t local;
+     cloud_file_target_t usb;
+     int ftp_enabled;
+     int drive_enabled;
+ } cloud_targets_config_t;
+
+ typedef struct {
+     int enabled;
      char provider[32];
      char watch_titles[CLOUD_MAX_TITLES][32];
      int watch_title_count;
      cloud_ftp_config_t ftp;
      cloud_drive_config_t drive;
      cloud_auto_config_t auto_backup;
+     cloud_targets_config_t targets;
  } cloud_config_t;
  
  typedef struct {
@@ -409,6 +425,27 @@
          json_get_string(json, "access_token", drive->access_token, sizeof(drive->access_token));
  }
  
+ static void cloud_read_backup_targets(const char *json, cloud_config_t *cfg) {
+     const char *targets = json_find_key(json, "backup_targets");
+     if (!targets || *targets != '{') {
+         cfg->targets.ftp_enabled = (strcmp(cfg->provider, "ftp") == 0);
+         cfg->targets.drive_enabled = (strcmp(cfg->provider, "google_drive") == 0);
+         return;
+     }
+     cfg->targets.local.enabled = json_get_object_bool_default(targets, "local", "enabled", cfg->targets.local.enabled);
+     if (json_get_object_string(targets, "local", "path", cfg->targets.local.path, sizeof(cfg->targets.local.path)) != 0 &&
+         json_get_object_string(targets, "local", "folder", cfg->targets.local.path, sizeof(cfg->targets.local.path)) != 0) {
+         /* Keep default local path. */
+     }
+     cfg->targets.usb.enabled = json_get_object_bool_default(targets, "usb", "enabled", cfg->targets.usb.enabled);
+     if (json_get_object_string(targets, "usb", "path", cfg->targets.usb.path, sizeof(cfg->targets.usb.path)) != 0 &&
+         json_get_object_string(targets, "usb", "folder", cfg->targets.usb.path, sizeof(cfg->targets.usb.path)) != 0) {
+         /* Keep default USB path. */
+     }
+     cfg->targets.ftp_enabled = json_get_object_bool_default(targets, "ftp", "enabled", cfg->targets.ftp_enabled);
+     cfg->targets.drive_enabled = json_get_object_bool_default(targets, "google_drive", "enabled", cfg->targets.drive_enabled);
+ }
+
  static int json_get_watch_titles(const char *json, cloud_config_t *cfg) {
      const char *p = json_find_key(json, "watch_titles");
      if (!p || *p != '[') return 0;
@@ -496,6 +533,8 @@
      cfg->auto_backup.poll_seconds = 5;
      cfg->auto_backup.settle_seconds = 15;
      cfg->auto_backup.queue_for_browser_drive = 1;
+    snprintf(cfg->targets.local.path, sizeof(cfg->targets.local.path), BACKUP_DEFAULT_LOCAL_DIR);
+    snprintf(cfg->targets.usb.path, sizeof(cfg->targets.usb.path), BACKUP_DEFAULT_USB_DIR);
  
      char *json = NULL;
      int rr = read_file_limited(CLOUD_CONFIG_PATH, &json, 64 * 1024);
@@ -506,9 +545,12 @@
  
      cfg->enabled = json_get_bool_default(json, "enabled", 0);
      json_get_string(json, "provider", cfg->provider, sizeof(cfg->provider));
+     cfg->targets.ftp_enabled = (strcmp(cfg->provider, "ftp") == 0);
+     cfg->targets.drive_enabled = (strcmp(cfg->provider, "google_drive") == 0);
      json_get_watch_titles(json, cfg);
      cloud_read_ftp_fields(json, &cfg->ftp);
      cloud_read_drive_fields(json, &cfg->drive);
+     cloud_read_backup_targets(json, cfg);
      json_get_object_string(json, "service_account", "type", cfg->drive.service_account.type, sizeof(cfg->drive.service_account.type));
      json_get_object_string(json, "service_account", "project_id", cfg->drive.service_account.project_id, sizeof(cfg->drive.service_account.project_id));
      json_get_object_string(json, "service_account", "private_key_id", cfg->drive.service_account.private_key_id, sizeof(cfg->drive.service_account.private_key_id));
@@ -533,7 +575,7 @@
      if (!cfg->enabled) return 0;
      if (strcmp(cfg->provider, "google_drive") != 0)
          snprintf(cfg->provider, sizeof(cfg->provider), "ftp");
-     if (strcmp(cfg->provider, "ftp") == 0) {
+     if (cfg->targets.ftp_enabled) {
          if (cfg->ftp.use_tls) {
              snprintf(err, err_sz, "FTP TLS is not supported in Phase 1");
              return -2;
@@ -546,12 +588,17 @@
              snprintf(err, err_sz, "Invalid FTP port");
              return -4;
          }
-     } else {
+     }
+     if (cfg->targets.drive_enabled || strcmp(cfg->provider, "google_drive") == 0) {
          if (strcmp(cfg->drive.mode, "direct") != 0)
              snprintf(cfg->drive.mode, sizeof(cfg->drive.mode), "browser");
      }
      if (!cfg->ftp.remote_path[0])
          snprintf(cfg->ftp.remote_path, sizeof(cfg->ftp.remote_path), "/");
+     if (!cfg->targets.local.path[0])
+        snprintf(cfg->targets.local.path, sizeof(cfg->targets.local.path), BACKUP_DEFAULT_LOCAL_DIR);
+     if (!cfg->targets.usb.path[0])
+        snprintf(cfg->targets.usb.path, sizeof(cfg->targets.usb.path), BACKUP_DEFAULT_USB_DIR);
      if (cfg->auto_backup.poll_seconds < 2) cfg->auto_backup.poll_seconds = 2;
      if (cfg->auto_backup.settle_seconds < 3) cfg->auto_backup.settle_seconds = 3;
      return 0;
@@ -567,6 +614,7 @@
  static int cloud_config_to_json(const cloud_config_t *cfg, char *out, size_t out_sz, int redact) {
      char provider[64], ftp_host[512], ftp_user[256], ftp_pass[256], ftp_path[1024];
      char drive_mode[64], auth_mode[64], folder_id[512], client_id[512], client_secret[512], refresh_token[1024], access_token[4096];
+     char local_path[2048], usb_path[2048];
      char sa_type[80], sa_project[256], sa_key_id[256], sa_key[8192], sa_email[512], sa_client_id[512];
      char sa_auth_uri[512], sa_token_uri[512], sa_auth_cert[512], sa_client_cert[1024], sa_universe[256];
      json_escape(cfg->provider, provider, sizeof(provider));
@@ -584,6 +632,8 @@
                  refresh_token, sizeof(refresh_token));
      json_escape(redact && cfg->drive.access_token[0] ? "********" : cfg->drive.access_token,
                  access_token, sizeof(access_token));
+     json_escape(cfg->targets.local.path, local_path, sizeof(local_path));
+     json_escape(cfg->targets.usb.path, usb_path, sizeof(usb_path));
      json_escape(cfg->drive.service_account.type, sa_type, sizeof(sa_type));
      json_escape(cfg->drive.service_account.project_id, sa_project, sizeof(sa_project));
      json_escape(cfg->drive.service_account.private_key_id, sa_key_id, sizeof(sa_key_id));
@@ -626,6 +676,12 @@
          "    \"settle_seconds\": %d,\n"
          "    \"queue_for_browser_drive\": %s\n"
          "  },\n"
+         "  \"backup_targets\": {\n"
+         "    \"local\": { \"enabled\": %s, \"path\": \"%s\" },\n"
+         "    \"usb\": { \"enabled\": %s, \"path\": \"%s\" },\n"
+         "    \"ftp\": { \"enabled\": %s },\n"
+         "    \"google_drive\": { \"enabled\": %s }\n"
+         "  },\n"
          "  \"google_drive\": {\n"
          "    \"mode\": \"%s\",\n"
          "    \"auth_mode\": \"%s\",\n"
@@ -656,6 +712,10 @@
          cfg->auto_backup.poll_seconds,
          cfg->auto_backup.settle_seconds,
          cfg->auto_backup.queue_for_browser_drive ? "true" : "false",
+         cfg->targets.local.enabled ? "true" : "false", local_path,
+         cfg->targets.usb.enabled ? "true" : "false", usb_path,
+         cfg->targets.ftp_enabled ? "true" : "false",
+         cfg->targets.drive_enabled ? "true" : "false",
          drive_mode, auth_mode, folder_id, client_id, client_secret, refresh_token, access_token,
          sa_type, sa_project, sa_key_id, sa_key, sa_email, sa_client_id,
          sa_auth_uri, sa_token_uri, sa_auth_cert, sa_client_cert, sa_universe);
@@ -689,12 +749,17 @@
      cfg->auto_backup.poll_seconds = 5;
      cfg->auto_backup.settle_seconds = 15;
      cfg->auto_backup.queue_for_browser_drive = 1;
+    snprintf(cfg->targets.local.path, sizeof(cfg->targets.local.path), BACKUP_DEFAULT_LOCAL_DIR);
+    snprintf(cfg->targets.usb.path, sizeof(cfg->targets.usb.path), BACKUP_DEFAULT_USB_DIR);
  
      cfg->enabled = json_get_bool_default(json, "enabled", 0);
      json_get_string(json, "provider", cfg->provider, sizeof(cfg->provider));
+     cfg->targets.ftp_enabled = (strcmp(cfg->provider, "ftp") == 0);
+     cfg->targets.drive_enabled = (strcmp(cfg->provider, "google_drive") == 0);
      json_get_watch_titles(json, cfg);
      cloud_read_ftp_fields(json, &cfg->ftp);
      cloud_read_drive_fields(json, &cfg->drive);
+     cloud_read_backup_targets(json, cfg);
      json_get_object_string(json, "service_account", "type", cfg->drive.service_account.type, sizeof(cfg->drive.service_account.type));
      json_get_object_string(json, "service_account", "project_id", cfg->drive.service_account.project_id, sizeof(cfg->drive.service_account.project_id));
      json_get_object_string(json, "service_account", "private_key_id", cfg->drive.service_account.private_key_id, sizeof(cfg->drive.service_account.private_key_id));
@@ -719,12 +784,16 @@
          snprintf(cfg->provider, sizeof(cfg->provider), "ftp");
      if (strcmp(cfg->drive.mode, "direct") != 0)
          snprintf(cfg->drive.mode, sizeof(cfg->drive.mode), "browser");
-     if (cfg->ftp.port <= 0 || cfg->ftp.port > 65535) {
+     if (cfg->targets.ftp_enabled && (cfg->ftp.port <= 0 || cfg->ftp.port > 65535)) {
          snprintf(err, err_sz, "Invalid FTP port");
          return -1;
      }
      if (!cfg->ftp.remote_path[0])
          snprintf(cfg->ftp.remote_path, sizeof(cfg->ftp.remote_path), "/");
+     if (!cfg->targets.local.path[0])
+        snprintf(cfg->targets.local.path, sizeof(cfg->targets.local.path), BACKUP_DEFAULT_LOCAL_DIR);
+     if (!cfg->targets.usb.path[0])
+        snprintf(cfg->targets.usb.path, sizeof(cfg->targets.usb.path), BACKUP_DEFAULT_USB_DIR);
      if (cfg->auto_backup.poll_seconds < 2) cfg->auto_backup.poll_seconds = 2;
      if (cfg->auto_backup.settle_seconds < 3) cfg->auto_backup.settle_seconds = 3;
      return 0;
@@ -771,6 +840,16 @@
      pthread_mutex_unlock(&g_cloud_mtx);
  }
  
+static void cloud_set_step(int progress, const char *active, const char *remote) {
+    pthread_mutex_lock(&g_cloud_mtx);
+    g_cloud_state.progress = progress;
+    if (active && active[0])
+        snprintf(g_cloud_state.active, sizeof(g_cloud_state.active), "%s", active);
+    if (remote && remote[0])
+        snprintf(g_cloud_state.last_remote, sizeof(g_cloud_state.last_remote), "%s", remote);
+    pthread_mutex_unlock(&g_cloud_mtx);
+}
+
  static void cloud_set_done(int ok, const char *message, const char *remote) {
      pthread_mutex_lock(&g_cloud_mtx);
      g_cloud_state.running = 0;
@@ -2293,15 +2372,23 @@
  
  typedef struct {
      int is_title;
+     int auto_job;
      save_entry_t save;
      char title_id[32];
  } cloud_job_args_t;
  
  static int cloud_start_job(cloud_job_args_t *job, char *err, size_t err_sz);
  
- static int ftp_data_zip_write(void *ctx, const void *buf, size_t len) {
-     int data_sock = *(int *)ctx;
-     return send_all_fd(data_sock, buf, len);
+ static int file_zip_write(void *ctx, const void *buf, size_t len) {
+     int fd = *(int *)ctx;
+     const char *p = (const char *)buf;
+     size_t off = 0;
+     while (off < len) {
+         ssize_t wr = write(fd, p + off, len - off);
+         if (wr <= 0) return -1;
+         off += (size_t)wr;
+     }
+     return 0;
  }
  
  static void cloud_timestamp(char *out, size_t out_sz) {
@@ -2324,42 +2411,145 @@
      snprintf(out, out_sz, "%s/%s/%s", base, title_id, uid);
  }
  
- static int cloud_upload_zip_files(const cloud_config_t *cfg, const char *remote_dir,
-                                   const char *remote_name, const zip_file_t *files,
-                                   int nfiles, char *iobuf, char *err, size_t err_sz) {
-     ftp_client_t ftp;
-     if (ftp_connect_login(&ftp, &cfg->ftp, err, err_sz) < 0) return -1;
-     if (ftp_cwd_mkdirs(&ftp, remote_dir, err, err_sz) < 0) {
-         ftp_close(&ftp);
-         return -1;
-     }
- 
-     int data_sock = ftp_begin_stor(&ftp, remote_name, err, err_sz);
-     if (data_sock < 0) {
-         ftp_close(&ftp);
-         return -1;
-     }
- 
-     zip_sink_t sink;
-     sink.write = ftp_data_zip_write;
-     sink.ctx = &data_sock;
-     sink.bytes = 0;
-     int zr = zip_write_files(&sink, files, nfiles, iobuf);
-     if (zr < 0) {
-         snprintf(err, err_sz, "Failed while streaming ZIP to FTP");
-         close(data_sock);
-         ftp_close(&ftp);
-         return -1;
-     }
- 
-     if (ftp_finish_stor(&ftp, data_sock, err, err_sz) < 0) {
-         ftp_close(&ftp);
-         return -1;
-     }
-     ftp_close(&ftp);
-     return 0;
+ static void cloud_backup_file_dir(const char *base_path, const char *title_id,
+                                   const char *user_id, char *out, size_t out_sz) {
+     const char *uid = (user_id && user_id[0]) ? user_id : "all";
+     char base[MAX_PATH_LEN];
+    snprintf(base, sizeof(base), "%s", base_path && base_path[0] ? base_path : BACKUP_DEFAULT_LOCAL_DIR);
+     size_t len = strlen(base);
+     while (len > 1 && base[len - 1] == '/') base[--len] = 0;
+     snprintf(out, out_sz, "%s/%s/%s", base, title_id, uid);
  }
  
+static int cloud_stage_zip_file(const char *filename, const zip_file_t *files, int nfiles,
+                                char *iobuf, char *out_path, size_t out_path_sz,
+                                char *err, size_t err_sz) {
+    mkdir("/data", 0777);
+    mkdir("/data/garlic", 0777);
+    mkdir(BACKUP_TMP_DIR, 0777);
+    char final_path[MAX_PATH_LEN], tmp_path[MAX_PATH_LEN];
+    snprintf(final_path, sizeof(final_path), "%s/%s", BACKUP_TMP_DIR, filename);
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", final_path);
+
+    int fd = open(tmp_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    if (fd < 0) {
+        snprintf(err, err_sz, "Cannot create staging ZIP: %s", tmp_path);
+        return -1;
+    }
+
+    zip_sink_t sink;
+    sink.write = file_zip_write;
+    sink.ctx = &fd;
+    sink.bytes = 0;
+    int zr = zip_write_files(&sink, files, nfiles, iobuf);
+    if (zr < 0) {
+        close(fd);
+        unlink(tmp_path);
+        snprintf(err, err_sz, "Failed while writing staging ZIP");
+        return -1;
+    }
+    fsync(fd);
+    close(fd);
+    if (rename(tmp_path, final_path) < 0) {
+        unlink(tmp_path);
+        snprintf(err, err_sz, "Failed to finalize staging ZIP");
+        return -1;
+    }
+    snprintf(out_path, out_path_sz, "%s", final_path);
+    return 0;
+}
+
+static int cloud_copy_file_atomic(const char *src, const char *dst, char *err, size_t err_sz) {
+    char tmp[MAX_PATH_LEN];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", dst);
+    if (copy_file(src, tmp) < 0) {
+        unlink(tmp);
+        snprintf(err, err_sz, "Failed to copy backup file");
+        return -1;
+    }
+    if (rename(tmp, dst) < 0) {
+        unlink(tmp);
+        snprintf(err, err_sz, "Failed to finalize backup file");
+        return -1;
+    }
+    return 0;
+}
+
+static int cloud_copy_staged_zip_target(const char *stage_path, const char *base_path,
+                                        const char *title_id, const char *user_id,
+                                        const char *filename, char *out_path, size_t out_path_sz,
+                                        char *err, size_t err_sz) {
+    if (!base_path || !base_path[0]) {
+        snprintf(err, err_sz, "Backup folder is not configured");
+        return -1;
+    }
+    char dir[MAX_PATH_LEN];
+    cloud_backup_file_dir(base_path, title_id, user_id, dir, sizeof(dir));
+    recursive_mkdir(dir);
+    char final_path[MAX_PATH_LEN];
+    snprintf(final_path, sizeof(final_path), "%s/%s", dir, filename);
+    if (cloud_copy_file_atomic(stage_path, final_path, err, err_sz) < 0) return -1;
+    if (out_path && out_path_sz)
+        snprintf(out_path, out_path_sz, "%s", final_path);
+    return 0;
+}
+
+static int cloud_queue_staged_zip(const char *stage_path, const char *filename,
+                                  char *err, size_t err_sz) {
+    mkdir("/data", 0777);
+    mkdir("/data/garlic", 0777);
+    mkdir(CLOUD_QUEUE_DIR, 0777);
+    char path[MAX_PATH_LEN];
+    snprintf(path, sizeof(path), "%s/%s", CLOUD_QUEUE_DIR, filename);
+    return cloud_copy_file_atomic(stage_path, path, err, err_sz);
+}
+
+static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_dir,
+                                 const char *remote_name, const char *stage_path,
+                                 char *iobuf, char *err, size_t err_sz) {
+    ftp_client_t ftp;
+    if (ftp_connect_login(&ftp, &cfg->ftp, err, err_sz) < 0) return -1;
+    if (ftp_cwd_mkdirs(&ftp, remote_dir, err, err_sz) < 0) {
+        ftp_close(&ftp);
+        return -1;
+    }
+    int data_sock = ftp_begin_stor(&ftp, remote_name, err, err_sz);
+    if (data_sock < 0) {
+        ftp_close(&ftp);
+        return -1;
+    }
+    int fd = open(stage_path, O_RDONLY);
+    if (fd < 0) {
+        close(data_sock);
+        ftp_close(&ftp);
+        snprintf(err, err_sz, "Cannot read staging ZIP");
+        return -1;
+    }
+    ssize_t nr;
+    while ((nr = read(fd, iobuf, BUF_SIZE)) > 0) {
+        if (send_all_fd(data_sock, iobuf, (size_t)nr) < 0) {
+            close(fd);
+            close(data_sock);
+            ftp_close(&ftp);
+            snprintf(err, err_sz, "Failed while streaming staged ZIP to FTP");
+            return -1;
+        }
+    }
+    close(fd);
+    if (nr < 0) {
+        close(data_sock);
+        ftp_close(&ftp);
+        snprintf(err, err_sz, "Failed to read staging ZIP");
+        return -1;
+    }
+    if (ftp_finish_stor(&ftp, data_sock, err, err_sz) < 0) {
+        ftp_close(&ftp);
+        return -1;
+    }
+    ftp_close(&ftp);
+    return 0;
+}
+
  static int cloud_build_single_files(const save_entry_t *s, zip_file_t *files,
                                      char names[][512], char *bin_path,
                                      int *nfiles) {
@@ -2618,65 +2808,26 @@
      return count;
  }
  
- static int cloud_queue_title_locked(const char *title_id, char *err, size_t err_sz) {
-     mkdir("/data", 0777);
-     mkdir("/data/garlic", 0777);
-     mkdir(CLOUD_QUEUE_DIR, 0777);
-     char *iobuf = malloc(BUF_SIZE);
-     if (!iobuf) { snprintf(err, err_sz, "Out of memory"); return -1; }
-     mem_buf_t pkg;
-     char filename[256];
-     int ret = cloud_package_title(title_id, iobuf, &pkg, filename, sizeof(filename), err, err_sz);
-     free(iobuf);
-     if (ret < 0) return -1;
-     char path[MAX_PATH_LEN];
-     snprintf(path, sizeof(path), "%s/%s", CLOUD_QUEUE_DIR, filename);
-     int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
-     if (fd < 0) {
-         free(pkg.data);
-         snprintf(err, err_sz, "Cannot create queue file");
-         return -1;
-     }
-     size_t off = 0;
-     while (off < pkg.len) {
-         ssize_t wr = write(fd, pkg.data + off, pkg.len - off);
-         if (wr <= 0) { close(fd); free(pkg.data); snprintf(err, err_sz, "Queue write failed"); return -1; }
-         off += wr;
-     }
-     close(fd);
-     free(pkg.data);
-     return 0;
- }
- 
  static int auto_trigger_title(const char *title_id, const cloud_config_t *cfg) {
      char err[256] = {0};
      if (!cloud_title_is_watched(cfg, title_id)) return 0;
-     if (strcmp(cfg->provider, "ftp") == 0) {
+     if (cfg->targets.local.enabled || cfg->targets.usb.enabled || cfg->targets.ftp_enabled ||
+         (cfg->targets.drive_enabled && cfg->auto_backup.queue_for_browser_drive &&
+          strcmp(cfg->drive.mode, "browser") == 0)) {
          cloud_job_args_t *job = calloc(1, sizeof(*job));
          if (!job) { auto_set_result(title_id, "Auto backup failed: out of memory"); return -1; }
          job->is_title = 1;
+         job->auto_job = 1;
          snprintf(job->title_id, sizeof(job->title_id), "%s", title_id);
          if (cloud_start_job(job, err, sizeof(err)) < 0) {
              free(job);
-             auto_set_result(title_id, "Auto FTP backup failed: %s", err);
+             auto_set_result(title_id, "Auto backup failed: %s", err);
              return -1;
          }
-         auto_set_result(title_id, "Auto FTP backup started");
+         auto_set_result(title_id, "Auto backup started");
          return 0;
      }
-     if (strcmp(cfg->provider, "google_drive") == 0 && cfg->auto_backup.queue_for_browser_drive) {
-         pthread_mutex_lock(&g_mtx);
-         scan_saves();
-         int ret = cloud_queue_title_locked(title_id, err, sizeof(err));
-         pthread_mutex_unlock(&g_mtx);
-         if (ret < 0) {
-             auto_set_result(title_id, "Auto Drive queue failed: %s", err);
-             return -1;
-         }
-         auto_set_result(title_id, "Queued Google Drive backup");
-         return 0;
-     }
-     auto_set_result(title_id, "Auto backup skipped for provider %s", cfg->provider);
+     auto_set_result(title_id, "Auto backup skipped: no enabled backup targets");
      return 0;
  }
  
@@ -2793,16 +2944,6 @@
          free(job);
          return NULL;
      }
-     if (strcmp(cfg.provider, "google_drive") == 0) {
-         if (strcmp(cfg.drive.mode, "browser") == 0) {
-             cloud_set_done(0, "Google Drive browser mode uploads from the web UI; use Settings and Cloud Backup again", NULL);
-         } else {
-             cloud_set_done(0, "Direct Google Drive needs HTTPS/TLS support not available in this payload build", NULL);
-         }
-         free(job);
-         return NULL;
-     }
- 
      char *iobuf = malloc(BUF_SIZE);
      if (!iobuf) {
          cloud_set_done(0, "Out of memory", NULL);
@@ -2896,9 +3037,136 @@
          mtx_locked = 0;
      }
  
-     if (upload_files && upload_nfiles > 0 && !err[0])
-         ret = cloud_upload_zip_files(&cfg, remote_dir, remote_name, upload_files, upload_nfiles,
-                                      iobuf, err, sizeof(err));
+    int final_success_count = 0, final_target_count = 0;
+    if (upload_files && upload_nfiles > 0 && !err[0]) {
+        int success_count = 0, fail_count = 0, target_done = 0;
+        int target_total = 0;
+        char target_path[MAX_PATH_LEN] = {0};
+        char stage_path[MAX_PATH_LEN] = {0};
+        char all_paths[1024] = {0};
+        char target_err[256] = {0};
+        char step_msg[128] = {0};
+        const char *target_title = job->is_title ? job->title_id : job->save.title_id;
+        const char *target_user = job->is_title ? "all" : job->save.user_id;
+        int drive_queue_enabled = job->auto_job && cfg.targets.drive_enabled &&
+                                  cfg.auto_backup.queue_for_browser_drive &&
+                                  job->is_title && strcmp(cfg.drive.mode, "browser") == 0;
+
+        if (cfg.targets.local.enabled) target_total++;
+        if (cfg.targets.usb.enabled) target_total++;
+        if (cfg.targets.ftp_enabled) target_total++;
+        if (drive_queue_enabled) target_total++;
+        final_target_count = target_total;
+
+        if (target_total <= 0) {
+            snprintf(err, sizeof(err), "No backup targets are enabled");
+            ret = -1;
+        } else {
+            cloud_set_step(30, "Packaging backup ZIP", remote_full);
+            if (cloud_stage_zip_file(remote_name, upload_files, upload_nfiles, iobuf,
+                                     stage_path, sizeof(stage_path), err, sizeof(err)) < 0) {
+                ret = -1;
+            }
+        }
+
+        if (stage_path[0] && cfg.targets.local.enabled) {
+            target_err[0] = 0;
+            target_done++;
+            int ok = cloud_copy_staged_zip_target(stage_path, cfg.targets.local.path,
+                                                  target_title, target_user, remote_name,
+                                                  target_path, sizeof(target_path),
+                                                  target_err, sizeof(target_err)) == 0;
+            if (ok) {
+                success_count++;
+                snprintf(all_paths + strlen(all_paths), sizeof(all_paths) - strlen(all_paths),
+                         "%slocal:%s", all_paths[0] ? "; " : "", target_path);
+            } else {
+                fail_count++;
+                snprintf(err + strlen(err), sizeof(err) - strlen(err), "%slocal: %s",
+                         err[0] ? "; " : "", target_err);
+            }
+            snprintf(step_msg, sizeof(step_msg), "Local backup %s (%d/%d)",
+                     ok ? "done" : "failed", target_done, target_total);
+            cloud_set_step(35 + (target_done * 60 / target_total), step_msg,
+                           ok ? target_path : remote_full);
+            notify("Garlic SaveMgr: %s", step_msg);
+        }
+
+        if (stage_path[0] && cfg.targets.usb.enabled) {
+            target_err[0] = 0;
+            target_done++;
+            int ok = cloud_copy_staged_zip_target(stage_path, cfg.targets.usb.path,
+                                                  target_title, target_user, remote_name,
+                                                  target_path, sizeof(target_path),
+                                                  target_err, sizeof(target_err)) == 0;
+            if (ok) {
+                success_count++;
+                snprintf(all_paths + strlen(all_paths), sizeof(all_paths) - strlen(all_paths),
+                         "%susb:%s", all_paths[0] ? "; " : "", target_path);
+            } else {
+                fail_count++;
+                snprintf(err + strlen(err), sizeof(err) - strlen(err), "%susb: %s",
+                         err[0] ? "; " : "", target_err);
+            }
+            snprintf(step_msg, sizeof(step_msg), "USB backup %s (%d/%d)",
+                     ok ? "done" : "failed", target_done, target_total);
+            cloud_set_step(35 + (target_done * 60 / target_total), step_msg,
+                           ok ? target_path : remote_full);
+            notify("Garlic SaveMgr: %s", step_msg);
+        }
+
+        if (stage_path[0] && cfg.targets.ftp_enabled) {
+            target_err[0] = 0;
+            target_done++;
+            int ok = cloud_upload_zip_file(&cfg, remote_dir, remote_name, stage_path,
+                                           iobuf, target_err, sizeof(target_err)) == 0;
+            if (ok) {
+                success_count++;
+                snprintf(all_paths + strlen(all_paths), sizeof(all_paths) - strlen(all_paths),
+                         "%sftp:%s", all_paths[0] ? "; " : "", remote_full);
+            } else {
+                fail_count++;
+                snprintf(err + strlen(err), sizeof(err) - strlen(err), "%sftp: %s",
+                         err[0] ? "; " : "", target_err);
+            }
+            snprintf(step_msg, sizeof(step_msg), "FTP backup %s (%d/%d)",
+                     ok ? "done" : "failed", target_done, target_total);
+            cloud_set_step(35 + (target_done * 60 / target_total), step_msg, remote_full);
+            notify("Garlic SaveMgr: %s", step_msg);
+        }
+
+        if (stage_path[0] && drive_queue_enabled) {
+            target_err[0] = 0;
+            target_done++;
+            int ok = cloud_queue_staged_zip(stage_path, remote_name, target_err, sizeof(target_err)) == 0;
+            if (ok) {
+                success_count++;
+                snprintf(all_paths + strlen(all_paths), sizeof(all_paths) - strlen(all_paths),
+                         "%sdrive_queue:%s", all_paths[0] ? "; " : "", remote_name);
+            } else {
+                fail_count++;
+                snprintf(err + strlen(err), sizeof(err) - strlen(err), "%sdrive_queue: %s",
+                         err[0] ? "; " : "", target_err);
+            }
+            snprintf(step_msg, sizeof(step_msg), "Drive queue %s (%d/%d)",
+                     ok ? "done" : "failed", target_done, target_total);
+            cloud_set_step(35 + (target_done * 60 / target_total), step_msg, remote_name);
+            notify("Garlic SaveMgr: %s", step_msg);
+        }
+
+        final_success_count = success_count;
+        if (success_count > 0) {
+            ret = 0;
+            snprintf(remote_full, sizeof(remote_full), "%d/%d targets complete: %s",
+                     success_count, target_total, all_paths);
+            if (fail_count > 0)
+                logprintf("[GarlicMgr] Cloud backup partial failures: %s\n", err);
+        } else if (target_total > 0) {
+            ret = -1;
+            if (!err[0]) snprintf(err, sizeof(err), "All backup targets failed");
+        }
+        if (stage_path[0]) unlink(stage_path);
+    }
  
      if (path_copies) {
          for (int i = 0; i < path_copy_count; i++) free(path_copies[i]);
@@ -2910,11 +3178,17 @@
  
      if (ret == 0) {
          logprintf("[GarlicMgr] Cloud upload complete: %s\n", remote_full);
-         notify("Garlic SaveMgr: cloud backup complete");
+        if (final_target_count > 0)
+            notify("Garlic SaveMgr: backup %d/%d done", final_success_count, final_target_count);
+        else
+            notify("Garlic SaveMgr: cloud backup complete");
          cloud_set_done(1, NULL, remote_full);
      } else {
          logprintf("[GarlicMgr] Cloud upload failed: %s\n", err);
-         notify("Garlic SaveMgr: cloud backup failed");
+        if (final_target_count > 0)
+            notify("Garlic SaveMgr: backup %d/%d done", final_success_count, final_target_count);
+        else
+            notify("Garlic SaveMgr: cloud backup failed");
          cloud_set_done(0, err[0] ? err : "Cloud upload failed", remote_full);
      }
      free(job);
@@ -3278,8 +3552,8 @@
          http_json(sock, "{\"ok\":false,\"stage\":\"config\",\"error\":\"Cloud backup is disabled\"}");
          return;
      }
-     if (strcmp(cfg.provider, "ftp") != 0) {
-         http_json(sock, "{\"ok\":false,\"stage\":\"config\",\"error\":\"Provider is not FTP\"}");
+     if (!cfg.targets.ftp_enabled) {
+         http_json(sock, "{\"ok\":false,\"stage\":\"config\",\"error\":\"FTP backup target is not enabled\"}");
          return;
      }
  
