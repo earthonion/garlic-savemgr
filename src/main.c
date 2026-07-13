@@ -2079,7 +2079,7 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      }
  
      uint32_t total = data_off + dpos;
-     int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+     int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0777);
      if (fd < 0) return -1;
      write(fd, buf, total);
      close(fd);
@@ -3271,7 +3271,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              while ((slash = strchr(slash + 1, '/')) != NULL) {
                  *slash = 0; mkdir(filepath, 0777); *slash = '/';
              }
-             int fd = open(filepath, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+             int fd = open(filepath, O_CREAT | O_WRONLY | O_TRUNC, 0777);
              if (fd >= 0) {
                  size_t to_write = uncomp_size;
                  if (off + to_write > len) to_write = len - off;
@@ -4253,7 +4253,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
  
          char filepath[MAX_PATH_LEN];
          snprintf(filepath, sizeof(filepath), "%s/%s", g_mount_point, fname);
-         int fd = open(filepath, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+         int fd = open(filepath, O_CREAT | O_WRONLY | O_TRUNC, 0777);
          if (fd < 0) { free(dec); http_json(sock, "{\"error\":\"Cannot write file\"}"); return; }
          write(fd, dec, dec_len);
          close(fd);
@@ -5080,7 +5080,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          if (!g_mounted) { http_json(sock, "{\"error\":\"No save mounted\"}"); return; }
          char filepath[MAX_PATH_LEN];
          snprintf(filepath, sizeof(filepath), "%s/%s", g_mount_point, g_ed_name);
-         int fd = open(filepath, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+         int fd = open(filepath, O_CREAT | O_WRONLY | O_TRUNC, 0777);
          if (fd < 0) { http_json(sock, "{\"error\":\"Cannot write file\"}"); return; }
          ssize_t written = 0;
          while ((size_t)written < g_ed_size) {
@@ -5780,7 +5780,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              *slash = 0; mkdir(filepath, 0777); *slash = '/'; slash++;
          }
  
-         int fd = open(filepath, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+         int fd = open(filepath, O_CREAT | O_WRONLY | O_TRUNC, 0777);
          if (fd < 0) {
              char json[256];
              snprintf(json, sizeof(json), "{\"error\":\"Cannot create %s\"}", fname);
@@ -8006,6 +8006,12 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
  
  /* ── Main ───────────────────────────────────────────────────────── */
  int main(void) {
+     /* Zero the umask so open(..., 0777) really lands at 0777. Files inside
+      * a mounted PFS need world-write to pass the game's save-verify at load;
+      * default umask 022 quietly strips those bits — see garlic-worker
+      * v1.1.6 for the equivalent bug in the worker. */
+     umask(0);
+
      sceUserServiceInitialize(0);
      kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
      signal(SIGPIPE, SIG_IGN);
