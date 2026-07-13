@@ -1409,11 +1409,17 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
  }
  
  /* ── Copy file helper ───────────────────────────────────────────── */
+ /* dst lands at 0777 so files copied into a mounted PFS pass the game's
+  * 0777 verification at save load. 0755 (or 0775 with default umask 022)
+  * mounts + PPR-authenticates cleanly but the game flags the save as
+  * corrupted — see garlic-worker v1.1.6. fchmod after open is defensive
+  * against a future umask that would clear world-write bits. */
  static int copy_file(const char *src, const char *dst) {
      int sfd = open(src, O_RDONLY);
      if (sfd < 0) return -1;
-     int dfd = open(dst, O_CREAT | O_WRONLY | O_TRUNC, 0755);
+     int dfd = open(dst, O_CREAT | O_WRONLY | O_TRUNC, 0777);
      if (dfd < 0) { close(sfd); return -2; }
+     fchmod(dfd, 0777);
      char *buf = malloc(BUF_SIZE);
      if (!buf) { close(sfd); close(dfd); return -3; }
      ssize_t n;
