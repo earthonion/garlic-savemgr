@@ -491,28 +491,28 @@
 <nav>
   <span class="logo">GARLICMGR</span>
   <div class="user-sel" id="usersel">
-    <button class="user-btn" onclick="toggleUserDD()"><span id="curuser">Loading...</span> <span class="arrow">&#9662;</span></button>
+    <button class="user-btn" onclick="toggleUserDD()"><span id="curuser" data-i18n="common.loading">Loading...</span> <span class="arrow">&#9662;</span></button>
     <div class="user-dd" id="userdd"></div>
   </div>
-  <button class="tab active" onclick="switchTab('browse')">Browse</button>
-  <button class="tab" onclick="switchTab('decrypt')">Decrypt</button>
-  <button class="tab" onclick="switchTab('encrypt')">Encrypt</button>
-  <button class="tab" onclick="switchTab('resign')">Resign</button>
-  <button class="tab" onclick="switchTab('import')">Import</button>
-  <button class="tab" onclick="switchTab('settings')">Settings</button>
+  <button class="tab active" data-tab="browse" data-i18n="nav.browse" onclick="switchTab('browse')">Browse</button>
+  <button class="tab" data-tab="decrypt" data-i18n="nav.decrypt" onclick="switchTab('decrypt')">Decrypt</button>
+  <button class="tab" data-tab="encrypt" data-i18n="nav.encrypt" onclick="switchTab('encrypt')">Encrypt</button>
+  <button class="tab" data-tab="resign" data-i18n="nav.resign" onclick="switchTab('resign')">Resign</button>
+  <button class="tab" data-tab="import" data-i18n="nav.import" onclick="switchTab('import')">Import</button>
+  <button class="tab" data-tab="settings" data-i18n="nav.settings" onclick="switchTab('settings')">Settings</button>
   <span class="spacer"></span>
-  <button class="shut" onclick="shutdown()">Kill GarlicMgr</button>
+  <button class="shut" data-i18n="nav.kill" onclick="shutdown()">Kill GarlicMgr</button>
   <span style="font-size:10px;color:#ffeb3b;margin-left:4px">__VERSION__</span>
   <button class="hamburger" onclick="toggleMenu()">&#9776;</button>
 </nav>
 <div class="mob-menu" id="mobmenu">
-  <button class="tab active" onclick="switchTab('browse')">Browse</button>
-  <button class="tab" onclick="switchTab('decrypt')">Decrypt</button>
-  <button class="tab" onclick="switchTab('encrypt')">Encrypt</button>
-  <button class="tab" onclick="switchTab('resign')">Resign</button>
-  <button class="tab" onclick="switchTab('import')">Import</button>
-  <button class="tab" onclick="switchTab('settings')">Settings</button>
-  <button class="shut" onclick="shutdown()">Kill GarlicMgr</button>
+  <button class="tab active" data-tab="browse" data-i18n="nav.browse" onclick="switchTab('browse')">Browse</button>
+  <button class="tab" data-tab="decrypt" data-i18n="nav.decrypt" onclick="switchTab('decrypt')">Decrypt</button>
+  <button class="tab" data-tab="encrypt" data-i18n="nav.encrypt" onclick="switchTab('encrypt')">Encrypt</button>
+  <button class="tab" data-tab="resign" data-i18n="nav.resign" onclick="switchTab('resign')">Resign</button>
+  <button class="tab" data-tab="import" data-i18n="nav.import" onclick="switchTab('import')">Import</button>
+  <button class="tab" data-tab="settings" data-i18n="nav.settings" onclick="switchTab('settings')">Settings</button>
+  <button class="shut" data-i18n="nav.kill" onclick="shutdown()">Kill GarlicMgr</button>
   <span style="font-size:10px;color:#ffeb3b">__VERSION__</span>
 </div>
 
@@ -520,19 +520,19 @@
 <div class="main" id="mn">
   <div class="left" id="drawer">
     <div class="shdr desk-shdr">
-      <span style="margin-right:auto">Saves</span>
+      <span style="margin-right:auto" data-i18n="layout.saves">Saves</span>
       <button class="ptab active" id="ptab5" onclick="setPlatform('ps5')">PS5</button>
       <button class="ptab" id="ptab4" onclick="setPlatform('ps4')">PS4</button>
     </div>
     <div class="bulk-bar" id="bulkBar">
-      <label class="bulk-all"><input type="checkbox" id="bulkSelectAll" onchange="onBulkSelectAll(this.checked)"> All</label>
-      <span class="bulk-count" id="bulkCount">0 titles</span>
-      <button class="bulk-btn" onclick="bulkQueue('dec')" id="bulkDec" disabled>Decrypted</button>
-      <button class="bulk-btn" onclick="bulkQueue('enc')" id="bulkEnc" disabled>Encrypted</button>
-      <button class="bulk-btn grn" onclick="bulkQueue('cloud')" id="bulkCloud" disabled>Cloud</button>
+      <label class="bulk-all"><input type="checkbox" id="bulkSelectAll" onchange="onBulkSelectAll(this.checked)"> <span data-i18n="bulk.all">All</span></label>
+      <span class="bulk-count" id="bulkCount" data-i18n="bulk.zero_titles">0 titles</span>
+      <button class="bulk-btn" data-i18n="bulk.decrypted" onclick="bulkQueue('dec')" id="bulkDec" disabled>Decrypted</button>
+      <button class="bulk-btn" data-i18n="bulk.encrypted" onclick="bulkQueue('enc')" id="bulkEnc" disabled>Encrypted</button>
+      <button class="bulk-btn grn" data-i18n="bulk.cloud" onclick="bulkQueue('cloud')" id="bulkCloud" disabled>Cloud</button>
     </div>
     <div class="drawer-toggle" onclick="toggleDrawer()" id="dtog"></div>
-    <div class="svs" id="svs"><div class="empty">Loading...</div></div>
+    <div class="svs" id="svs"><div class="empty" data-i18n="common.loading">Loading...</div></div>
   </div>
   <div class="right">
     <div class="tb" id="tb"></div>
@@ -542,11 +542,87 @@
 
 <!-- ── Log panel ───────────────────────────────────── -->
 <div class="logw">
-  <div class="shdr">Terminal</div>
+  <div class="shdr" data-i18n="layout.terminal">Terminal</div>
   <div class="log" id="log"></div>
 </div>
 
 <script>
+window.GARLIC_I18N = {};
+"__I18N_DICTIONARIES__";
+
+const DEFAULT_LANG = 'en';
+const LANGUAGE_OPTIONS = [
+  { value: 'en', label: 'English' },
+  { value: 'zh-CN', label: '简体中文' }
+];
+const SUPPORTED_LANGS = LANGUAGE_OPTIONS.map(option => option.value);
+const savedLanguage = localStorage.getItem('garlic_lang');
+let langPreference = savedLanguage && SUPPORTED_LANGS.includes(savedLanguage)
+  ? savedLanguage : 'system';
+if (savedLanguage && langPreference === 'system') localStorage.removeItem('garlic_lang');
+
+function systemLanguage() {
+  const browserLangs = navigator.languages && navigator.languages.length
+    ? navigator.languages : [navigator.language || DEFAULT_LANG];
+  for (const browserLang of browserLangs) {
+    const normalized = String(browserLang).toLowerCase();
+    if (normalized === 'zh' || normalized === 'zh-cn' || normalized.startsWith('zh-hans')) return 'zh-CN';
+    if (normalized === 'en' || normalized.startsWith('en-')) return 'en';
+  }
+  return DEFAULT_LANG;
+}
+
+function resolveLanguage(preference) {
+  if (preference === 'system') return systemLanguage();
+  return SUPPORTED_LANGS.includes(preference) ? preference : DEFAULT_LANG;
+}
+
+let lang = resolveLanguage(langPreference);
+
+function t(key, fallback, vars) {
+  const dict = (window.GARLIC_I18N && window.GARLIC_I18N[lang]) || {};
+  let text = dict[key] || fallback || key;
+  if (vars) Object.keys(vars).forEach(name => {
+    text = text.split('{' + name + '}').join(String(vars[name]));
+  });
+  return text;
+}
+
+function applyLanguage() {
+  document.documentElement.lang = lang;
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    if (!el.dataset.i18nEn) el.dataset.i18nEn = el.textContent;
+    el.textContent = t(el.dataset.i18n, el.dataset.i18nEn);
+  });
+}
+
+function setLanguage(value) {
+  langPreference = value === 'system' ? 'system'
+    : (SUPPORTED_LANGS.includes(value) ? value : 'system');
+  if (langPreference === 'system') localStorage.removeItem('garlic_lang');
+  else localStorage.setItem('garlic_lang', langPreference);
+  lang = resolveLanguage(langPreference);
+  applyLanguage();
+  renderL();
+  renderTB();
+  renderCt();
+}
+
+function languageOptionLabel(value) {
+  if (value === 'system') return t('settings.language_system', 'System / Browser Default');
+  const option = LANGUAGE_OPTIONS.find(item => item.value === value);
+  return option ? option.label : value;
+}
+
+function languageOptionsHtml() {
+  const system = '<option value="system"' + (langPreference === 'system' ? ' selected' : '')
+    + '>' + languageOptionLabel('system') + '</option>';
+  return system + LANGUAGE_OPTIONS.map(option =>
+    '<option value="' + esc(option.value) + '"' + (langPreference === option.value ? ' selected' : '')
+    + '>' + esc(option.label) + '</option>'
+  ).join('');
+}
+
 /* ── State ─────────────────────────────────────────── */
 let S = [], si = -1, tab = 'browse';
 let mt = false, bsy = false;
@@ -729,12 +805,12 @@ function updateDrawer() {
   const cnt = S.filter(s => s.type === platform).length;
   if (drawerOpen) {
     d.classList.remove('collapsed');
-    $('dtog').innerHTML = '\u25BE Saves'
+    $('dtog').innerHTML = '\u25BE ' + t('layout.saves', 'Saves')
       + ' <button class="ptab' + (platform === 'ps5' ? ' active' : '') + '" onclick="event.stopPropagation();setPlatform(\'ps5\')" style="margin-left:8px">PS5</button>'
       + '<button class="ptab' + (platform === 'ps4' ? ' active' : '') + '" onclick="event.stopPropagation();setPlatform(\'ps4\')">PS4</button>';
   } else {
     d.classList.add('collapsed');
-    $('dtog').textContent = '\u25B8 ' + platform.toUpperCase() + ' Saves' + (cnt ? ' (' + cnt + ')' : '');
+    $('dtog').textContent = '\u25B8 ' + platform.toUpperCase() + ' ' + t('layout.saves', 'Saves') + (cnt ? ' (' + cnt + ')' : '');
   }
 }
 
@@ -780,10 +856,8 @@ document.addEventListener('click', e => {
 /* ── Tab switching ─────────────────────────────────── */
 function switchTab(t) {
   tab = t;
-  const tabs = ['browse', 'decrypt', 'encrypt', 'resign', 'import', 'settings'];
   document.querySelectorAll('nav .tab, .mob-menu .tab').forEach(b => {
-    const idx = tabs.indexOf(b.textContent.trim().toLowerCase());
-    b.className = 'tab' + (tabs[idx] === t ? ' active' : '');
+    b.className = 'tab' + (b.dataset.tab === t ? ' active' : '');
   });
   $('mn').className = t === 'browse' ? 'main' : 'main full';
   /* Close mobile menu */
@@ -803,9 +877,9 @@ async function load() {
     renderL();
     renderTB();
     updateDrawer();
-    log('Loaded ' + S.length + ' saves', 'ok');
+    log(t('status.loaded_saves', 'Loaded {count} saves', {count: S.length}), 'ok');
   } catch (e) {
-    log('Failed: ' + e.message, 'err');
+    log(t('status.failed', 'Failed: {error}', {error: e.message}), 'err');
     S = [];
     renderL();
   }
@@ -860,7 +934,7 @@ function updateBulkBar() {
   const vis = visibleBulkTitles();
   const n = vis.filter(t => bulkSel.has(t)).length;
   const cnt = $('bulkCount');
-  if (cnt) cnt.textContent = n + (n === 1 ? ' title' : ' titles');
+  if (cnt) cnt.textContent = t('bulk.titles', '{count} titles', {count: n});
   const all = $('bulkSelectAll');
   if (all) {
     all.checked = vis.length > 0 && n === vis.length;
@@ -884,7 +958,7 @@ function renderGroup(g, h) {
   }
   if (g.items.length === 1) {
     const i = g.items[0], s = S[i];
-    const bu = s.backup ? '<span class="badge badge-bu">BACKUP</span>' : '';
+    const bu = s.backup ? '<span class="badge badge-bu">' + t('badge.backup', 'BACKUP') + '</span>' : '';
     h += '<div class="sv' + (i === si ? ' sel' : '') + '" onclick="sel(' + i + ')">';
     h += '<div class="sv-row">' + bulkTitleCheckbox(g.title_id, anyUsb);
     h += '<div class="sv-body"><div class="tid">' + bu + badge + esc(g.name) + tdots + '</div>';
@@ -896,11 +970,11 @@ function renderGroup(g, h) {
     h += '<div class="sv' + (anySel ? ' sel' : '') + '" onclick="togG(\'' + gesc + '\',event)" style="cursor:pointer">';
     h += '<div class="sv-row">' + bulkTitleCheckbox(g.title_id, anyUsb);
     h += '<div class="sv-body"><div class="tid">' + badge + (open ? '\u25BE ' : '\u25B8 ') + esc(g.name) + tdots + '</div>';
-    h += '<div class="sn">' + g.items.length + ' saves</div></div></div></div>';
+    h += '<div class="sn">' + esc(t('saves.count', '{count} saves', {count: g.items.length})) + '</div></div></div></div>';
     if (open) {
       g.items.forEach(i => {
         const s = S[i];
-        const bu = s.backup ? '<span class="badge badge-bu">BACKUP</span>' : '';
+        const bu = s.backup ? '<span class="badge badge-bu">' + t('badge.backup', 'BACKUP') + '</span>' : '';
         const dots = saveDots(i);
         h += '<div class="sv' + (i === si ? ' sel' : '') + '" onclick="sel(' + i + ')" style="padding-left:16px">';
         h += '<div class="sv-row"><span style="width:22px;flex-shrink:0"></span>';
@@ -915,7 +989,7 @@ function renderL() {
   const ptype = platform === 'ps4' ? 'ps4' : 'ps5';
   const filtered = S.map((s, i) => ({s, i})).filter(x => x.s.type === ptype && (x.s.usb || x.s.uid === curUid));
   if (!filtered.length) {
-    $('svs').innerHTML = '<div class="empty">No ' + ptype.toUpperCase() + ' saves found</div>';
+    $('svs').innerHTML = '<div class="empty">' + esc(t('saves.none', 'No {platform} saves found', {platform: ptype.toUpperCase()})) + '</div>';
     return;
   }
   /* Group saves by title_id, split system vs USB */
@@ -943,7 +1017,7 @@ function renderL() {
   if (usbGroups.length > 0) {
     h += '<div class="sv" onclick="event.stopPropagation();usbDrawerOpen=!usbDrawerOpen;renderL()" style="cursor:pointer;border-top:1px solid var(--bd);margin-top:4px">';
     h += '<div class="tid" style="color:#8b5cf6;font-weight:700">'
-      + (usbDrawerOpen ? '\u25BE' : '\u25B8') + ' USB Saves'
+      + (usbDrawerOpen ? '\u25BE' : '\u25B8') + ' USB ' + esc(t('layout.saves', 'Saves'))
       + '<span class="badge badge-usb" style="float:none;margin-left:8px">' + usbGroups.length + '</span></div></div>';
     if (usbDrawerOpen) {
       usbGroups.forEach(g => { h = renderGroup(g, h); });
@@ -968,9 +1042,9 @@ function renderCt() {
     c.className = 'ct ctr';
     c.innerHTML =
       '<div class="drop" id="dz">'
-      + '<div class="dlbl">Drag & drop encrypted save file</div>'
-      + '<div style="font-size:11px;color:var(--dm);margin:6px 0">PS4: drop save image + .bin key together</div>'
-      + '<button class="bbtn">Browse Files</button></div>';
+      + '<div class="dlbl">' + t('drop.decrypt', 'Drag & drop encrypted save file') + '</div>'
+      + '<div style="font-size:11px;color:var(--dm);margin:6px 0">' + t('drop.ps4_pair', 'PS4: drop save image + .bin key together') + '</div>'
+      + '<button class="bbtn">' + t('drop.browse_files', 'Browse Files') + '</button></div>';
     setupDZ('dz', decDrop);
 
   } else if (tab === 'encrypt') {
@@ -978,46 +1052,47 @@ function renderCt() {
     c.innerHTML =
       '<div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">'
       + '<label style="font-size:12px;color:var(--dm);font-weight:600;text-transform:uppercase;letter-spacing:.5px">Account ID:</label>'
-      + '<input id="eaid" type="text" maxlength="16" placeholder="optional" '
+      + '<input id="eaid" type="text" maxlength="16" placeholder="' + esc(t('encrypt.optional', 'optional')) + '" '
       + 'style="background:var(--bg);border:1px solid var(--bd);color:var(--tx);padding:6px 10px;border-radius:8px;font-family:monospace;font-size:13px;width:170px">'
       + '</div>'
       + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:16px">'
       + '<label style="cursor:pointer;display:flex;align-items:center;gap:6px;font-size:12px;color:var(--dm);font-weight:600;text-transform:uppercase;letter-spacing:.5px">'
-      + '<input id="eps4" type="checkbox" style="accent-color:#1e6fbf;width:16px;height:16px"> PS4 Save'
+      + '<input id="eps4" type="checkbox" style="accent-color:#1e6fbf;width:16px;height:16px"> ' + t('encrypt.ps4_save', 'PS4 Save')
       + '</label>'
       + '</div>'
       + '<div class="drop" id="dz">'
-      + '<div class="dlbl">Drag & drop a <b>folder</b> to encrypt into a save</div>'
-      + '<button class="bbtn">Browse Folder</button></div>';
+      + '<div class="dlbl">' + t('drop.encrypt', 'Drag & drop a folder to encrypt into a save') + '</div>'
+      + '<button class="bbtn">' + t('drop.browse_folder', 'Browse Folder') + '</button></div>';
     setupFolderDZ('dz', encDrop);
 
   } else if (tab === 'resign') {
     c.className = 'ct ctr';
     c.innerHTML =
       '<div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">'
-      + '<label style="font-size:12px;color:var(--dm);font-weight:600;text-transform:uppercase;letter-spacing:.5px">New Account ID:</label>'
+      + '<label style="font-size:12px;color:var(--dm);font-weight:600;text-transform:uppercase;letter-spacing:.5px">' + t('resign.new_account_id', 'New Account ID') + ':</label>'
       + '<input id="raid" type="text" maxlength="16" placeholder="0000000000000000" '
       + 'style="background:var(--bg);border:1px solid var(--bd);color:var(--tx);padding:6px 10px;border-radius:8px;font-family:monospace;font-size:13px;width:170px">'
       + '</div>'
       + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:16px">'
       + '<label style="font-size:12px;color:var(--dm);font-weight:600;text-transform:uppercase;letter-spacing:.5px">User ID:</label>'
-      + '<input id="ruid" type="text" maxlength="8" placeholder="optional (uses local user)" '
+      + '<input id="ruid" type="text" maxlength="8" placeholder="' + esc(t('resign.user_id_placeholder', 'optional (uses local user)')) + '" '
       + 'style="background:var(--bg);border:1px solid var(--bd);color:var(--tx);padding:6px 10px;border-radius:8px;font-family:monospace;font-size:13px;width:240px">'
       + '</div>'
       + '<div class="drop" id="dz">'
-      + '<div class="dlbl">Drag & drop encrypted save to resign</div>'
-      + '<div style="font-size:11px;color:var(--dm);margin:6px 0">PS4: drop save image + .bin key together</div>'
-      + '<button class="bbtn">Browse Files</button></div>';
+      + '<div class="dlbl">' + t('drop.resign', 'Drag & drop encrypted save to resign') + '</div>'
+      + '<div style="font-size:11px;color:var(--dm);margin:6px 0">' + t('drop.ps4_pair', 'PS4: drop save image + .bin key together') + '</div>'
+      + '<button class="bbtn">' + t('drop.browse_files', 'Browse Files') + '</button></div>';
     setupDZ('dz', resignDrop);
 
   } else if (tab === 'import') {
     c.className = 'ct ctr';
     c.innerHTML =
       '<div class="drop" id="dz">'
-      + '<div class="dlbl">Drag & drop a <b>decrypted save folder</b> or <b>encrypted save file</b> to import</div>'
-      + '<div style="font-size:11px;color:var(--dm);margin:6px 0">Folder: must contain sce_sys/param.sfo<br>Encrypted: PS4 drop image + .bin key together</div>'
-      + '<button class="bbtn" onclick="browseFolder()" style="margin-right:8px">Browse Folder</button>'
-      + '<button class="bbtn" onclick="browseEncFile()">Browse File</button></div>';
+      + '<div class="dlbl">' + t('drop.import', 'Drag & drop a decrypted save folder or encrypted save file to import') + '</div>'
+      + '<div style="font-size:11px;color:var(--dm);margin:6px 0">' + t('import.folder_hint', 'Folder: must contain sce_sys/param.sfo')
+      + '<br>' + t('import.encrypted_hint', 'Encrypted: PS4 drop image + .bin key together') + '</div>'
+      + '<button class="bbtn" onclick="browseFolder()" style="margin-right:8px">' + t('drop.browse_folder', 'Browse Folder') + '</button>'
+      + '<button class="bbtn" onclick="browseEncFile()">' + t('drop.browse_files', 'Browse File') + '</button></div>';
     setupImportDZ('dz');
 
   } else if (tab === 'settings') {
@@ -1029,7 +1104,8 @@ function renderCt() {
       renderF();
     } else {
       c.className = 'ct ctr';
-      c.innerHTML = '<div class="drop"><div class="dlbl">Select a save to browse<br><br>Tip: Drag & drop files onto a mounted save to add or replace them</div></div>';
+      c.innerHTML = '<div class="drop"><div class="dlbl">' + t('saves.select', 'Select a save to browse')
+        + '<br><br>' + t('saves.tip', 'Tip: Drag & drop files onto a mounted save to add or replace them') + '</div></div>';
     }
   }
 }
@@ -1047,10 +1123,23 @@ function settingsTextarea(id, label, value, rows) {
     + esc(value || '') + '</textarea>';
 }
 
+function languageSettingsHtml() {
+  return '<div style="padding:18px;max-width:760px;width:100%">'
+    + '<div style="font-size:18px;font-weight:800;color:var(--tx);margin-bottom:12px">' + t('settings.title', 'Settings') + '</div>'
+    + '<div style="background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:16px;margin-bottom:16px">'
+    + '<label style="display:block;margin:8px 0 4px;font-size:10px;color:var(--dm);font-weight:700;text-transform:uppercase;letter-spacing:1px">' + t('settings.language', 'Interface Language') + '</label>'
+    + '<select id="setLanguage" onchange="setLanguage(this.value)" style="width:100%;background:var(--bg);border:1px solid var(--bd);color:var(--tx);padding:8px 10px;border-radius:8px">'
+    + languageOptionsHtml() + '</select>'
+    + '<div style="font-size:10px;color:var(--dm);margin-top:4px">' + t('settings.language_help', 'The language preference is saved only in this browser.') + '</div>'
+    + '</div>'
+    + '<div id="cloudSettings"><div class="empty">' + t('settings.loading', 'Loading settings...') + '</div></div>'
+    + '</div>';
+}
+
 async function renderSettings() {
   const c = $('ct');
   c.className = 'ct';
-  c.innerHTML = '<div class="empty">Loading settings...</div>';
+  c.innerHTML = languageSettingsHtml();
   try {
     const r = await fetch('/api/settings/cloud');
     const d = await r.json();
@@ -1068,98 +1157,100 @@ async function renderSettings() {
     const accessToken = gd.access_token || localStorage.getItem('gdrive_access_token') || '';
     const storedSa = localStorage.getItem('gdrive_service_account') || '';
     const saForTextarea = storedSa || ((gd.service_account && gd.service_account.private_key && gd.service_account.private_key !== '********') ? JSON.stringify(gd.service_account, null, 2) : '');
-    c.innerHTML =
-      '<div style="padding:18px;max-width:760px;width:100%">'
-      + '<div style="font-size:18px;font-weight:800;color:var(--tx);margin-bottom:4px">Settings</div>'
-      + '<div style="font-size:12px;color:var(--dm);margin-bottom:16px">Cloud backup settings are saved to /data/garlic/cloud.json. Password/private-key fields show ******** when already stored.</div>'
+    const cloudSettings = $('cloudSettings');
+    if (!cloudSettings) return;
+    cloudSettings.innerHTML =
+      '<div style="font-size:12px;color:var(--dm);margin-bottom:16px">' + t('settings.description', 'Cloud backup settings are saved to /data/garlic/cloud.json. Password/private-key fields show ******** when already stored.') + '</div>'
       + '<div style="background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:16px">'
       + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx);font-weight:700;margin-bottom:12px">'
-      + '<input id="setEnabled" type="checkbox" ' + (cfg.enabled ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> Enable Cloud Backup</label>'
-      + '<label style="display:block;margin:8px 0 4px;font-size:10px;color:var(--dm);font-weight:700;text-transform:uppercase;letter-spacing:1px">Provider</label>'
+      + '<input id="setEnabled" type="checkbox" ' + (cfg.enabled ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> ' + t('settings.enable_cloud', 'Enable Cloud Backup') + '</label>'
+      + '<label style="display:block;margin:8px 0 4px;font-size:10px;color:var(--dm);font-weight:700;text-transform:uppercase;letter-spacing:1px">' + t('settings.provider', 'Provider') + '</label>'
       + '<select id="setProvider" onchange="updateSettingsVisibility()" style="width:100%;background:var(--bg);border:1px solid var(--bd);color:var(--tx);padding:8px 10px;border-radius:8px">'
       + '<option value="ftp"' + ((cfg.provider || 'ftp') === 'ftp' ? ' selected' : '') + '>FTP</option>'
       + '<option value="google_drive"' + (cfg.provider === 'google_drive' ? ' selected' : '') + '>Google Drive</option>'
       + '</select>'
-      + settingsInput('setWatch', 'Watch Titles (comma separated, blank = all)', (cfg.watch_titles || []).join(', '))
+      + settingsInput('setWatch', t('settings.watch_titles', 'Watch Titles (comma separated, blank = all)'), (cfg.watch_titles || []).join(', '))
       + '<div id="ftpSettings" style="margin-top:14px">'
       + '<div style="font-size:13px;font-weight:700;color:var(--tx);margin-bottom:8px">FTP</div>'
-      + settingsInput('setFtpHost', 'Host', ftp.host || '')
-      + settingsInput('setFtpPort', 'Port', String(ftp.port || 21), 'number')
-      + settingsInput('setFtpUser', 'User', ftp.user || '')
-      + settingsInput('setFtpPass', 'Password', ftp.pass || '', 'password')
-      + settingsInput('setFtpPath', 'Remote Path', ftp.remote_path || '/')
+      + settingsInput('setFtpHost', t('settings.host', 'Host'), ftp.host || '')
+      + settingsInput('setFtpPort', t('settings.port', 'Port'), String(ftp.port || 21), 'number')
+      + settingsInput('setFtpUser', t('settings.user', 'User'), ftp.user || '')
+      + settingsInput('setFtpPass', t('settings.password', 'Password'), ftp.pass || '', 'password')
+      + settingsInput('setFtpPath', t('settings.remote_path', 'Remote Path'), ftp.remote_path || '/')
       + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx);font-weight:700;margin-top:10px">'
-      + '<input id="setFtpTls" type="checkbox" ' + (ftp.use_tls ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> Use TLS (currently rejected by backend)</label>'
+      + '<input id="setFtpTls" type="checkbox" ' + (ftp.use_tls ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> ' + t('settings.use_tls', 'Use TLS (currently rejected by backend)') + '</label>'
       + '</div>'
       + '<div style="margin-top:14px">'
-      + '<div style="font-size:13px;font-weight:700;color:var(--tx);margin-bottom:8px">Auto Backup</div>'
+      + '<div style="font-size:13px;font-weight:700;color:var(--tx);margin-bottom:8px">' + t('settings.auto_backup', 'Auto Backup') + '</div>'
       + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx);font-weight:700;margin-top:10px">'
-      + '<input id="setAutoEnabled" type="checkbox" ' + (auto.enabled || auto.auto_enabled ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> Enable automatic backup after watched game closes</label>'
-      + settingsInput('setAutoPoll', 'Poll Interval Seconds', String(auto.poll_seconds || 5), 'number')
-      + settingsInput('setAutoSettle', 'Settle Delay Seconds After Close', String(auto.settle_seconds || 15), 'number')
-      + '<div style="font-size:10px;color:var(--dm);margin:-4px 0 8px">Upload runs once after a watched game closes, then waits this many seconds for saves to finish writing.</div>'
+      + '<input id="setAutoEnabled" type="checkbox" ' + (auto.enabled || auto.auto_enabled ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> ' + t('settings.enable_auto', 'Enable automatic backup after watched game closes') + '</label>'
+      + settingsInput('setAutoPoll', t('settings.poll_seconds', 'Poll Interval Seconds'), String(auto.poll_seconds || 5), 'number')
+      + settingsInput('setAutoSettle', t('settings.settle_seconds', 'Settle Delay Seconds After Close'), String(auto.settle_seconds || 15), 'number')
+      + '<div style="font-size:10px;color:var(--dm);margin:-4px 0 8px">' + t('settings.settle_help', 'Upload runs once after a watched game closes, then waits this many seconds for saves to finish writing.') + '</div>'
       + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx);font-weight:700;margin-top:10px">'
-      + '<input id="setAutoQueueDrive" type="checkbox" ' + (auto.queue_for_browser_drive !== false ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> Queue Google Drive backups for browser upload</label>'
-      + '<div id="autoStatus" style="font-size:11px;color:var(--dm);margin-top:8px">Auto status loading...</div>'
+      + '<input id="setAutoQueueDrive" type="checkbox" ' + (auto.queue_for_browser_drive !== false ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> ' + t('settings.queue_drive', 'Queue Google Drive backups for browser upload') + '</label>'
+      + '<div id="autoStatus" style="font-size:11px;color:var(--dm);margin-top:8px">' + t('settings.auto_loading', 'Auto status loading...') + '</div>'
       + '</div>'
       + '<div style="margin-top:14px">'
-      + '<div style="font-size:13px;font-weight:700;color:var(--tx);margin-bottom:8px">Backup Destinations</div>'
+      + '<div style="font-size:13px;font-weight:700;color:var(--tx);margin-bottom:8px">' + t('settings.destinations', 'Backup Destinations') + '</div>'
       + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx);font-weight:700;margin-top:10px">'
-      + '<input id="setTargetLocal" type="checkbox" ' + (localTarget.enabled ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> Local PS5 folder</label>'
-      + settingsInput('setTargetLocalPath', 'Local Folder', localTarget.path || '/data/garlic/backups')
+      + '<input id="setTargetLocal" type="checkbox" ' + (localTarget.enabled ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> ' + t('settings.local_folder', 'Local PS5 folder') + '</label>'
+      + settingsInput('setTargetLocalPath', t('settings.local_folder', 'Local Folder'), localTarget.path || '/data/garlic/backups')
       + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx);font-weight:700;margin-top:10px">'
-      + '<input id="setTargetUsb" type="checkbox" ' + (usbTarget.enabled ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> USB folder</label>'
-      + settingsInput('setTargetUsbPath', 'USB Folder', usbTarget.path || '/mnt/usb0/garlic-backups')
+      + '<input id="setTargetUsb" type="checkbox" ' + (usbTarget.enabled ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> ' + t('settings.usb_folder', 'USB folder') + '</label>'
+      + settingsInput('setTargetUsbPath', t('settings.usb_folder', 'USB Folder'), usbTarget.path || '/mnt/usb0/garlic-backups')
       + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx);font-weight:700;margin-top:10px">'
       + '<input id="setTargetFtp" type="checkbox" ' + (ftpTarget.enabled || (!targets.ftp && cfg.provider === 'ftp') ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> FTP</label>'
       + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx);font-weight:700;margin-top:10px">'
-      + '<input id="setTargetDrive" type="checkbox" ' + (driveTarget.enabled || (!targets.google_drive && cfg.provider === 'google_drive') ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> Google Drive browser upload</label>'
-      + '<div style="font-size:11px;color:var(--dm);margin-top:6px">Manual and auto title backups write one encrypted/restorable ZIP to every enabled destination. Drive uploads are handled by the browser queue.</div>'
+      + '<input id="setTargetDrive" type="checkbox" ' + (driveTarget.enabled || (!targets.google_drive && cfg.provider === 'google_drive') ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> ' + t('settings.drive_browser', 'Google Drive browser upload') + '</label>'
+      + '<div style="font-size:11px;color:var(--dm);margin-top:6px">' + t('settings.destinations_help', 'Manual and auto title backups write one encrypted/restorable ZIP to every enabled destination. Drive uploads are handled by the browser queue.') + '</div>'
       + '</div>'
       + '<div id="driveSettings" style="margin-top:14px">'
       + '<div style="font-size:13px;font-weight:700;color:var(--tx);margin-bottom:8px">Google Drive</div>'
-      + '<label style="display:block;margin:8px 0 4px;font-size:10px;color:var(--dm);font-weight:700;text-transform:uppercase;letter-spacing:1px">Mode</label>'
+      + '<label style="display:block;margin:8px 0 4px;font-size:10px;color:var(--dm);font-weight:700;text-transform:uppercase;letter-spacing:1px">' + t('settings.mode', 'Mode') + '</label>'
       + '<select id="setDriveMode" onchange="updateSettingsVisibility()" style="width:100%;background:var(--bg);border:1px solid var(--bd);color:var(--tx);padding:8px 10px;border-radius:8px">'
-      + '<option value="browser"' + ((gd.mode || 'browser') === 'browser' ? ' selected' : '') + '>Browser Assisted</option>'
-      + '<option value="direct"' + (gd.mode === 'direct' ? ' selected' : '') + '>Direct PS5 (requires TLS backend)</option>'
+      + '<option value="browser"' + ((gd.mode || 'browser') === 'browser' ? ' selected' : '') + '>' + t('settings.browser_assisted', 'Browser Assisted') + '</option>'
+      + '<option value="direct"' + (gd.mode === 'direct' ? ' selected' : '') + '>' + t('settings.direct_ps5', 'Direct PS5 (requires TLS backend)') + '</option>'
       + '</select>'
-      + settingsInput('setDriveFolder', 'Folder ID (required)', gd.folder_id || '')
-      + '<label style="display:block;margin:8px 0 4px;font-size:10px;color:var(--dm);font-weight:700;text-transform:uppercase;letter-spacing:1px">Browser Upload Auth</label>'
+      + settingsInput('setDriveFolder', t('settings.folder_id', 'Folder ID (required)'), gd.folder_id || '')
+      + '<label style="display:block;margin:8px 0 4px;font-size:10px;color:var(--dm);font-weight:700;text-transform:uppercase;letter-spacing:1px">' + t('settings.browser_auth', 'Browser Upload Auth') + '</label>'
       + '<select id="setDriveAuth" onchange="updateSettingsVisibility()" style="width:100%;background:var(--bg);border:1px solid var(--bd);color:var(--tx);padding:8px 10px;border-radius:8px">'
-      + '<option value="oauth_refresh"' + (driveAuth === 'oauth_refresh' ? ' selected' : '') + '>OAuth2 (Personal My Drive)</option>'
-      + '<option value="service_account"' + (driveAuth === 'service_account' ? ' selected' : '') + '>Service Account (Shared Drive only)</option>'
+      + '<option value="oauth_refresh"' + (driveAuth === 'oauth_refresh' ? ' selected' : '') + '>' + t('settings.oauth_personal', 'OAuth2 (Personal My Drive)') + '</option>'
+      + '<option value="service_account"' + (driveAuth === 'service_account' ? ' selected' : '') + '>' + t('settings.service_shared', 'Service Account (Shared Drive only)') + '</option>'
       + '</select>'
       + '<div id="driveOAuthRefreshSettings" style="margin-top:8px">'
-      + settingsInput('setDriveClientId', 'OAuth Client ID', gd.client_id || '')
-      + settingsInput('setDriveClientSecret', 'OAuth Client Secret', gd.client_secret || '', 'password')
-      + settingsInput('setDriveRefreshToken', 'OAuth Refresh Token', gd.refresh_token || '', 'password')
-      + settingsInput('setDriveAccessToken', 'OAuth Access Token', accessToken, 'password')
-      + '<div style="font-size:11px;color:var(--dm);margin-top:6px">All four values come from your Google OAuth client. Paste Client ID, Client Secret, Refresh Token, and Access Token from OAuth Playground (or your own OAuth flow). Saved to cloud.json on the PS5; secret and tokens show ******** when already stored.</div>'
-      + '<div style="font-size:11px;color:var(--dm);margin-top:4px">When the access token expires (~1 hour), uploads auto-refresh it using the refresh token. Re-paste a new access token from Playground if refresh fails.</div>'
-      + '<div style="font-size:11px;color:var(--dm);margin-top:4px">Setup: <a href="https://developers.google.com/oauthplayground/" target="_blank" rel="noopener" style="color:var(--ac)">Google OAuth Playground</a> → gear icon → use your OAuth credentials → Drive API v3 scope → Authorize → Exchange → copy both tokens.</div>'
+      + settingsInput('setDriveClientId', t('settings.oauth_client_id', 'OAuth Client ID'), gd.client_id || '')
+      + settingsInput('setDriveClientSecret', t('settings.oauth_client_secret', 'OAuth Client Secret'), gd.client_secret || '', 'password')
+      + settingsInput('setDriveRefreshToken', t('settings.oauth_refresh_token', 'OAuth Refresh Token'), gd.refresh_token || '', 'password')
+      + settingsInput('setDriveAccessToken', t('settings.oauth_access_token', 'OAuth Access Token'), accessToken, 'password')
+      + '<div style="font-size:11px;color:var(--dm);margin-top:6px">' + t('settings.oauth_help', 'All four values come from your Google OAuth client. Paste Client ID, Client Secret, Refresh Token, and Access Token from OAuth Playground (or your own OAuth flow). Saved to cloud.json on the PS5; secret and tokens show ******** when already stored.') + '</div>'
+      + '<div style="font-size:11px;color:var(--dm);margin-top:4px">' + t('settings.oauth_refresh_help', 'When the access token expires (~1 hour), uploads auto-refresh it using the refresh token. Re-paste a new access token from Playground if refresh fails.') + '</div>'
+      + '<div style="font-size:11px;color:var(--dm);margin-top:4px">' + t('settings.oauth_setup_prefix', 'Setup') + ': <a href="https://developers.google.com/oauthplayground/" target="_blank" rel="noopener" style="color:var(--ac)">Google OAuth Playground</a> → ' + t('settings.oauth_setup_steps', 'gear icon → use your OAuth credentials → Drive API v3 scope → Authorize → Exchange → copy both tokens.') + '</div>'
       + '</div>'
       + '<div id="driveSaSettings" style="margin-top:8px">'
-      + settingsTextarea('setDriveServiceAccount', 'Service Account JSON (stored in this browser by default)', saForTextarea, 8)
+      + settingsTextarea('setDriveServiceAccount', t('settings.service_json', 'Service Account JSON (stored in this browser by default)'), saForTextarea, 8)
       + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx);font-weight:700;margin-top:10px">'
-      + '<input id="setDriveSaveSa" type="checkbox" style="accent-color:var(--ac);width:16px;height:16px"> Also save service account to PS5 config</label>'
-      + '<div style="font-size:11px;color:var(--dm);margin-top:6px">Service accounts can upload only to Shared Drives or Workspace delegated drives. For normal My Drive folders, use OAuth2 above.</div>'
+      + '<input id="setDriveSaveSa" type="checkbox" style="accent-color:var(--ac);width:16px;height:16px"> ' + t('settings.save_service_ps5', 'Also save service account to PS5 config') + '</label>'
+      + '<div style="font-size:11px;color:var(--dm);margin-top:6px">' + t('settings.service_account_help', 'Service accounts can upload only to Shared Drives or Workspace delegated drives. For normal My Drive folders, use OAuth2 above.') + '</div>'
       + '</div>'
-      + '<div id="directNote" style="font-size:11px;color:#c89b00;margin-top:8px">Direct PS5 Google Drive is configured here, but this payload build reports direct_drive_supported=false until a TLS backend is available.</div>'
+      + '<div id="directNote" style="font-size:11px;color:#c89b00;margin-top:8px">' + t('settings.direct_note', 'Direct PS5 Google Drive is configured here, but this payload build reports direct_drive_supported=false until a TLS backend is available.') + '</div>'
       + '</div>'
       + '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:16px">'
-      + '<button class="btn grn" onclick="saveCloudSettings()">Save Settings</button>'
-      + '<button class="btn" onclick="testCloudSettings()">Test FTP / Status</button>'
-      + '<button class="btn" onclick="testDriveAccess()">Test Drive Access</button>'
-      + '<button class="btn" onclick="drainDriveQueue(true)">Upload Pending Drive Backups</button>'
+      + '<button class="btn grn" onclick="saveCloudSettings()">' + t('settings.save_settings', 'Save Settings') + '</button>'
+      + '<button class="btn" onclick="testCloudSettings()">' + t('settings.test_ftp', 'Test FTP / Status') + '</button>'
+      + '<button class="btn" onclick="testDriveAccess()">' + t('settings.test_drive', 'Test Drive Access') + '</button>'
+      + '<button class="btn" onclick="drainDriveQueue(true)">' + t('settings.upload_pending', 'Upload Pending Drive Backups') + '</button>'
       + '</div>'
-      + '</div></div>';
+      + '</div>';
     updateSettingsVisibility();
     refreshAutoStatus();
     if (window.autoStatusTimer) clearInterval(window.autoStatusTimer);
     window.autoStatusTimer = setInterval(refreshAutoStatus, 5000);
     loadDriveQueueStatus();
   } catch (e) {
-    c.innerHTML = '<div class="empty">Failed to load settings: ' + esc(e.message) + '</div>';
+    const cloudSettings = $('cloudSettings');
+    if (cloudSettings)
+      cloudSettings.innerHTML = '<div class="empty">' + esc(t('settings.load_failed', 'Failed to load settings: {error}', {error: e.message})) + '</div>';
   }
 }
 
@@ -1631,7 +1722,7 @@ function renderTB() {
 
     h += '<div style="flex:1;min-width:0">';
     h += '<div style="font-size:16px;font-weight:700;color:var(--tx);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'
-      + (stitle ? esc(stitle) : 'Untitled') + '</div>';
+      + (stitle ? esc(stitle) : t('saves.untitled', 'Untitled')) + '</div>';
     h += '<div style="font-size:13px;color:var(--dm);margin-top:2px">'
       + (mtid ? 'Title ID: <b style="color:var(--tx)">' + esc(mtid) + '</b>  ' : '')
       + (aid ? 'Account ID: <b style="color:var(--tx)">' + esc(aid) + '</b>' : '')
@@ -1641,25 +1732,25 @@ function renderTB() {
 
     const isUsb = si >= 0 && S[si] && S[si].usb;
     if (!isUsb) {
-      h += '<button class="btn grn desk-btn" onclick="dlZip()" ' + (bsy ? 'disabled' : '') + '>Download Decrypted Zip</button>';
-      h += '<button class="btn desk-btn" onclick="dlBin()" ' + (bsy ? 'disabled' : '') + '>Download Encrypted</button>';
-      h += '<button class="btn desk-btn" onclick="cloudBackupSave(si)" ' + (bsy ? 'disabled' : '') + '>Cloud Backup</button>';
-      h += '<button class="btn desk-btn" onclick="dumpUsb()" ' + (bsy ? 'disabled' : '') + '>Dump to USB</button>';
-      h += '<button class="btn red desk-btn" onclick="um()" ' + (bsy ? 'disabled' : '') + '>Unmount</button>';
+      h += '<button class="btn grn desk-btn" onclick="dlZip()" ' + (bsy ? 'disabled' : '') + '>' + t('toolbar.download_zip', 'Download Decrypted Zip') + '</button>';
+      h += '<button class="btn desk-btn" onclick="dlBin()" ' + (bsy ? 'disabled' : '') + '>' + t('toolbar.download_encrypted', 'Download Encrypted') + '</button>';
+      h += '<button class="btn desk-btn" onclick="cloudBackupSave(si)" ' + (bsy ? 'disabled' : '') + '>' + t('toolbar.cloud_backup', 'Cloud Backup') + '</button>';
+      h += '<button class="btn desk-btn" onclick="dumpUsb()" ' + (bsy ? 'disabled' : '') + '>' + t('toolbar.dump_usb', 'Dump to USB') + '</button>';
+      h += '<button class="btn red desk-btn" onclick="um()" ' + (bsy ? 'disabled' : '') + '>' + t('common.unmount', 'Unmount') + '</button>';
     } else {
-      h += '<button class="btn desk-btn" style="background:#8b5cf6" onclick="importUsb()" ' + (bsy ? 'disabled' : '') + '>Import to System</button>';
+      h += '<button class="btn desk-btn" style="background:#8b5cf6" onclick="importUsb()" ' + (bsy ? 'disabled' : '') + '>' + t('toolbar.import_system', 'Import to System') + '</button>';
     }
     h += '<div class="mob-opts">'
-      + '<button class="btn" onclick="toggleOpts()" ' + (bsy ? 'disabled' : '') + '>Options \u25BE</button>'
+      + '<button class="btn" onclick="toggleOpts()" ' + (bsy ? 'disabled' : '') + '>' + t('common.options', 'Options') + ' \u25BE</button>'
       + '<div class="opts-menu" id="optsmenu">'
       + (isUsb
-        ? '<div onclick="closeOpts();importUsb()" style="color:#8b5cf6">Import to System</div>'
-        : '<div onclick="closeOpts();dlZip()">Download Decrypted Zip</div>'
-          + '<div onclick="closeOpts();dlBin()">Download Encrypted</div>'
-          + '<div onclick="closeOpts();cloudBackupSave(si)">Cloud Backup</div>'
-          + '<div onclick="closeOpts();dumpUsb()">Dump to USB</div>'
-          + '<div onclick="closeOpts();ctxUpload()">Upload File</div>'
-          + '<div class="ctx-del" onclick="closeOpts();um()">Unmount</div>')
+        ? '<div onclick="closeOpts();importUsb()" style="color:#8b5cf6">' + t('toolbar.import_system', 'Import to System') + '</div>'
+        : '<div onclick="closeOpts();dlZip()">' + t('toolbar.download_zip', 'Download Decrypted Zip') + '</div>'
+          + '<div onclick="closeOpts();dlBin()">' + t('toolbar.download_encrypted', 'Download Encrypted') + '</div>'
+          + '<div onclick="closeOpts();cloudBackupSave(si)">' + t('toolbar.cloud_backup', 'Cloud Backup') + '</div>'
+          + '<div onclick="closeOpts();dumpUsb()">' + t('toolbar.dump_usb', 'Dump to USB') + '</div>'
+          + '<div onclick="closeOpts();ctxUpload()">' + t('common.upload_file', 'Upload File') + '</div>'
+          + '<div class="ctx-del" onclick="closeOpts();um()">' + t('common.unmount', 'Unmount') + '</div>')
       + '</div></div>';
   }
   $('tb').innerHTML = h;
@@ -1696,7 +1787,7 @@ async function decDrop(files) {
   }
 
   bsy = true;
-  $('ct').innerHTML = '<div class="drop"><div class="dlbl">Uploading for decrypt...</div></div>';
+  $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + t('status.uploading_decrypt', 'Uploading for decrypt...') + '</div></div>';
   try {
     /* For PS4, upload .bin key first */
     if (isPS4 && binFile) {
@@ -1716,9 +1807,9 @@ async function decDrop(files) {
     log('Mounted — click Download to save decrypted files', 'ok');
     const name = imgFile.name.replace(/\.[^.]+$/, '') + '_dec.zip';
     $('ct').innerHTML =
-      '<div class="drop"><div class="dlbl">Decrypted successfully!</div>'
-      + '<a class="dlnk" href="/api/download" download="' + esc(name) + '">Download .zip</a>'
-      + '<br><button class="bbtn" style="margin-top:12px" onclick="fetch(\'/api/unmount\');renderCt()">Done</button></div>';
+      '<div class="drop"><div class="dlbl">' + t('status.decrypt_ok', 'Decrypted successfully!') + '</div>'
+      + '<a class="dlnk" href="/api/download" download="' + esc(name) + '">' + t('status.download_zip', 'Download .zip') + '</a>'
+      + '<br><button class="bbtn" style="margin-top:12px" onclick="fetch(\'/api/unmount\');renderCt()">' + t('status.done', 'Done') + '</button></div>';
   } catch (e) {
     log('Error: ' + e.message, 'err');
     renderCt();
@@ -1740,7 +1831,7 @@ async function encDrop(files, folderName) {
 
     /* Step 1: create fresh PFS image and mount it */
     log('Creating ' + (isPS4 ? 'PS4' : 'PS5') + ' PFS image (' + fmtB(totalSize) + ' of files)...');
-    $('ct').innerHTML = '<div class="drop"><div class="dlbl">Creating PFS image...</div></div>';
+    $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + t('status.creating_pfs', 'Creating PFS image...') + '</div></div>';
     let r = await fetch('/api/create_pfs?size=' + totalSize + (isPS4 ? '&ps4=1' : ''));
     let d = await r.json();
     if (d.error) throw new Error(d.error);
@@ -1755,7 +1846,7 @@ async function encDrop(files, folderName) {
       const relPath = parts.length > 1 ? parts.slice(1).join('/') : parts[0];
 
       log('Uploading (' + (i + 1) + '/' + files.length + ') ' + relPath + ' (' + fmtB(f.size) + ')...');
-      $('ct').innerHTML = '<div class="drop" id="dz"><div class="dlbl">Uploading ' + esc(relPath)
+      $('ct').innerHTML = '<div class="drop" id="dz"><div class="dlbl">' + t('status.uploading_file', 'Uploading {name}', {name: esc(relPath)})
         + '<br>(' + (i + 1) + '/' + files.length + ')</div></div>';
 
       const xhr = await upload('/api/upload_file?name=' + encodeURIComponent(relPath), f, (loaded, total) => {
@@ -1769,7 +1860,7 @@ async function encDrop(files, folderName) {
 
     /* Step 3: patch AID if provided, unmount, download encrypted */
     log('Encrypting and downloading...');
-    $('ct').innerHTML = '<div class="drop"><div class="dlbl">Encrypting save...</div></div>';
+    $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + t('status.encrypting', 'Encrypting save...') + '</div></div>';
     const name = (folderName || 'encrypted_save') + '_enc';
     let dlUrl = '/api/download_new?name=' + encodeURIComponent(name);
     if (aidv) dlUrl += '&aid=' + encodeURIComponent(aidv);
@@ -1781,13 +1872,13 @@ async function encDrop(files, folderName) {
 
     if (isPS4) {
       $('ct').innerHTML =
-        '<div class="drop"><div class="dlbl">PS4 Save: <b>sdimg_' + esc(name) + '</b> + <b>' + esc(name) + '.bin</b></div>'
-        + '<div style="color:#0f0">Download started (.zip)</div>'
-        + '<div style="font-size:11px;color:var(--dm);margin-top:8px">Extract and place both files in the same directory on PS5</div></div>';
+        '<div class="drop"><div class="dlbl">' + t('status.ps4_save', 'PS4 Save') + ': <b>sdimg_' + esc(name) + '</b> + <b>' + esc(name) + '.bin</b></div>'
+        + '<div style="color:#0f0">' + t('status.download_started_zip', 'Download started (.zip)') + '</div>'
+        + '<div style="font-size:11px;color:var(--dm);margin-top:8px">' + t('status.ps4_extract_hint', 'Extract and place both files in the same directory on PS5') + '</div></div>';
     } else {
       $('ct').innerHTML =
         '<div class="drop"><div class="dlbl">' + esc(name) + '</div>'
-        + '<div style="color:#0f0">Download started</div></div>';
+        + '<div style="color:#0f0">' + t('status.download_started', 'Download started') + '</div></div>';
     }
   } catch (e) {
     log('Error: ' + e.message, 'err');
@@ -1819,7 +1910,7 @@ async function resignDrop(files) {
   }
 
   bsy = true;
-  $('ct').innerHTML = '<div class="drop"><div class="dlbl">Uploading for resign...</div></div>';
+  $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + t('status.uploading_resign', 'Uploading for resign...') + '</div></div>';
   try {
     /* For PS4, upload .bin key first */
     if (isPS4 && binFile) {
@@ -1847,8 +1938,8 @@ async function resignDrop(files) {
     document.body.appendChild(a); a.click(); a.remove();
     $('ct').innerHTML =
       '<div class="drop"><div class="dlbl">' + esc(name) + '<br>' + fmtB(d.size) + '</div>'
-      + '<div style="color:#0f0">Download started' + (isPS4 ? ' (.zip)' : '') + '</div>'
-      + '<button class="bbtn" style="margin-top:12px" onclick="switchTab(\'resign\')">Resign Another</button></div>';
+      + '<div style="color:#0f0">' + (isPS4 ? t('status.download_started_zip', 'Download started (.zip)') : t('status.download_started', 'Download started')) + '</div>'
+      + '<button class="bbtn" style="margin-top:12px" onclick="switchTab(\'resign\')">' + t('status.resign_another', 'Resign Another') + '</button></div>';
   } catch (e) {
     log('Error: ' + e.message, 'err');
     renderCt();
@@ -1879,7 +1970,7 @@ async function importDrop(files, folderName) {
 
     /* Step 1: create PFS image */
     log('Creating PFS image for import (' + fmtB(totalSize) + ' of files)...');
-    $('ct').innerHTML = '<div class="drop"><div class="dlbl">Creating PFS image...</div></div>';
+    $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + t('status.creating_pfs', 'Creating PFS image...') + '</div></div>';
     let r = await fetch('/api/create_pfs?size=' + totalSize);
     let d = await r.json();
     if (d.error) throw new Error(d.error);
@@ -1893,7 +1984,7 @@ async function importDrop(files, folderName) {
       const relPath = parts.length > 1 ? parts.slice(1).join('/') : parts[0];
 
       log('Uploading (' + (i + 1) + '/' + files.length + ') ' + relPath + ' (' + fmtB(f.size) + ')...');
-      $('ct').innerHTML = '<div class="drop" id="dz"><div class="dlbl">Uploading ' + esc(relPath)
+      $('ct').innerHTML = '<div class="drop" id="dz"><div class="dlbl">' + t('status.uploading_file', 'Uploading {name}', {name: esc(relPath)})
         + '<br>(' + (i + 1) + '/' + files.length + ')</div></div>';
 
       const xhr = await upload('/api/upload_file?name=' + encodeURIComponent(relPath), f, (loaded, total) => {
@@ -1909,7 +2000,7 @@ async function importDrop(files, folderName) {
     r = await fetch('/api/import_check?uid=' + encodeURIComponent(curUid));
     d = await r.json();
     if (d.exists) {
-      const ok = await showConfirmModal('This will overwrite an existing save. Are you sure?');
+      const ok = await showConfirmModal(t('confirm.overwrite_save', 'This will overwrite an existing save. Are you sure?'));
       if (!ok) {
         log('Import cancelled');
         try { await fetch('/api/unmount'); } catch(x) {}
@@ -1932,13 +2023,13 @@ async function importDrop(files, folderName) {
 function showImportSuccess(d) {
   $('ct').innerHTML =
     '<div class="drop"><div class="dlbl">'
-    + '<div style="color:var(--ok);font-size:16px;font-weight:700;margin-bottom:8px">Import Successful</div>'
+    + '<div style="color:var(--ok);font-size:16px;font-weight:700;margin-bottom:8px">' + t('status.import_ok', 'Import Successful') + '</div>'
     + '<b>' + esc(d.main_title || d.title_id) + '</b><br>'
     + esc(d.title_id) + ' / ' + esc(d.dir_name)
-    + (d.exists ? '<br><span style="color:var(--dm)">Existing save updated</span>' : '<br><span style="color:var(--dm)">New save added</span>')
+    + (d.exists ? '<br><span style="color:var(--dm)">' + t('status.existing_save_updated', 'Existing save updated') + '</span>' : '<br><span style="color:var(--dm)">' + t('status.new_save_added', 'New save added') + '</span>')
     + (d.warning ? '<br><span style="color:#c89b00">' + esc(d.warning) + '</span>' : '')
     + '</div>'
-    + '<button class="bbtn" style="margin-top:12px" onclick="switchTab(\'import\')">Import Another</button></div>';
+    + '<button class="bbtn" style="margin-top:12px" onclick="switchTab(\'import\')">' + t('status.import_another', 'Import Another') + '</button></div>';
 }
 
 /* ── Import DZ setup (accepts both folders and files) ── */
@@ -2006,7 +2097,7 @@ async function importEncrypted(files) {
   }
 
   bsy = true;
-  $('ct').innerHTML = '<div class="drop"><div class="dlbl">Uploading encrypted save...</div></div>';
+  $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + t('status.uploading_encrypted', 'Uploading encrypted save...') + '</div></div>';
   try {
     /* Upload .bin key first if PS4 */
     if (isPS4 && binFile) {
@@ -2033,7 +2124,7 @@ async function importEncrypted(files) {
 
     /* Check if save already exists */
     if (d.exists) {
-      const ok = await showConfirmModal('This will overwrite an existing save. Are you sure?');
+      const ok = await showConfirmModal(t('confirm.overwrite_save', 'This will overwrite an existing save. Are you sure?'));
       if (!ok) {
         log('Import cancelled');
         try { await fetch('/api/unmount'); } catch(x) {}
@@ -2047,12 +2138,12 @@ async function importEncrypted(files) {
     } else {
       /* Account ID mismatch — show modal */
       const resign = await showConfirmModal(
-        'Account ID Mismatch!<br><br>'
+        t('import.account_mismatch', 'Account ID Mismatch!') + '<br><br>'
         + '<span style="font-size:13px;color:var(--dm)">'
-        + 'Save: <b style="color:var(--tx)">' + esc(d.save_aid) + '</b><br>'
-        + 'Your account: <b style="color:var(--tx)">' + esc(d.user_aid) + '</b></span><br><br>'
-        + 'Do you want to resign to your account ID?',
-        'Yes, Resign', 'Cancel');
+        + t('import.save_account', 'Save') + ': <b style="color:var(--tx)">' + esc(d.save_aid) + '</b><br>'
+        + t('import.your_account', 'Your account') + ': <b style="color:var(--tx)">' + esc(d.user_aid) + '</b></span><br><br>'
+        + t('import.resign_question', 'Do you want to resign to your account ID?'),
+        t('import.yes_resign', 'Yes, Resign'), t('common.cancel', 'Cancel'));
       if (resign) {
         await doImportFinish();
       } else {
@@ -2077,8 +2168,8 @@ function showConfirmModal(msg, yesText, noText) {
     m.innerHTML =
       '<div style="background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:24px;max-width:400px;text-align:center">'
       + '<div style="font-size:14px;color:var(--tx);margin-bottom:16px">' + msg + '</div>'
-      + '<button class="btn grn" style="margin-right:8px" id="cmYes">' + (yesText || 'Yes') + '</button>'
-      + '<button class="btn red" id="cmNo">' + (noText || 'Cancel') + '</button>'
+      + '<button class="btn grn" style="margin-right:8px" id="cmYes">' + (yesText || t('common.yes', 'Yes')) + '</button>'
+      + '<button class="btn red" id="cmNo">' + (noText || t('common.cancel', 'Cancel')) + '</button>'
       + '</div>';
     document.body.appendChild(m);
     m.querySelector('#cmYes').onclick = () => { m.remove(); resolve(true); };
@@ -2103,31 +2194,31 @@ async function showSfoModal(opts) {
       + ' onmouseenter="this.style.background=\'var(--s2)\'" onmouseleave="this.style.background=\'\'">'
       + '<div style="flex:1;text-align:left"><div style="font-size:13px;color:var(--tx)">' + (t.title||t.tid) + '</div>'
       + '<div style="font-size:11px;color:var(--dm)">' + t.tid + ' / ' + t.dir + (t.ps4?' (PS4)':'') + '</div></div></div>'
-    ).join('') : '<div style="padding:16px;color:var(--dm);font-size:12px">No titles found in database</div>';
+    ).join('') : '<div style="padding:16px;color:var(--dm);font-size:12px">' + t('import.no_titles', 'No titles found in database') + '</div>';
     m.innerHTML =
       '<div style="background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:0;max-width:420px;width:90%;max-height:80vh;display:flex;flex-direction:column">'
       + '<div style="padding:16px 20px 12px;border-bottom:1px solid var(--bd)">'
-      + '<div style="font-size:14px;color:var(--tx);font-weight:600">Zeroed param.sfo detected</div>'
-      + '<div style="font-size:12px;color:var(--dm);margin-top:4px">Select a title from the database to regenerate</div></div>'
+      + '<div style="font-size:14px;color:var(--tx);font-weight:600">' + t('import.zeroed_sfo', 'Zeroed param.sfo detected') + '</div>'
+      + '<div style="font-size:12px;color:var(--dm);margin-top:4px">' + t('import.select_title_regen', 'Select a title from the database to regenerate') + '</div></div>'
       + '<div id="sfList" style="overflow-y:auto;max-height:40vh">' + listHtml + '</div>'
       + '<div id="sfStatus" style="font-size:11px;color:var(--dm);padding:4px 20px;min-height:16px"></div>'
       + '<div style="padding:12px 20px 16px;border-top:1px solid var(--bd);display:flex;gap:8px">'
-      + (hasAnyway ? '<button class="btn grn" style="flex:1" id="sfAnyway">Import Anyway</button>' : '')
-      + '<button class="btn red" style="flex:1" id="sfCancel">Cancel</button></div></div>';
+      + (hasAnyway ? '<button class="btn grn" style="flex:1" id="sfAnyway">' + t('import.anyway', 'Import Anyway') + '</button>' : '')
+      + '<button class="btn red" style="flex:1" id="sfCancel">' + t('common.cancel', 'Cancel') + '</button></div></div>';
     document.body.appendChild(m);
     m.querySelectorAll('.sfo-row').forEach(row => {
       row.onclick = async () => {
-        const t = titles[parseInt(row.dataset.i)];
+        const title = titles[parseInt(row.dataset.i)];
         m.querySelectorAll('.sfo-row').forEach(r => r.style.background = '');
         row.style.background = 'var(--ac)';
         row.style.borderRadius = '6px';
-        m.querySelector('#sfStatus').textContent = 'Regenerating from ' + t.tid + '/' + t.dir + '...';
+        m.querySelector('#sfStatus').textContent = t('import.regenerating', 'Regenerating from {source}...', {source: title.tid + '/' + title.dir});
         try {
-          const rr = await fetch('/api/regen_sfo?title_id=' + encodeURIComponent(t.tid) + '&dir_name=' + encodeURIComponent(t.dir));
+          const rr = await fetch('/api/regen_sfo?title_id=' + encodeURIComponent(title.tid) + '&dir_name=' + encodeURIComponent(title.dir));
           const rd = await rr.json();
           if (rd.error) { m.querySelector('#sfStatus').innerHTML = '<span style="color:#f44">' + rd.error + '</span>'; return; }
-          m.remove(); resolve({type:'regen', tid:t.tid, dir:t.dir});
-        } catch(e) { m.querySelector('#sfStatus').innerHTML = '<span style="color:#f44">Error: ' + e.message + '</span>'; }
+          m.remove(); resolve({type:'regen', tid:title.tid, dir:title.dir});
+        } catch(e) { m.querySelector('#sfStatus').innerHTML = '<span style="color:#f44">' + esc(t('status.error', 'Error: {error}', {error: e.message})) + '</span>'; }
       };
     });
     if (hasAnyway) {
@@ -2139,7 +2230,7 @@ async function showSfoModal(opts) {
 
 async function doImportFinish() {
   log('Importing to system...');
-  $('ct').innerHTML = '<div class="drop"><div class="dlbl">Importing save to system...</div></div>';
+  $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + t('status.importing', 'Importing save to system...') + '</div></div>';
   let r = await fetch('/api/import_finish?uid=' + encodeURIComponent(curUid));
   let d = await r.json();
   if (d.sfo_zeroed) {
@@ -2244,8 +2335,8 @@ function renderF() {
         + '<span class="sz">' + fmtB(f.size) + '</span></div>';
     }
   });
-  if (!isUsb) h += '<div class="dh" style="opacity:1;font-size:12px">Tip: Drag & drop files here to add or replace them</div>';
-  $('ct').innerHTML = h || '<div class="empty">Empty</div>';
+  if (!isUsb) h += '<div class="dh" style="opacity:1;font-size:12px">' + t('file.tip', 'Tip: Drag & drop files here to add or replace them') + '</div>';
+  $('ct').innerHTML = h || '<div class="empty">' + t('common.empty', 'Empty') + '</div>';
   if (!isUsb) {
     $('ct').oncontextmenu = e => {
       if (!e.target.closest('.fi:not(.dir)')) { e.preventDefault(); showCtxMenu(e, null); }
@@ -2267,7 +2358,7 @@ function showDirMenu(e, dirName) {
   m.className = 'ctx-menu';
   m.id = 'ctxmenu';
   const fn = dirName.replace(/'/g, "\\'");
-  m.innerHTML = '<div onclick="uploadToDir(\'' + fn + '\')">Upload File Here</div>';
+  m.innerHTML = '<div onclick="uploadToDir(\'' + fn + '\')">' + t('file.upload_here', 'Upload File Here') + '</div>';
   m.style.left = e.clientX + 'px';
   m.style.top = e.clientY + 'px';
   document.body.appendChild(m);
@@ -2319,13 +2410,13 @@ function showTitleMenu(e, titleId, isUsb) {
   const tid = titleId.replace(/'/g, "\\'");
   let items = '';
   if (isUsb) {
-    items += '<div onclick="importAllUsb(\'' + tid + '\')">Import All to System</div>';
+    items += '<div onclick="importAllUsb(\'' + tid + '\')">' + t('toolbar.import_all', 'Import All to System') + '</div>';
   } else {
-    items += '<div onclick="showExportModal(\'' + tid + '\',false)">Export All Saves</div>';
-    items += '<div onclick="showExportModal(\'' + tid + '\',true)">Export All Decrypted</div>';
-    items += '<div onclick="cloudBackupTitle(\'' + tid + '\')">Cloud Backup All</div>';
+    items += '<div onclick="showExportModal(\'' + tid + '\',false)">' + t('toolbar.export_all', 'Export All Saves') + '</div>';
+    items += '<div onclick="showExportModal(\'' + tid + '\',true)">' + t('toolbar.export_decrypted', 'Export All Decrypted') + '</div>';
+    items += '<div onclick="cloudBackupTitle(\'' + tid + '\')">' + t('toolbar.cloud_all', 'Cloud Backup All') + '</div>';
   }
-  items += '<div class="ctx-del" onclick="deleteTitle(\'' + tid + '\')">Delete All Saves</div>';
+  items += '<div class="ctx-del" onclick="deleteTitle(\'' + tid + '\')">' + t('toolbar.delete_all', 'Delete All Saves') + '</div>';
   m.innerHTML = items;
   m.style.left = e.clientX + 'px';
   m.style.top = e.clientY + 'px';
@@ -2337,8 +2428,8 @@ function showTitleMenu(e, titleId, isUsb) {
 
 async function showExportModal(titleId, decrypted) {
   closeCtxMenu();
-  const label = decrypted ? 'Export All Decrypted' : 'Export All Saves';
-  let usbHtml = '<div style="color:var(--dm);font-size:12px;margin-top:8px">Checking USB drives...</div>';
+  const label = decrypted ? t('toolbar.export_decrypted', 'Export All Decrypted') : t('toolbar.export_all', 'Export All Saves');
+  let usbHtml = '<div style="color:var(--dm);font-size:12px;margin-top:8px">' + t('saves.usb_checking', 'Checking USB drives...') + '</div>';
 
   const m = document.createElement('div');
   m.id = 'exportModal';
@@ -2346,9 +2437,9 @@ async function showExportModal(titleId, decrypted) {
   m.innerHTML =
     '<div style="background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:24px;max-width:400px;width:90%">'
     + '<div style="font-size:14px;font-weight:700;color:var(--tx);margin-bottom:16px">' + label + '</div>'
-    + '<button class="btn grn" style="width:100%;margin-bottom:12px" id="emDl">Download</button>'
+    + '<button class="btn grn" style="width:100%;margin-bottom:12px" id="emDl">' + t('common.download', 'Download') + '</button>'
     + '<div id="emUsb">' + usbHtml + '</div>'
-    + '<button class="btn red" style="width:100%;margin-top:12px" id="emCancel">Cancel</button>'
+    + '<button class="btn red" style="width:100%;margin-top:12px" id="emCancel">' + t('common.cancel', 'Cancel') + '</button>'
     + '</div>';
   document.body.appendChild(m);
 
@@ -2366,14 +2457,14 @@ async function showExportModal(titleId, decrypted) {
     const el = m.querySelector('#emUsb');
     if (!el) return;
     if (d.usb && d.usb.length > 0) {
-      el.innerHTML = '<div style="font-size:11px;color:var(--dm);margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">Dump to USB</div>'
+      el.innerHTML = '<div style="font-size:11px;color:var(--dm);margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">' + t('toolbar.dump_usb', 'Dump to USB') + '</div>'
         + d.usb.map(u => '<button class="btn" style="width:100%;margin-bottom:6px;background:var(--bd);color:var(--tx)" onclick="dumpTitleUsb(\'' + titleId.replace(/'/g, "\\'") + '\',' + u + ',' + decrypted + ')">USB ' + u + '</button>').join('');
     } else {
-      el.innerHTML = '<div style="color:var(--dm);font-size:12px">No USB drives detected</div>';
+      el.innerHTML = '<div style="color:var(--dm);font-size:12px">' + t('saves.usb_none', 'No USB drives detected') + '</div>';
     }
   } catch(e) {
     const el = m.querySelector('#emUsb');
-    if (el) el.innerHTML = '<div style="color:var(--er);font-size:12px">Failed to check USB drives</div>';
+    if (el) el.innerHTML = '<div style="color:var(--er);font-size:12px">' + t('saves.usb_failed', 'Failed to check USB drives') + '</div>';
   }
 }
 
@@ -2395,7 +2486,7 @@ async function dumpTitleUsb(titleId, usbNum, decrypted) {
 
 async function deleteTitle(titleId) {
   closeCtxMenu();
-  const ok = await showConfirmModal('Delete all saves for ' + titleId + '? This cannot be undone.');
+  const ok = await showConfirmModal(t('confirm.delete_title', 'Delete all saves for {title}? This cannot be undone.', {title: esc(titleId)}));
   if (!ok) return;
   log('Deleting all saves for ' + titleId + '...');
   try {
@@ -2419,11 +2510,11 @@ function showSaveMenu(e, idx) {
   m.id = 'ctxmenu';
   let items = '';
   if (s.usb) {
-    items += '<div onclick="importSingleUsb(' + idx + ')">Import to System</div>';
+    items += '<div onclick="importSingleUsb(' + idx + ')">' + t('toolbar.import_system', 'Import to System') + '</div>';
   } else {
-    items += '<div onclick="cloudBackupSave(' + idx + ')">Cloud Backup</div>';
+    items += '<div onclick="cloudBackupSave(' + idx + ')">' + t('toolbar.cloud_backup', 'Cloud Backup') + '</div>';
   }
-  items += '<div class="ctx-del" onclick="deleteSave(' + idx + ')">Delete</div>';
+  items += '<div class="ctx-del" onclick="deleteSave(' + idx + ')">' + t('common.delete', 'Delete') + '</div>';
   m.innerHTML = items;
   m.style.left = e.clientX + 'px';
   m.style.top = e.clientY + 'px';
@@ -2439,7 +2530,7 @@ async function importSingleUsb(idx) {
   const s = S[idx];
   const exists = S.some((x, i) => i !== idx && !x.usb && x.title_id === s.title_id && x.save_name === s.save_name);
   if (exists) {
-    const ok = await showConfirmModal('This will overwrite an existing save. Are you sure?');
+    const ok = await showConfirmModal(t('confirm.overwrite_save', 'This will overwrite an existing save. Are you sure?'));
     if (!ok) return;
   }
   bsy = true;
@@ -2463,8 +2554,9 @@ async function importAllUsb(titleId) {
   const usbSaves = S.map((s, i) => ({s, i})).filter(x => x.s.usb && x.s.title_id === titleId);
   if (usbSaves.length === 0) { log('No USB saves found for ' + titleId, 'err'); return; }
   const existingAny = usbSaves.some(x => S.some((s2, j) => j !== x.i && !s2.usb && s2.title_id === x.s.title_id && s2.save_name === x.s.save_name));
-  const msg = 'Import ' + usbSaves.length + ' save(s) for ' + titleId + ' to system?' + (existingAny ? '\n\nSome saves already exist and will be overwritten.' : '');
-  const ok = await showConfirmModal(msg, 'Import All', 'Cancel');
+  const msg = t('confirm.import_all', 'Import {count} save(s) for {title} to system?', {count: usbSaves.length, title: esc(titleId)})
+    + (existingAny ? '<br><br>' + t('confirm.some_overwritten', 'Some saves already exist and will be overwritten.') : '');
+  const ok = await showConfirmModal(msg, t('toolbar.import_all', 'Import All'), t('common.cancel', 'Cancel'));
   if (!ok) return;
   bsy = true; renderTB();
   let imported = 0, failed = 0;
@@ -2490,7 +2582,7 @@ async function importAllUsb(titleId) {
 async function deleteCurrentSave() {
   if (bsy || si < 0) return;
   const s = S[si];
-  const ok = await showConfirmModal('Delete ' + s.title_id + '/' + s.save_name + '? This cannot be undone.');
+  const ok = await showConfirmModal(t('confirm.delete_save', 'Delete {save}? This cannot be undone.', {save: esc(s.title_id + '/' + s.save_name)}));
   if (!ok) return;
   bsy = true; renderTB();
   try {
@@ -2512,7 +2604,7 @@ async function deleteCurrentSave() {
 async function deleteSave(idx) {
   closeCtxMenu();
   const s = S[idx];
-  const ok = await showConfirmModal('Delete ' + s.title_id + '/' + s.save_name + '? This cannot be undone.');
+  const ok = await showConfirmModal(t('confirm.delete_save', 'Delete {save}? This cannot be undone.', {save: esc(s.title_id + '/' + s.save_name)}));
   if (!ok) return;
   try {
     log('Deleting ' + s.title_id + '/' + s.save_name + '...');
@@ -2536,12 +2628,12 @@ function showCtxMenu(e, fname) {
   let items = '';
   if (fname) {
     const fn = esc(fname).replace(/'/g, "\\'");
-    items += '<div onclick="ctxDownload(\'' + fn + '\')">Download</div>';
+    items += '<div onclick="ctxDownload(\'' + fn + '\')">' + t('common.download', 'Download') + '</div>';
   }
-  items += '<div onclick="ctxUpload()">Upload File</div>';
+  items += '<div onclick="ctxUpload()">' + t('common.upload_file', 'Upload File') + '</div>';
   if (fname) {
     const fn = esc(fname).replace(/'/g, "\\'");
-    items += '<div class="ctx-del" onclick="ctxDelete(\'' + fn + '\')">Delete</div>';
+    items += '<div class="ctx-del" onclick="ctxDelete(\'' + fn + '\')">' + t('common.delete', 'Delete') + '</div>';
   }
   m.innerHTML = items;
   m.style.left = e.clientX + 'px';
@@ -2574,7 +2666,7 @@ function ctxUpload() {
 
 async function ctxDelete(name) {
   closeCtxMenu();
-  if (!confirm('Delete ' + name + '?')) return;
+  if (!confirm(t('confirm.delete_file', 'Delete {name}?', {name}))) return;
   try {
     const r = await fetch('/api/delete_file?name=' + encodeURIComponent(name));
     const d = await r.json();
@@ -2692,15 +2784,15 @@ function renderEditorShell() {
   const fname = edName.split('/').pop();
   const isUsb = si >= 0 && S[si] && S[si].usb;
   let bar = '<div class="editor-bar">'
-    + '<button class="ebtn" onclick="closeEditor()">\u2190 Back</button>'
-    + '<button class="ebtn' + (edMode==='hex'?' eact':'') + '" onclick="edSwitchMode(\'hex\')">Hex</button>'
-    + '<button class="ebtn' + (edMode==='text'?' eact':'') + '" onclick="edSwitchMode(\'text\')">Text</button>'
+    + '<button class="ebtn" onclick="closeEditor()">\u2190 ' + t('common.back', 'Back') + '</button>'
+    + '<button class="ebtn' + (edMode==='hex'?' eact':'') + '" onclick="edSwitchMode(\'hex\')">' + t('editor.hex', 'Hex') + '</button>'
+    + '<button class="ebtn' + (edMode==='text'?' eact':'') + '" onclick="edSwitchMode(\'text\')">' + t('editor.text', 'Text') + '</button>'
     + '<span class="ename">' + esc(fname) + '</span>'
     + '<span class="esz">' + fmtB(edTotal) + '</span>'
     + '<button class="ebtn" onclick="edZoom(-1)" style="padding:4px 8px;font-size:14px">\u2212</button>'
     + '<span style="font-size:11px;color:var(--dm);min-width:30px;text-align:center">' + edFontSize + 'px</span>'
     + '<button class="ebtn" onclick="edZoom(1)" style="padding:4px 8px;font-size:14px">+</button>';
-  if (!isUsb) bar += '<button class="ebtn" style="border-color:var(--ok);color:var(--ok)" onclick="saveEditor()">Save</button>';
+  if (!isUsb) bar += '<button class="ebtn" style="border-color:var(--ok);color:var(--ok)" onclick="saveEditor()">' + t('common.save', 'Save') + '</button>';
   bar += '</div>';
 
   if (edMode === 'hex') {
@@ -2717,9 +2809,9 @@ function renderEditorShell() {
     c.innerHTML = bar
       + '<div class="text-wrap">'
       + '<pre id="texthl"></pre>'
-      + '<textarea id="textedit" spellcheck="false">Loading...</textarea>'
+      + '<textarea id="textedit" spellcheck="false">' + t('editor.loading', 'Loading...') + '</textarea>'
       + '</div>'
-      + '<div id="etload" style="display:none;text-align:center;padding:4px;font-size:11px;color:var(--dm)">Loading more...</div>';
+      + '<div id="etload" style="display:none;text-align:center;padding:4px;font-size:11px;color:var(--dm)">' + t('editor.loading_more', 'Loading more...') + '</div>';
     edTextLoaded = 0;
     edLoadTextChunk();
   }
@@ -2975,7 +3067,7 @@ function editByte(off) {
   if (isUsb || !edOpen || off >= edTotal) return;
   const b = edGetCachedByte(off);
   const cur = b ? b.v.toString(16).toUpperCase().padStart(2, '0') : '00';
-  const val = prompt('Edit byte at 0x' + off.toString(16).toUpperCase() + ' (hex):', cur);
+  const val = prompt(t('editor.edit_byte', 'Edit byte at 0x{offset} (hex):', {offset: off.toString(16).toUpperCase()}), cur);
   if (val === null) return;
   const parsed = parseInt(val, 16);
   if (isNaN(parsed) || parsed < 0 || parsed > 255) { log('Invalid byte value', 'err'); return; }
@@ -3007,7 +3099,7 @@ async function saveEditor() {
 
 async function closeEditor() {
   if (edHasEdits()) {
-    if (!confirm('You have unsaved changes. Discard?')) return;
+    if (!confirm(t('editor.discard_changes', 'You have unsaved changes. Discard?'))) return;
   }
   try { await fetch('/api/editor/close'); } catch(e) {}
   edName = ''; edTotal = 0; edOpen = false; edCache = {}; edDirty = {}; edTextDirty = false;
@@ -3020,11 +3112,11 @@ function confirmReplace(name) {
     const bg = document.createElement('div');
     bg.className = 'modal-bg';
     bg.innerHTML =
-      '<div class="modal"><h3>File already exists</h3>'
-      + '<p><b>' + esc(name) + '</b> already exists in this save. Replace it?</p>'
+      '<div class="modal"><h3>' + t('file.exists', 'File already exists') + '</h3>'
+      + '<p>' + t('file.replace_question', '<b>{name}</b> already exists in this save. Replace it?', {name: esc(name)}) + '</p>'
       + '<div class="btns">'
-      + '<button class="mbtn-s" id="mskip">Skip</button>'
-      + '<button class="mbtn-r" id="mrep">Replace</button>'
+      + '<button class="mbtn-s" id="mskip">' + t('common.skip', 'Skip') + '</button>'
+      + '<button class="mbtn-r" id="mrep">' + t('common.replace', 'Replace') + '</button>'
       + '</div></div>';
     document.body.appendChild(bg);
     $("mrep").onclick = () => { bg.remove(); res(true) };
@@ -3256,17 +3348,17 @@ async function refreshAutoStatus() {
   try {
     const r = await fetch('/api/cloud/auto_status');
     const d = await r.json();
-    let mode = d.lnc_saw_title ? 'game-close detection' : 'waiting for watched game';
-    if (!d.auto_enabled) mode = 'auto backup disabled in config';
-    else if (!d.cloud_enabled) mode = 'cloud backup disabled in config';
-    else if (d.config_error) mode = 'config error';
-    $('autoStatus').innerHTML = 'Watcher: ' + (d.watcher_running ? 'running' : 'stopped')
-      + ' | Mode: ' + esc(mode)
-      + ' | Running: ' + esc(d.current_title || 'none')
-      + ' | Last: ' + esc(d.last_result || 'none')
-      + ' | Pending Drive queue: ' + (d.pending_count || 0);
+    let mode = d.lnc_saw_title ? t('auto.game_close', 'game-close detection') : t('auto.waiting_game', 'waiting for watched game');
+    if (!d.auto_enabled) mode = t('auto.disabled', 'auto backup disabled in config');
+    else if (!d.cloud_enabled) mode = t('auto.cloud_disabled', 'cloud backup disabled in config');
+    else if (d.config_error) mode = t('auto.config_error', 'config error');
+    $('autoStatus').innerHTML = t('auto.watcher', 'Watcher') + ': ' + (d.watcher_running ? t('auto.running', 'running') : t('auto.stopped', 'stopped'))
+      + ' | ' + t('auto.mode', 'Mode') + ': ' + esc(mode)
+      + ' | ' + t('auto.current', 'Running') + ': ' + esc(d.current_title || t('auto.none', 'none'))
+      + ' | ' + t('auto.last', 'Last') + ': ' + esc(d.last_result || t('auto.none', 'none'))
+      + ' | ' + t('auto.pending', 'Pending Drive queue') + ': ' + (d.pending_count || 0);
   } catch (e) {
-    $('autoStatus').textContent = 'Auto status failed: ' + e.message;
+    $('autoStatus').textContent = t('auto.status_failed', 'Auto status failed: {error}', {error: e.message});
   }
 }
 
@@ -3279,7 +3371,7 @@ async function loadDriveQueueStatus() {
     if (count) log('Pending Google Drive backup queue: ' + count);
     return d.queue || [];
   } catch (e) {
-    if ($('autoStatus')) $('autoStatus').textContent = 'Queue status failed: ' + e.message;
+    if ($('autoStatus')) $('autoStatus').textContent = t('auto.queue_failed', 'Queue status failed: {error}', {error: e.message});
     return [];
   }
 }
@@ -3394,7 +3486,7 @@ async function dumpUsb() {
       closeCtxMenu();
       const m = document.createElement('div');
       m.className = 'ctx-menu'; m.id = 'ctxmenu';
-      m.innerHTML = '<div style="padding:4px 10px;font-size:10px;color:var(--dm);font-weight:600">Select USB</div>'
+      m.innerHTML = '<div style="padding:4px 10px;font-size:10px;color:var(--dm);font-weight:600">' + t('saves.select_usb', 'Select USB') + '</div>'
         + ud.usb.map(u => '<div onclick="closeCtxMenu();dumpUsbTo(' + u + ')">USB ' + u + ' (usb' + u + ')</div>').join('');
       m.style.left = '50%'; m.style.top = '50%';
       m.style.transform = 'translate(-50%,-50%)'; m.style.position = 'fixed';
@@ -3427,7 +3519,7 @@ async function importUsb() {
   /* Check if a system save with same title_id and save_name exists */
   const exists = S.some((x, i) => i !== si && !x.usb && x.title_id === s.title_id && x.save_name === s.save_name);
   if (exists) {
-    const ok = await showConfirmModal('This will overwrite an existing save. Are you sure?');
+    const ok = await showConfirmModal(t('confirm.overwrite_save', 'This will overwrite an existing save. Are you sure?'));
     if (!ok) return;
   }
   bsy = true; renderTB();
@@ -3576,7 +3668,7 @@ function dl(b, n) {
 
 /* ── Shutdown ──────────────────────────────────────── */
 async function shutdown() {
-  if (!confirm('Kill GarlicMgr?')) return;
+  if (!confirm(t('confirm.kill', 'Kill GarlicMgr?'))) return;
   log('Killing GarlicMgr...');
   try { await fetch('/api/shutdown') } catch (e) {}
   log('GarlicMgr killed', 'ok');
@@ -3584,7 +3676,7 @@ async function shutdown() {
   bg.className = 'modal-bg';
   bg.innerHTML =
     '<div class="modal" style="text-align:center">'
-    + '<h3 style="font-size:18px;margin-bottom:16px">Thank you for using<br>Garlic SaveMgr!</h3>'
+    + '<h3 style="font-size:18px;margin-bottom:16px">' + t('shutdown.thanks', 'Thank you for using Garlic SaveMgr!') + '</h3>'
     + '<p style="color:var(--dm);margin-bottom:12px">by earthonion</p>'
     + '<iframe src="https://github.com/sponsors/earthonion/button" title="Sponsor earthonion" height="32" width="114" style="border:0;border-radius:6px"></iframe>'
     + '</div>';
@@ -3592,17 +3684,23 @@ async function shutdown() {
 }
 
 /* ── Init ──────────────────────────────────────────── */
-if (window.innerWidth <= 768) $('drawer').classList.add('collapsed');
-else drawerOpen = true;
-updateDrawer();
-loadUsers().then(() => load());
-setInterval(() => {
-  if (tab !== 'settings') return;
-  refreshAutoStatus();
-  drainDriveQueue(false);
-}, 15000);
-renderCt();
-renderTB();
+async function init() {
+  applyLanguage();
+  if (window.innerWidth <= 768) $('drawer').classList.add('collapsed');
+  else drawerOpen = true;
+  updateDrawer();
+  await loadUsers();
+  await load();
+  setInterval(() => {
+    if (tab !== 'settings') return;
+    refreshAutoStatus();
+    drainDriveQueue(false);
+  }, 15000);
+  renderCt();
+  renderTB();
+}
+
+init();
 </script>
 </body>
 </html>

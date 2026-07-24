@@ -9,11 +9,16 @@ CFLAGS := -O2 -Wall -D_BSD_SOURCE -std=gnu11 -Isrc -I$(PS5_INCDIR)
 SQLITE_FLAGS := -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_WAL -w
 LDFLAGS := -L$(PS5_LIBDIR)
 LIBS := -lkernel_sys -lkernel -lSceSystemService -lSceUserService -lSceFsInternalForVsh -lSceRegMgr -lSceNet
+I18N_FILES := $(wildcard src/i18n/*.js)
+PREVIEW_DIR ?= /tmp/garlic-savemgr-ui-preview
+PREVIEW_PORT ?= 8082
 
 all: garlic-savemgr.elf
 
-src/ui.h: src/ui.html
+src/ui.h: src/ui.html src/i18n $(I18N_FILES)
 	sed 's/__VERSION__/v$(VERSION)/g' $< > src/_ui_tmp.html
+	for file in $(I18N_FILES); do sed -i '/^"__I18N_DICTIONARIES__";$$/r '"$$file" src/_ui_tmp.html; done
+	sed -i '/^"__I18N_DICTIONARIES__";$$/d' src/_ui_tmp.html
 	xxd -i src/_ui_tmp.html > $@
 	sed -i 's/src__ui_tmp_html/src_ui_html/g' $@
 	rm -f src/_ui_tmp.html
@@ -27,4 +32,12 @@ garlic-savemgr.elf: src/main.c src/ui.h src/sqlite3.o
 clean:
 	rm -f garlic-savemgr.elf src/ui.h src/sqlite3.o src/_ui_tmp.html
 
-.PHONY: all clean
+ui-preview: src/ui.html src/i18n $(I18N_FILES)
+	mkdir -p $(PREVIEW_DIR)
+	sed 's/__VERSION__/local-preview/g' src/ui.html > $(PREVIEW_DIR)/index.html
+	for file in $(I18N_FILES); do sed -i '/^"__I18N_DICTIONARIES__";$$/r '"$$file" $(PREVIEW_DIR)/index.html; done
+	sed -i '/^"__I18N_DICTIONARIES__";$$/d' $(PREVIEW_DIR)/index.html
+	@echo "UI preview: http://127.0.0.1:$(PREVIEW_PORT)/"
+	cd $(PREVIEW_DIR) && python3 -m http.server $(PREVIEW_PORT) --bind 0.0.0.0
+
+.PHONY: all clean ui-preview
