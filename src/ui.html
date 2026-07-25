@@ -825,6 +825,7 @@ async function loadUsers() {
     users = d.users || [];
     if (users.length > 0) {
       curUid = users[0].id;
+      $('curuser').removeAttribute('data-i18n');
       $('curuser').textContent = users[0].name;
     }
     if (users.length <= 1) $('usersel').querySelector('.arrow').style.display = 'none';
@@ -843,6 +844,7 @@ function toggleUserDD() {
 function selectUser(uid) {
   curUid = uid;
   const u = users.find(x => x.id === uid);
+  $('curuser').removeAttribute('data-i18n');
   $('curuser').textContent = u ? u.name : uid;
   $('userdd').classList.remove('open');
   si = -1; mt = null; cf = [];
