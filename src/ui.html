@@ -1059,11 +1059,6 @@ function renderCt() {
       + '<input id="eaid" type="text" maxlength="16" placeholder="' + esc(t('encrypt.optional', 'optional')) + '" '
       + 'style="background:var(--bg);border:1px solid var(--bd);color:var(--tx);padding:6px 10px;border-radius:8px;font-family:monospace;font-size:13px;width:170px">'
       + '</div>'
-      + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:16px">'
-      + '<label style="cursor:pointer;display:flex;align-items:center;gap:6px;font-size:12px;color:var(--dm);font-weight:600;text-transform:uppercase;letter-spacing:.5px">'
-      + '<input id="eps4" type="checkbox" style="accent-color:#1e6fbf;width:16px;height:16px"> ' + t('encrypt.ps4_save', 'PS4 Save')
-      + '</label>'
-      + '</div>'
       + '<div class="drop" id="dz">'
       + '<div class="dlbl">' + t('drop.encrypt', 'Drag & drop a folder to encrypt into a save') + '</div>'
       + '<button class="bbtn">' + t('drop.browse_folder', 'Browse Folder') + '</button></div>';
@@ -2017,15 +2012,47 @@ async function decDropOne(save, batch) {
 }
 
 /* ── Encrypt drop ──────────────────────────────────── */
+async function detectEncryptPlatform(files) {
+  const sfos = Array.from(files).filter(f => {
+    const path = (f._path || f.webkitRelativePath || f.name).replace(/\\/g, '/');
+    return /(?:^|\/)sce_sys\/param\.sfo$/i.test(path);
+  });
+  if (sfos.length !== 1) throw new Error('Folder must contain one sce_sys/param.sfo');
+  const bytes = new Uint8Array(await sfos[0].arrayBuffer());
+  const view = new DataView(bytes.buffer);
+  const invalid = () => { throw new Error('Invalid param.sfo'); };
+  if (bytes.length < 20 || view.getUint32(0, true) !== 0x46535000) invalid();
+  const keyOffset = view.getUint32(8, true), dataOffset = view.getUint32(12, true);
+  const count = view.getUint32(16, true);
+  if (20 + count * 16 > keyOffset || keyOffset > dataOffset || dataOffset > bytes.length) invalid();
+  const decoder = new TextDecoder();
+  for (let i = 0; i < count; i++) {
+    const entry = 20 + i * 16;
+    const keyStart = keyOffset + view.getUint16(entry, true);
+    const keyEnd = bytes.indexOf(0, keyStart);
+    if (keyStart >= dataOffset || keyEnd < keyStart || keyEnd >= dataOffset) invalid();
+    if (decoder.decode(bytes.subarray(keyStart, keyEnd)) !== 'TITLE_ID') continue;
+    const start = dataOffset + view.getUint32(entry + 12, true);
+    const length = view.getUint32(entry + 4, true);
+    if (view.getUint16(entry + 2, true) !== 0x0204 || !length || start + length > bytes.length) invalid();
+    const titleId = decoder.decode(bytes.subarray(start, start + length)).replace(/\0.*$/s, '');
+    if (!/^(CUSA|PPSA)\d{5}$/.test(titleId))
+      throw new Error('param.sfo TITLE_ID must be CUSAxxxxx (PS4) or PPSAxxxxx (PS5)');
+    return {titleId, isPS4: titleId.startsWith('CUSA')};
+  }
+  throw new Error('param.sfo is missing TITLE_ID');
+}
+
 async function encDrop(files, folderName, entries) {
   if (bsy) return;
   const aidv = document.getElementById('eaid') ? document.getElementById('eaid').value.trim() : '';
-  const isPS4 = document.getElementById('eps4') ? document.getElementById('eps4').checked : false;
   return runFolderSaves(files, folderName, entries, 'Encrypt',
-    (all, name) => encDropOne(all, name, aidv, isPS4));
+    (all, name) => encDropOne(all, name, aidv));
 }
 
-async function encDropOne(files, folderName, aidv, isPS4) {
+async function encDropOne(files, folderName, aidv) {
+  const {titleId, isPS4} = await detectEncryptPlatform(files);
+  log('Detected ' + (isPS4 ? 'PS4' : 'PS5') + ' save: ' + titleId, 'ok');
   /* Calculate total size for PFS image sizing */
   let totalSize = 0;
   for (const f of files) totalSize += f.size;
