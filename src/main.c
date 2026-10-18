@@ -28,6 +28,7 @@
  
  #include <ps5/kernel.h>
  #include "sqlite3.h"
+ #include "sfo_account.h"
  
  /* ── SDK imports ────────────────────────────────────────────────── */
  typedef struct { uint8_t reserved; char *budgetid; } MountOpt;
@@ -199,7 +200,7 @@
  }
  
  /* ── Account ID lookup via registry ─────────────────────────────── */
- static uint64_t get_account_id_for_user(const char *uid_hex) {
+ static int get_account_id_for_user(const char *uid_hex, uint64_t *account_id) {
      /* Read username from /user/home/<uid>/username.dat */
      char upath[MAX_PATH_LEN];
      snprintf(upath, sizeof(upath), "/user/home/%s/username.dat", uid_hex);
@@ -210,7 +211,7 @@
          username[16] = 0;
          close(fd);
      }
-     if (!username[0]) return 0;
+     if (!username[0]) return -1;
  
      /* Iterate registry accounts 1-16, match by name */
      for (int i = 1; i <= 16; i++) {
@@ -221,14 +222,15 @@
          if (strcmp(username, reg_name) == 0) {
              int key_aid = (i - 1) * 65536 + 125830400;
              uint64_t aid = 0;
-             sceRegMgrGetBin(key_aid, &aid, sizeof(aid));
+             if (sceRegMgrGetBin(key_aid, &aid, sizeof(aid)) < 0) return -1;
              printf("[GarlicMgr] Registry: user '%s' = account %d, aid=%llx\n",
                     username, i, (unsigned long long)aid);
-             return aid;
+             *account_id = aid;
+             return 0;
          }
      }
      printf("[GarlicMgr] Registry: no account found for user '%s'\n", username);
-     return 0;
+     return -1;
  }
  
  /* ── Notification ───────────────────────────────────────────────── */
@@ -1701,8 +1703,8 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
  }
  
  /* ── Mount by path (for uploaded files already on /data/) ──────── */
- static int mount_by_path(const char *path) {
-     if (g_mounted) unmount_save();
+ static int mount_by_path_at(const char *path, const char *mount_point, int track) {
+     if (track && g_mounted) unmount_save();
  
      const char *bname = strrchr(path, '/');
      bname = bname ? bname + 1 : path;
@@ -1717,7 +1719,7 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
              close(hfd);
          }
      }
-     g_enc_ps4 = is_ps4;
+     if (track) g_enc_ps4 = is_ps4;
      logprintf("[GarlicMgr] mount_by_path: %s detected as %s\n", bname, is_ps4 ? "PS4" : "PS5");
  
      kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
@@ -1804,8 +1806,7 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
          /* Try mounting with zeroed key anyway */
      }
  
-     snprintf(g_mount_point, sizeof(g_mount_point), "/data/mount_sd");
-     mkdir(g_mount_point, 0777);
+     mkdir(mount_point, 0777);
  
      MountOpt mopt;
      memset(&mopt, 0, sizeof(mopt));
@@ -1813,18 +1814,26 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      mopt.budgetid = "system";
  
      signal(SIGPIPE, SIG_DFL);
-     int ret = sceFsMountSaveData(&mopt, path, g_mount_point, decrypted_key);
+     int ret = sceFsMountSaveData(&mopt, path, mount_point, decrypted_key);
      signal(SIGPIPE, SIG_IGN);
  
      if (ret >= 0) {
          logprintf("[GarlicMgr] mount: mounted %s (handle=%d, key_ok=%d)\n", path, ret, key_ok);
-         snprintf(g_mounted_path, sizeof(g_mounted_path), "%s", path);
-         g_local_copy[0] = 0;
-         g_mounted = 1;
+         if (track) {
+             snprintf(g_mount_point, sizeof(g_mount_point), "%s", mount_point);
+             snprintf(g_mounted_path, sizeof(g_mounted_path), "%s", path);
+             g_local_copy[0] = 0;
+             g_mounted_idx = -1;
+             g_mounted = 1;
+         }
          return 0;
      }
      logprintf("[GarlicMgr] mount: failed 0x%x (key_ok=%d)\n", ret, key_ok);
      return ret;
+ }
+
+ static int mount_by_path(const char *path) {
+     return mount_by_path_at(path, "/data/mount_sd", 1);
  }
  
  /* ── SFO parser ────────────────────────────────────────────────── */
@@ -1903,6 +1912,99 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      return 0;
  }
  
+ /* Prefer an exact PS4 template, then try the user's other local saves.
+  * Read a disposable image copy on a separate mount; never write the donor. */
+ static int patch_local_sfo_owner(const char *path, const uint8_t account[8],
+                                  uint32_t uid, int is_ps4) {
+     static int template_mounted = 0;
+     if (!is_ps4) return patch_sfo_account(path, account, &uid);
+     if (template_mounted) return -1;
+     sfo_info_t incoming;
+     if (parse_sfo(path, &incoming) < 0) return -1;
+     uint8_t params[1024];
+     const char *image = "/data/save_files/sdimg__owner_template";
+     const char *key = "/data/save_files/_owner_template.bin";
+     const char *point = "/data/mount_owner";
+     for (int pass = 0; pass < 3; pass++) {
+     for (int i = 0; i < g_save_count; i++) {
+         const save_entry_t *save = &g_saves[i];
+         const char *dir = save->save_name;
+         if (strncmp(dir, "sdimg_", 6) == 0) dir += 6;
+         int same_title = strcmp(save->title_id, incoming.title_id) == 0;
+         int rank = same_title ? (strcmp(dir, incoming.dir_name) == 0 ? 0 : 1) : 2;
+         if (!save->is_ps4 || save->is_usb || save->is_backup || rank != pass ||
+             (uint32_t)strtoul(save->user_id, NULL, 16) != uid) continue;
+         char key_src[MAX_PATH_LEN];
+         snprintf(key_src, sizeof(key_src), "%s", save->path);
+         char *base = strrchr(key_src, '/');
+         if (!base) continue;
+         snprintf(base + 1, sizeof(key_src) - (size_t)(base + 1 - key_src), "%s.bin", dir);
+         mkdir("/data/save_files", 0777);
+         if (copy_file(save->path, image) < 0 || copy_file(key_src, key) < 0) {
+             unlink(image); unlink(key); continue;
+         }
+         if (mount_by_path_at(image, point, 0) < 0) {
+             unlink(image); unlink(key); continue;
+         }
+         template_mounted = 1;
+         char template_sfo[MAX_PATH_LEN];
+         snprintf(template_sfo, sizeof(template_sfo), "%s/sce_sys/param.sfo", point);
+         sfo_info_t donor;
+         int valid = parse_sfo(template_sfo, &donor) == 0 &&
+             strcmp(donor.title_id, save->title_id) == 0 &&
+             strcmp(donor.dir_name, dir) == 0 &&
+             sfo_read_owner_params(template_sfo, account, uid, params) == 0;
+         UmountOpt opt;
+         memset(&opt, 0, sizeof(opt));
+         sceFsInitUmountSaveDataOpt(&opt);
+         if (sceFsUmountSaveData(&opt, point, 0, 0) < 0) return -1;
+         template_mounted = 0;
+         unlink(image); unlink(key);
+         if (!valid) continue;
+         int patched = pass == 0 ? patch_sfo_owner_params(path, account, uid, params) :
+                                   patch_sfo_owner_identity(path, account, uid, params);
+         if (patched < 0) return -1;
+         logprintf("[GarlicMgr] PS4 ownership %s from local %s/%s for user %x\n",
+                   pass == 0 ? "restored" : "partially recovered (unverified)",
+                   donor.title_id, donor.dir_name, uid);
+         return pass == 0 ? 0 : 1;
+     }
+     }
+     logprintf("[GarlicMgr] No local PS4 ownership template for %s/%s and user %x\n",
+               incoming.title_id, incoming.dir_name, uid);
+     return -2;
+ }
+
+ /* Import is best effort: unavailable ownership metadata is a warning, not
+  * a reason to cancel copying the save. Normal mount/copy errors still fail. */
+ static int patch_import_sfo_owner(const char *path, uint64_t original_aid,
+                                   const char *uid_hex, uint32_t uid, int is_ps4,
+                                   uint64_t *local_aid) {
+     if (get_account_id_for_user(uid_hex, local_aid) < 0) {
+         *local_aid = original_aid;
+         return 4;
+     }
+     int result = patch_local_sfo_owner(path, (const uint8_t *)local_aid, uid, is_ps4);
+     if (result >= 0) return result;
+     if (patch_sfo_account(path, (const uint8_t *)local_aid, &uid) == 0) return 2;
+     /* Try the account alone if a user field is absent. */
+     if (patch_sfo_account(path, (const uint8_t *)local_aid, NULL) == 0) return 2;
+     *local_aid = original_aid;
+     sfo_info_t actual;
+     if (parse_sfo(path, &actual) == 0) *local_aid = actual.account_id;
+     return 3;
+ }
+
+ static const char *import_owner_warning(int result) {
+     switch (result) {
+         case 1: return "Owner identity recovered from another local save. Full ownership could not be verified; the game may report corrupt data.";
+         case 2: return "Full ownership metadata unavailable. Imported with basic account/user changes only; the game may report corrupt data.";
+         case 3: return "Ownership changes could not be verified. Imported anyway; the game may report corrupt data.";
+         case 4: return "Selected user Account ID could not be read. Imported with original ownership; the game may report corrupt data.";
+         default: return "";
+     }
+ }
+
  /* Per-user PARAMS HMAC cache.
   * The HMAC at PARAMS offset 0x08 (32 bytes) is identical across all saves
   * for the same user — we cache it from any valid param.sfo we encounter. */
@@ -4560,11 +4662,8 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          }
          if (sfo_ret == 0) {
              cache_params_hmac(sfo_path);
-             if (sfo_info.account_id) {
-                 uint8_t *a = (uint8_t *)&sfo_info.account_id;
-                 snprintf(acct_id, sizeof(acct_id), "0x%02X%02X%02X%02X%02X%02X%02X%02X",
-                     a[0],a[1],a[2],a[3],a[4],a[5],a[6],a[7]);
-             }
+             snprintf(acct_id, sizeof(acct_id), "0x%016llX",
+                      (unsigned long long)sfo_info.account_id);
              if (sfo_info.main_title[0]) {
                  int tp = 0;
                  for (int ti = 0; sfo_info.main_title[ti] && tp < (int)sizeof(save_title) - 2; ti++) {
@@ -5444,9 +5543,10 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              snprintf(uid_hex, sizeof(uid_hex), "%x", (uint32_t)local_uid);
          }
  
-         uint64_t user_aid = get_account_id_for_user(uid_hex);
+         uint64_t user_aid = 0;
+         int user_aid_known = get_account_id_for_user(uid_hex, &user_aid) == 0;
  
-         int match = (user_aid != 0 && sfo.account_id == user_aid) ? 1 : 0;
+         int match = !user_aid_known || (sfo.account_id == user_aid);
  
          /* Check if save already exists on system */
          char exist_path[MAX_PATH_LEN];
@@ -5463,7 +5563,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          char json[512];
          snprintf(json, sizeof(json),
                   "{\"ok\":true,\"title_id\":\"%s\",\"dir_name\":\"%s\",\"main_title\":\"%s\","
-                  "\"save_aid\":\"%llx\",\"user_aid\":\"%llx\",\"match\":%s,\"exists\":%s}",
+                  "\"save_aid\":\"%016llX\",\"user_aid\":\"%016llX\",\"match\":%s,\"exists\":%s}",
                   sfo.title_id, sfo.dir_name, sfo.main_title,
                   (unsigned long long)sfo.account_id, (unsigned long long)user_aid,
                   match ? "true" : "false", exists ? "true" : "false");
@@ -5590,18 +5690,13 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              if (hs[0] == '0' && (hs[1] == 'x' || hs[1] == 'X')) hs += 2;
              if (strlen(hs) == 16) {
                  uint8_t new_aid[8];
-                 for (int i = 0; i < 8; i++) {
-                     char bh[3] = {hs[i*2], hs[i*2+1], 0};
-                     new_aid[i] = (uint8_t)strtol(bh, NULL, 16);
+                 if (sfo_account_from_hex(hs, new_aid) < 0) {
+                     http_json(sock, "{\"error\":\"Invalid Account ID\"}"); return;
                  }
                  char sfo_path[MAX_PATH_LEN];
                  snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
-                 int sfo_fd = open(sfo_path, O_RDWR);
-                 if (sfo_fd >= 0) {
-                     pwrite(sfo_fd, new_aid, 8, 0x1B8);
-                     close(sfo_fd);
-                     sync();
-                     printf("[GarlicMgr] encrypt: patched account ID\n");
+                 if (patch_sfo_account(sfo_path, new_aid, NULL) < 0) {
+                     http_json(sock, "{\"error\":\"Failed to write and verify Account ID in param.sfo\"}"); return;
                  }
              }
          }
@@ -6062,25 +6157,23 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              if (hs[0] == '0' && (hs[1] == 'x' || hs[1] == 'X')) hs += 2;
              if (strlen(hs) == 16) {
                  uint8_t new_aid[8];
-                 for (int i = 0; i < 8; i++) {
-                     char bh[3] = {hs[i*2], hs[i*2+1], 0};
-                     new_aid[i] = (uint8_t)strtol(bh, NULL, 16);
+                 if (sfo_account_from_hex(hs, new_aid) < 0) {
+                     http_json(sock, "{\"error\":\"Invalid Account ID\"}"); return;
                  }
                  char sfo_path[MAX_PATH_LEN];
                  snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
-                 int sfo_fd = open(sfo_path, O_RDWR);
-                 if (sfo_fd >= 0) {
-                     /* PS4: AID at 0x15C, PS5: AID at 0x1B8 */
-                     pwrite(sfo_fd, new_aid, 8, g_enc_ps4 ? 0x15C : 0x1B8);
-                     int local_uid = 0;
-                     if (!g_enc_ps4 && sceUserServiceGetForegroundUser(&local_uid) == 0) {
-                         uint32_t uid = (uint32_t)local_uid;
-                         pwrite(sfo_fd, &uid, 4, 0x660);
-                         printf("[GarlicMgr] download_new: patched user_id to 0x%x\n", uid);
-                     }
-                     close(sfo_fd);
-                     sync();
-                     printf("[GarlicMgr] download_new: patched account ID\n");
+                 int local_uid = 0;
+                 int have_local_uid = sceUserServiceGetForegroundUser(&local_uid) == 0;
+                 uint32_t uid = 0;
+                 const uint32_t *uid_ptr = NULL;
+                 if (!g_enc_ps4 && have_local_uid) {
+                     uid = (uint32_t)local_uid;
+                     uid_ptr = &uid;
+                 }
+                 int owner_ret = g_enc_ps4 ? (have_local_uid ? patch_local_sfo_owner(sfo_path, new_aid,
+                     (uint32_t)local_uid, 1) : -1) : patch_sfo_account(sfo_path, new_aid, uid_ptr);
+                 if (owner_ret < 0) {
+                     http_json(sock, "{\"error\":\"Cannot restore ownership. PS4 requires a fresh local save for the same game and slot under the target user.\"}"); return;
                  }
              }
          }
@@ -6199,9 +6292,8 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              return;
          }
          uint8_t new_aid[8];
-         for (int i = 0; i < 8; i++) {
-             char byte_hex[3] = {hex_str[i*2], hex_str[i*2+1], 0};
-             new_aid[i] = (uint8_t)strtol(byte_hex, NULL, 16);
+         if (sfo_account_from_hex(hex_str, new_aid) < 0) {
+             http_json(sock, "{\"error\":\"Invalid Account ID\"}"); return;
          }
  
          /* Receive body */
@@ -6254,22 +6346,10 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          /* Patch account ID in param.sfo */
          char sfo_path[MAX_PATH_LEN];
          snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
-         int sfo_fd = open(sfo_path, O_RDWR);
-         if (sfo_fd < 0) {
-             unmount_save(); unlink(tmp);
-             if (is_ps4) unlink("/data/save_files/_tmp_resign.bin");
-             http_json(sock, "{\"error\":\"Cannot open param.sfo\"}"); return;
-         }
-         /* PS4: AID at 0x15C, PS5: AID at 0x1B8 */
-         off_t aid_offset = is_ps4 ? 0x15C : 0x1B8;
-         if (pwrite(sfo_fd, new_aid, 8, aid_offset) != 8) {
-             close(sfo_fd); unmount_save(); unlink(tmp);
-             if (is_ps4) unlink("/data/save_files/_tmp_resign.bin");
-             http_json(sock, "{\"error\":\"Failed to write account ID\"}"); return;
-         }
- 
-         if (!is_ps4) {
-             /* PS5 only: patch user_id (uint32_t) at offset 0x660 */
+         uint32_t resign_uid = 0;
+         const uint32_t *resign_uid_ptr = NULL;
+         {
+             /* Resolve the target user for both PS4 and PS5 ownership. */
              char *up = strstr(url, "uid=");
              uint32_t uid = 0;
              int have_uid = 0;
@@ -6298,12 +6378,19 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                  }
              }
              if (have_uid) {
-                 pwrite(sfo_fd, &uid, 4, 0x660);
+                 resign_uid = uid;
+                 resign_uid_ptr = &resign_uid;
                  printf("[GarlicMgr] resign: patched user_id to 0x%x\n", uid);
              }
          }
-         close(sfo_fd);
-         sync();
+         int owner_ret = is_ps4 ? (resign_uid_ptr ?
+             patch_local_sfo_owner(sfo_path, new_aid, resign_uid, 1) : -1) :
+             patch_sfo_account(sfo_path, new_aid, resign_uid_ptr);
+         if (owner_ret < 0) {
+             unmount_save(); unlink(tmp);
+             if (is_ps4) unlink("/data/save_files/_tmp_resign.bin");
+             http_json(sock, "{\"error\":\"Cannot restore ownership. PS4 requires a fresh local save for the same game and slot under the target user.\"}"); return;
+         }
          printf("[GarlicMgr] resign: patched account ID to %s (%s)\n", aid_hex, is_ps4 ? "PS4" : "PS5");
  
          /* Unmount (re-encrypts) */
@@ -6477,19 +6564,12 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              }
  
              /* Resign */
-             uint64_t local_aid = get_account_id_for_user(uid_hex);
-             if (local_aid) {
-                 int sfo_fd = open(sfo_path, O_RDWR);
-                 if (sfo_fd >= 0) {
-                     if (g_enc_ps4) {
-                         pwrite(sfo_fd, &local_aid, 8, 0x15C);
-                     } else {
-                         pwrite(sfo_fd, &local_aid, 8, 0x1B8);
-                         pwrite(sfo_fd, &uid, 4, 0x660);
-                     }
-                     close(sfo_fd); sync();
-                 }
-             }
+             uint64_t local_aid = 0;
+             int owner_result = patch_import_sfo_owner(sfo_path, sfo.account_id, uid_hex, uid, g_enc_ps4, &local_aid);
+             const char *owner_warning = import_owner_warning(owner_result);
+             if (owner_warning[0]) logprintf("[GarlicMgr] WARNING: %s\n", owner_warning);
+             printf("[GarlicMgr] import: resigned aid=%016llX uid=0x%x\n",
+                    (unsigned long long)local_aid, uid);
  
              /* Copy icon before unmount */
              char icon_tmp[MAX_PATH_LEN] = {0};
@@ -6584,7 +6664,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                  { time_t now = time(NULL); struct tm *tm = gmtime(&now);
                    strftime(mtime, sizeof(mtime), "%Y-%m-%dT%H:%M:%S.00Z", tm); }
  
-                 uint64_t aid_val = local_aid ? local_aid : sfo.account_id;
+                 uint64_t aid_val = local_aid;
  
                  char check_sql[512];
                  snprintf(check_sql, sizeof(check_sql),
@@ -6620,10 +6700,10 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                  sqlite3_close(db);
              }
  
-             char json[512];
+             char json[1024];
              snprintf(json, sizeof(json),
-                      "{\"ok\":true,\"title_id\":\"%s\",\"dir_name\":\"%s\",\"main_title\":\"%s\"}",
-                      sfo.title_id, sfo.dir_name, sfo.main_title);
+                      "{\"ok\":true,\"title_id\":\"%s\",\"dir_name\":\"%s\",\"main_title\":\"%s\",\"warning\":\"%s\"}",
+                      sfo.title_id, sfo.dir_name, sfo.main_title, owner_warning);
              http_json(sock, json);
              return;
          }
@@ -6875,23 +6955,14 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          printf("[GarlicMgr] import_usb: copied files into PFS\n");
  
          /* Resign param.sfo */
-         uint64_t local_aid = get_account_id_for_user(uid_hex);
-         if (local_aid) {
-             char pfs_sfo[MAX_PATH_LEN];
-             snprintf(pfs_sfo, sizeof(pfs_sfo), "%s/sce_sys/param.sfo", g_mount_point);
-             int sfo_fd = open(pfs_sfo, O_RDWR);
-             if (sfo_fd >= 0) {
-                 if (is_ps4) {
-                     pwrite(sfo_fd, &local_aid, 8, 0x15C);
-                 } else {
-                     pwrite(sfo_fd, &local_aid, 8, 0x1B8);
-                     pwrite(sfo_fd, &uid, 4, 0x660);
-                 }
-                 close(sfo_fd);
-                 sync();
-                 printf("[GarlicMgr] import_usb: resigned %s\n", is_ps4 ? "PS4" : "PS5");
-             }
-         }
+         uint64_t local_aid = 0;
+         char pfs_sfo[MAX_PATH_LEN];
+         snprintf(pfs_sfo, sizeof(pfs_sfo), "%s/sce_sys/param.sfo", g_mount_point);
+         int owner_result = patch_import_sfo_owner(pfs_sfo, sfo.account_id, uid_hex, uid, is_ps4, &local_aid);
+         const char *owner_warning = import_owner_warning(owner_result);
+         if (owner_warning[0]) logprintf("[GarlicMgr] WARNING: %s\n", owner_warning);
+         printf("[GarlicMgr] import: resigned aid=%016llX uid=0x%x\n",
+                (unsigned long long)local_aid, uid);
  
          /* Copy icon before unmount */
          char icon_tmp[MAX_PATH_LEN] = {0};
@@ -6986,7 +7057,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              { time_t now = time(NULL); struct tm *tm = gmtime(&now);
                strftime(mtime, sizeof(mtime), "%Y-%m-%dT%H:%M:%S.00Z", tm); }
  
-             uint64_t aid_val = local_aid ? local_aid : sfo.account_id;
+             uint64_t aid_val = local_aid;
              uint32_t size_kib = sfo.blocks * 0x40;
  
              /* Check if exists */
@@ -7030,10 +7101,10 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              sqlite3_close(db);
          }
  
-         char json[512];
+         char json[1024];
          snprintf(json, sizeof(json),
-                  "{\"ok\":true,\"title_id\":\"%s\",\"dir_name\":\"%s\",\"main_title\":\"%s\"}",
-                  sfo.title_id, sfo.dir_name, sfo.main_title);
+                  "{\"ok\":true,\"title_id\":\"%s\",\"dir_name\":\"%s\",\"main_title\":\"%s\",\"warning\":\"%s\"}",
+                  sfo.title_id, sfo.dir_name, sfo.main_title, owner_warning);
          http_json(sock, json);
          return;
      }
@@ -7156,26 +7227,12 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          }
  
          /* Read local account_id from registry */
-         uint64_t local_aid = get_account_id_for_user(uid_hex);
- 
-         /* Resign: PS4 = AID at 0x15C only, PS5 = AID at 0x1B8 + UID at 0x660 */
-         if (local_aid) {
-             int sfo_fd = open(sfo_path, O_RDWR);
-             if (sfo_fd >= 0) {
-                 if (g_enc_ps4) {
-                     pwrite(sfo_fd, &local_aid, 8, 0x15C);
-                     printf("[GarlicMgr] import: PS4 resigned aid=%llu at 0x15C\n",
-                            (unsigned long long)local_aid);
-                 } else {
-                     pwrite(sfo_fd, &local_aid, 8, 0x1B8);
-                     pwrite(sfo_fd, &uid, 4, 0x660);
-                     printf("[GarlicMgr] import: PS5 resigned aid=%llu uid=0x%x\n",
-                            (unsigned long long)local_aid, uid);
-                 }
-                 close(sfo_fd);
-                 sync();
-             }
-         }
+         uint64_t local_aid = 0;
+         int owner_result = patch_import_sfo_owner(sfo_path, sfo.account_id, uid_hex, uid, g_enc_ps4, &local_aid);
+         const char *owner_warning = import_owner_warning(owner_result);
+         if (owner_warning[0]) logprintf("[GarlicMgr] WARNING: %s\n", owner_warning);
+         printf("[GarlicMgr] import: resigned aid=%016llX uid=0x%x\n",
+                (unsigned long long)local_aid, uid);
  
          /* Copy icon before unmount */
          char icon_src[MAX_PATH_LEN];
@@ -7267,10 +7324,10 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              printf("[GarlicMgr] import: cannot open savedata.db: %s\n", sqlite3_errmsg(db));
              if (db) sqlite3_close(db);
              /* Save is already copied, just DB update failed */
-             char json[256];
+             char json[1024];
              snprintf(json, sizeof(json),
-                      "{\"ok\":true,\"warning\":\"Save imported but DB update failed\","
-                      "\"title_id\":\"%s\",\"dir_name\":\"%s\"}", sfo.title_id, sfo.dir_name);
+                      "{\"ok\":true,\"warning\":\"Save imported but DB update failed. %s\","
+                      "\"title_id\":\"%s\",\"dir_name\":\"%s\"}", owner_warning, sfo.title_id, sfo.dir_name);
              http_json(sock, json);
              return;
          }
@@ -7339,7 +7396,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              sqlite3_finalize(stmt);
          }
  
-         uint64_t aid_val = local_aid ? local_aid : sfo.account_id;
+         uint64_t aid_val = local_aid;
          uint32_t size_kib = sfo.blocks * 0x40;
  
          char sql[2048];
@@ -7378,12 +7435,12 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          }
          sqlite3_close(db);
  
-         char json[512];
+         char json[1024];
          snprintf(json, sizeof(json),
                   "{\"ok\":true,\"title_id\":\"%s\",\"dir_name\":\"%s\","
-                  "\"main_title\":\"%s\",\"exists\":%s}",
+                  "\"main_title\":\"%s\",\"exists\":%s,\"warning\":\"%s\"}",
                   sfo.title_id, sfo.dir_name, sfo.main_title,
-                  exists ? "true" : "false");
+                  exists ? "true" : "false", owner_warning);
          http_json(sock, json);
          return;
      }
@@ -8031,6 +8088,11 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          UmountOpt u0; memset(&u0, 0, sizeof(u0));
          sceFsInitUmountSaveDataOpt(&u0);
          sceFsUmountSaveData(&u0, "/data/mount_sd", 0, 0);
+     }
+     if (stat("/data/mount_owner", &st0) == 0) {
+         UmountOpt u0; memset(&u0, 0, sizeof(u0));
+         sceFsInitUmountSaveDataOpt(&u0);
+         sceFsUmountSaveData(&u0, "/data/mount_owner", 0, 0);
      }
  
      /* Get OpenPsId for PARAMS HMAC */

@@ -26,7 +26,7 @@ src/ui.h: src/ui.html src/i18n $(I18N_FILES)
 src/sqlite3.o: src/sqlite3.c
 	$(PS5_CC) -O2 -D_BSD_SOURCE -std=gnu11 -I$(PS5_INCDIR) $(SQLITE_FLAGS) -c -o $@ $<
 
-garlic-savemgr.elf: src/main.c src/ui.h src/sqlite3.o
+garlic-savemgr.elf: src/main.c src/sfo_account.h src/ui.h src/sqlite3.o
 	$(PS5_CC) $(CFLAGS) $(LDFLAGS) -o $@ src/main.c src/sqlite3.o $(LIBS)
 
 clean:
