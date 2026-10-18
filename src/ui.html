@@ -238,6 +238,7 @@
 
     .ll { color: #4a6a5a; animation: fadeIn .2s ease }
     .ll.err { color: var(--er) }
+    .ll.warn { color: #c89b00 }
     .ll.ok { color: var(--ok) }
     .ll .t { opacity: .35; margin-right: 8px }
 
@@ -715,15 +716,16 @@ function setupFolderDZ(id, fn) {
     e.preventDefault(); el.classList.remove('over');
     const items = e.dataTransfer.items;
     if (!items || !items.length) return;
-    const files = [];
     const entries = [];
     for (let i = 0; i < items.length; i++) {
       const entry = items[i].webkitGetAsEntry ? items[i].webkitGetAsEntry() : null;
       if (entry) entries.push(entry);
     }
-    if (entries.length && entries[0].isDirectory) {
-      const all = await readEntryRecursive(entries[0], '');
-      if (all.length) fn(all, entries[0].name);
+    if (entries.some(entry => entry.isDirectory)) {
+      if (entries.some(entry => !entry.isDirectory)) {
+        log('Drop save folders separately from loose files', 'err'); return;
+      }
+      fn([], '', entries);
     } else if (e.dataTransfer.files.length) {
       fn(Array.from(e.dataTransfer.files));
     }
@@ -1092,7 +1094,8 @@ function renderCt() {
       '<div class="drop" id="dz">'
       + '<div class="dlbl">' + t('drop.import', 'Drag & drop a decrypted save folder or encrypted save file to import') + '</div>'
       + '<div style="font-size:11px;color:var(--dm);margin:6px 0">' + t('import.folder_hint', 'Folder: must contain sce_sys/param.sfo')
-      + '<br>' + t('import.encrypted_hint', 'Encrypted: PS4 drop image + .bin key together') + '</div>'
+      + '<br>' + t('import.encrypted_hint', 'Encrypted: PS4 drop image + .bin key together')
+      + '<br>' + t('import.ps4_owner_hint', 'PS4: ownership recovery is attempted automatically. If incomplete, import continues with a warning.') + '</div>'
       + '<button class="bbtn" onclick="browseFolder()" style="margin-right:8px">' + t('drop.browse_folder', 'Browse Folder') + '</button>'
       + '<button class="bbtn" onclick="browseEncFile()">' + t('drop.browse_files', 'Browse File') + '</button></div>';
     setupImportDZ('dz');
@@ -1768,191 +1771,264 @@ async function sel(i) {
   if (window.innerWidth <= 768 && drawerOpen) toggleDrawer();
 }
 
+/* Match keys by path and basename, never by selection order or image size. */
+async function collectEncryptedSaves(files) {
+  const all = Array.from(files);
+  const pathOf = f => (f._path || f.webkitRelativePath || f.name).replace(/\\/g, '/');
+  const keys = all.filter(f => /\.bin$/i.test(f.name));
+  const used = new Set(), saves = [];
+  for (const imgFile of all.filter(f => !/\.bin$/i.test(f.name))) {
+    const hdr = new Uint8Array(await imgFile.slice(0, 1).arrayBuffer());
+    const isPS4 = hdr[0] === 0x01;
+    let error = hdr[0] !== 0x01 && hdr[0] !== 0x02 ? 'Unsupported save image' : '';
+    let binFile = null;
+    if (isPS4) {
+      const path = pathOf(imgFile);
+      const slash = path.lastIndexOf('/') + 1;
+      const base = path.slice(slash).replace(/^sdimg_/i, '');
+      const expected = (path.slice(0, slash) + base + '.bin').toLowerCase();
+      const matches = keys.filter(f => pathOf(f).toLowerCase() === expected);
+      if (matches.length === 1) { binFile = matches[0]; used.add(binFile); }
+      else error = matches.length ? 'Ambiguous .bin key for ' + base : 'Missing matching key: ' + base + '.bin';
+    }
+    saves.push({imgFile, binFile, isPS4, error});
+  }
+  for (const key of keys) {
+    if (!used.has(key)) log('Unmatched key: ' + pathOf(key), 'err');
+  }
+  return saves;
+}
+
+/* Fetch the entire result before the next save overwrites the payload's temp files. */
+async function downloadSaveResult(url, name) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error('Download failed: HTTP ' + r.status);
+  if ((r.headers.get('Content-Type') || '').includes('application/json')) {
+    const d = await r.json();
+    throw new Error(d.error || 'Download failed');
+  }
+  const blob = await r.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = objectUrl; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
+}
+
+async function unmountUploadedSave() {
+  const r = await fetch('/api/unmount');
+  const d = await r.json();
+  if (!r.ok || d.error || d.ok === false) throw new Error(d.error || 'Unmount failed');
+}
+
+async function uploadSaveKey(binFile) {
+  log('Uploading PS4 sealed key ' + binFile.name + '...');
+  const xhr = await upload('/api/upload_key', binFile);
+  if (xhr.status !== 200) throw new Error('Failed to upload .bin key');
+  const d = JSON.parse(xhr.responseText);
+  if (!d.ok) throw new Error(d.error || 'Failed to upload .bin key');
+}
+
+async function runSaveBatch(files, label, process, prepare = collectEncryptedSaves) {
+  if (bsy || !files || !files.length) return;
+  bsy = true;
+  let succeeded = 0, failed = 0, skipped = 0;
+  const warnings = [];
+  try {
+    const saves = await prepare(files);
+    if (!saves.length) { log('No save image found', 'err'); return; }
+    for (let i = 0; i < saves.length; i++) {
+      const save = saves[i];
+      log(label + ' (' + (i + 1) + '/' + saves.length + '): ' + save.imgFile.name);
+      try {
+        if (save.error) { failed++; log(save.imgFile.name + ': ' + save.error, 'err'); continue; }
+        const result = await process(save, saves.length > 1);
+        if (result === false) skipped++;
+        else {
+          succeeded++;
+          if (result && result.warning) warnings.push(save.imgFile.name + ': ' + result.warning);
+        }
+      } catch (e) {
+        failed++;
+        log(save.imgFile.name + ': ' + e.message, 'err');
+        await unmountUploadedSave();
+      }
+    }
+    if (saves.length > 1 || failed || skipped || warnings.length) {
+      const summary = label + ': ' + succeeded + ' succeeded, ' + failed + ' failed, ' + skipped + ' skipped'
+        + (warnings.length ? ', ' + warnings.length + ' with warnings' : '');
+      log(summary, failed ? 'err' : warnings.length ? 'warn' : 'ok');
+      $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + esc(summary) + '</div>'
+        + warnings.map(w => '<div style="color:#c89b00;margin:8px">' + esc(w) + '</div>').join('')
+        + '<button class="bbtn" onclick="renderCt()">' + t('status.done', 'Done') + '</button></div>';
+    }
+  } catch (e) {
+    log(label + ' stopped: ' + e.message, 'err');
+    renderCt();
+  } finally {
+    bsy = false;
+  }
+}
+
+function runFolderSaves(files, folderName, entries, label, process) {
+  return runSaveBatch(entries || files, label, save => process(save.files, save.folderName), async () => {
+    if (!entries) return [{imgFile: {name: folderName || 'Save folder'}, files, folderName}];
+    const saves = [];
+    for (const entry of entries) {
+      try {
+        const all = await readEntryRecursive(entry, '');
+        saves.push({imgFile: {name: entry.name}, files: all, folderName: entry.name,
+          error: all.length ? '' : 'Folder is empty'});
+      } catch (e) {
+        saves.push({imgFile: {name: entry.name}, error: e.message});
+      }
+    }
+    return saves;
+  });
+}
+
 /* ── Decrypt drop ──────────────────────────────────── */
 async function decDrop(files) {
-  if (bsy || !files.length) return;
-  /* Check first byte to detect PS4 (0x01) vs PS5 (0x02) */
-  const imgFile = files[0];
-  const hdr = new Uint8Array(await imgFile.slice(0, 1).arrayBuffer());
-  const isPS4 = (hdr[0] === 0x01);
+  return runSaveBatch(files, 'Decrypt', decDropOne);
+}
 
-  let binFile = null;
-  if (isPS4) {
-    /* Look for .bin in the dropped files */
-    for (let i = 1; i < files.length; i++) {
-      if (files[i].name.endsWith('.bin')) { binFile = files[i]; break; }
-    }
-    if (!binFile) {
-      log('PS4 save detected — please drop both the save image and its .bin sealed key file together', 'err');
-      return;
-    }
-  }
-
-  bsy = true;
+async function decDropOne(save, batch) {
+  const {imgFile, binFile, isPS4} = save;
   $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + t('status.uploading_decrypt', 'Uploading for decrypt...') + '</div></div>';
-  try {
-    /* For PS4, upload .bin key first */
-    if (isPS4 && binFile) {
-      log('Uploading PS4 sealed key ' + binFile.name + '...');
-      const kxhr = await upload('/api/upload_key', binFile);
-      if (kxhr.status !== 200) throw new Error('Failed to upload .bin key');
-    }
-    log('Uploading ' + imgFile.name + ' (' + fmtB(imgFile.size) + ')...');
-    const xhr = await upload('/api/decrypt_upload' + (isPS4 ? '?ps4=1' : ''), imgFile, (loaded, total) => {
-      const pct = Math.round(loaded * 100 / total);
-      showProgress(pct, loaded, total);
-    });
-    if (xhr.status !== 200) {
-      const d = JSON.parse(xhr.responseText);
-      throw new Error(d.error || 'Failed');
-    }
-    log('Mounted — click Download to save decrypted files', 'ok');
-    const name = imgFile.name.replace(/\.[^.]+$/, '') + '_dec.zip';
-    $('ct').innerHTML =
-      '<div class="drop"><div class="dlbl">' + t('status.decrypt_ok', 'Decrypted successfully!') + '</div>'
-      + '<a class="dlnk" href="/api/download" download="' + esc(name) + '">' + t('status.download_zip', 'Download .zip') + '</a>'
-      + '<br><button class="bbtn" style="margin-top:12px" onclick="fetch(\'/api/unmount\');renderCt()">' + t('status.done', 'Done') + '</button></div>';
-  } catch (e) {
-    log('Error: ' + e.message, 'err');
-    renderCt();
+  /* For PS4, upload .bin key first */
+  if (isPS4 && binFile) {
+    await uploadSaveKey(binFile);
   }
-  bsy = false;
+  log('Uploading ' + imgFile.name + ' (' + fmtB(imgFile.size) + ')...');
+  const xhr = await upload('/api/decrypt_upload' + (isPS4 ? '?ps4=1' : ''), imgFile, (loaded, total) => {
+    const pct = Math.round(loaded * 100 / total);
+    showProgress(pct, loaded, total);
+  });
+  if (xhr.status !== 200) {
+    const d = JSON.parse(xhr.responseText);
+    throw new Error(d.error || 'Failed');
+  }
+  const d = JSON.parse(xhr.responseText);
+  if (d.error) throw new Error(d.error);
+  log('Mounted — click Download to save decrypted files', 'ok');
+  const name = imgFile.name + '_dec.zip';
+  if (batch) {
+    await downloadSaveResult('/api/download', name);
+    await unmountUploadedSave();
+    return;
+  }
+  $('ct').innerHTML =
+    '<div class="drop"><div class="dlbl">' + t('status.decrypt_ok', 'Decrypted successfully!') + '</div>'
+    + '<a class="dlnk" href="/api/download" download="' + esc(name) + '">' + t('status.download_zip', 'Download .zip') + '</a>'
+    + '<br><button class="bbtn" style="margin-top:12px" onclick="fetch(\'/api/unmount\');renderCt()">' + t('status.done', 'Done') + '</button></div>';
 }
 
 /* ── Encrypt drop ──────────────────────────────────── */
-async function encDrop(files, folderName) {
-  if (bsy || !files || !files.length) return;
+async function encDrop(files, folderName, entries) {
+  if (bsy) return;
   const aidv = document.getElementById('eaid') ? document.getElementById('eaid').value.trim() : '';
   const isPS4 = document.getElementById('eps4') ? document.getElementById('eps4').checked : false;
-  bsy = true;
+  return runFolderSaves(files, folderName, entries, 'Encrypt',
+    (all, name) => encDropOne(all, name, aidv, isPS4));
+}
 
-  try {
-    /* Calculate total size for PFS image sizing */
-    let totalSize = 0;
-    for (const f of files) totalSize += f.size;
+async function encDropOne(files, folderName, aidv, isPS4) {
+  /* Calculate total size for PFS image sizing */
+  let totalSize = 0;
+  for (const f of files) totalSize += f.size;
 
-    /* Step 1: create fresh PFS image and mount it */
-    log('Creating ' + (isPS4 ? 'PS4' : 'PS5') + ' PFS image (' + fmtB(totalSize) + ' of files)...');
-    $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + t('status.creating_pfs', 'Creating PFS image...') + '</div></div>';
-    let r = await fetch('/api/create_pfs?size=' + totalSize + (isPS4 ? '&ps4=1' : ''));
-    let d = await r.json();
-    if (d.error) throw new Error(d.error);
-    log('PFS image created and mounted', 'ok');
+  /* Step 1: create fresh PFS image and mount it */
+  log('Creating ' + (isPS4 ? 'PS4' : 'PS5') + ' PFS image (' + fmtB(totalSize) + ' of files)...');
+  $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + t('status.creating_pfs', 'Creating PFS image...') + '</div></div>';
+  let r = await fetch('/api/create_pfs?size=' + totalSize + (isPS4 ? '&ps4=1' : ''));
+  let d = await r.json();
+  if (d.error) throw new Error(d.error);
+  log('PFS image created and mounted', 'ok');
 
-    /* Step 2: upload each file */
-    for (let i = 0; i < files.length; i++) {
-      const f = files[i];
-      const path = f._path || f.webkitRelativePath || f.name;
-      /* Strip leading folder name */
-      const parts = path.split('/');
-      const relPath = parts.length > 1 ? parts.slice(1).join('/') : parts[0];
+  /* Step 2: upload each file */
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    const path = f._path || f.webkitRelativePath || f.name;
+    /* Strip leading folder name */
+    const parts = path.split('/');
+    const relPath = parts.length > 1 ? parts.slice(1).join('/') : parts[0];
 
-      log('Uploading (' + (i + 1) + '/' + files.length + ') ' + relPath + ' (' + fmtB(f.size) + ')...');
-      $('ct').innerHTML = '<div class="drop" id="dz"><div class="dlbl">' + t('status.uploading_file', 'Uploading {name}', {name: esc(relPath)})
-        + '<br>(' + (i + 1) + '/' + files.length + ')</div></div>';
+    log('Uploading (' + (i + 1) + '/' + files.length + ') ' + relPath + ' (' + fmtB(f.size) + ')...');
+    $('ct').innerHTML = '<div class="drop" id="dz"><div class="dlbl">' + t('status.uploading_file', 'Uploading {name}', {name: esc(relPath)})
+      + '<br>(' + (i + 1) + '/' + files.length + ')</div></div>';
 
-      const xhr = await upload('/api/upload_file?name=' + encodeURIComponent(relPath), f, (loaded, total) => {
-        const pct = Math.round(loaded * 100 / total);
-        showProgress(pct, loaded, total);
-      });
-      const rd = JSON.parse(xhr.responseText);
-      if (!rd.ok) throw new Error(rd.error || 'Upload failed for ' + relPath);
-    }
-    log('All ' + files.length + ' files uploaded', 'ok');
-
-    /* Step 3: patch AID if provided, unmount, download encrypted */
-    log('Encrypting and downloading...');
-    $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + t('status.encrypting', 'Encrypting save...') + '</div></div>';
-    const name = (folderName || 'encrypted_save') + '_enc';
-    let dlUrl = '/api/download_new?name=' + encodeURIComponent(name);
-    if (aidv) dlUrl += '&aid=' + encodeURIComponent(aidv);
-    const a = document.createElement('a');
-    a.href = dlUrl;
-    a.download = isPS4 ? (name + '_ps4.zip') : name;
-    document.body.appendChild(a); a.click(); a.remove();
-    log('Encrypted save download started', 'ok');
-
-    if (isPS4) {
-      $('ct').innerHTML =
-        '<div class="drop"><div class="dlbl">' + t('status.ps4_save', 'PS4 Save') + ': <b>sdimg_' + esc(name) + '</b> + <b>' + esc(name) + '.bin</b></div>'
-        + '<div style="color:#0f0">' + t('status.download_started_zip', 'Download started (.zip)') + '</div>'
-        + '<div style="font-size:11px;color:var(--dm);margin-top:8px">' + t('status.ps4_extract_hint', 'Extract and place both files in the same directory on PS5') + '</div></div>';
-    } else {
-      $('ct').innerHTML =
-        '<div class="drop"><div class="dlbl">' + esc(name) + '</div>'
-        + '<div style="color:#0f0">' + t('status.download_started', 'Download started') + '</div></div>';
-    }
-  } catch (e) {
-    log('Error: ' + e.message, 'err');
-    renderCt();
+    const xhr = await upload('/api/upload_file?name=' + encodeURIComponent(relPath), f, (loaded, total) => {
+      const pct = Math.round(loaded * 100 / total);
+      showProgress(pct, loaded, total);
+    });
+    const rd = JSON.parse(xhr.responseText);
+    if (!rd.ok) throw new Error(rd.error || 'Upload failed for ' + relPath);
   }
-  bsy = false;
+  log('All ' + files.length + ' files uploaded', 'ok');
+
+  /* Step 3: patch AID if provided, unmount, download encrypted */
+  log('Encrypting and downloading...');
+  $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + t('status.encrypting', 'Encrypting save...') + '</div></div>';
+  const name = (folderName || 'encrypted_save') + '_enc';
+  let dlUrl = '/api/download_new?name=' + encodeURIComponent(name);
+  if (aidv) dlUrl += '&aid=' + encodeURIComponent(aidv);
+  await downloadSaveResult(dlUrl, isPS4 ? (name + '_ps4.zip') : name);
+  log('Encrypted save download started', 'ok');
+
+  if (isPS4) {
+    $('ct').innerHTML =
+      '<div class="drop"><div class="dlbl">' + t('status.ps4_save', 'PS4 Save') + ': <b>sdimg_' + esc(name) + '</b> + <b>' + esc(name) + '.bin</b></div>'
+      + '<div style="color:#0f0">' + t('status.download_started_zip', 'Download started (.zip)') + '</div>'
+      + '<div style="font-size:11px;color:var(--dm);margin-top:8px">' + t('status.ps4_extract_hint', 'Extract and place both files in the same directory on PS5') + '</div></div>';
+  } else {
+    $('ct').innerHTML =
+      '<div class="drop"><div class="dlbl">' + esc(name) + '</div>'
+      + '<div style="color:#0f0">' + t('status.download_started', 'Download started') + '</div></div>';
+  }
 }
 
 /* ── Resign drop ───────────────────────────────────── */
 async function resignDrop(files) {
   if (bsy || !files.length) return;
   const aidv = document.getElementById('raid').value.trim();
-  if (!aidv) { log('Enter new Account ID first', 'err'); return }
+  if (!aidv) { log('Enter new Account ID first', 'err'); return; }
+  const uidv = document.getElementById('ruid') ? document.getElementById('ruid').value.trim() : '';
+  return runSaveBatch(files, 'Resign', (save, batch) => resignDropOne(save, batch, aidv, uidv));
+}
 
-  /* Find image file (largest non-.bin) and detect PS4 */
-  let imgFile = null, binFile = null;
-  for (let i = 0; i < files.length; i++) {
-    if (files[i].name.endsWith('.bin')) binFile = files[i];
-    else if (!imgFile || files[i].size > imgFile.size) imgFile = files[i];
-  }
-  if (!imgFile) return;
-
-  const hdr = new Uint8Array(await imgFile.slice(0, 1).arrayBuffer());
-  const isPS4 = (hdr[0] === 0x01);
-
-  if (isPS4 && !binFile) {
-    log('PS4 save detected — please drop both the save image and its .bin sealed key file together', 'err');
-    return;
-  }
-
-  bsy = true;
+async function resignDropOne(save, batch, aidv, uidv) {
+  const {imgFile, binFile, isPS4} = save;
   $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + t('status.uploading_resign', 'Uploading for resign...') + '</div></div>';
-  try {
-    /* For PS4, upload .bin key first */
-    if (isPS4 && binFile) {
-      log('Uploading PS4 sealed key ' + binFile.name + '...');
-      const kxhr = await upload('/api/upload_key', binFile);
-      if (kxhr.status !== 200) throw new Error('Failed to upload .bin key');
-    }
-
-    const uidv = document.getElementById('ruid') ? document.getElementById('ruid').value.trim() : '';
-    log('Uploading ' + imgFile.name + ' (' + fmtB(imgFile.size) + ') for resign...');
-    let rurl = '/api/resign?aid=' + encodeURIComponent(aidv);
-    if (isPS4) rurl += '&ps4=1';
-    if (uidv) rurl += '&uid=' + encodeURIComponent(uidv);
-    const xhr = await upload(rurl, imgFile, (loaded, total) => {
-      const pct = Math.round(loaded * 100 / total);
-      showProgress(pct, loaded, total);
-    });
-    const d = JSON.parse(xhr.responseText);
-    if (d.error) throw new Error(d.error);
-    log('Resigned ' + fmtB(d.size) + ', starting download...', 'ok');
-    const name = imgFile.name.replace(/\.[^.]+$/, '') + '_resigned';
-    const a = document.createElement('a');
-    a.href = '/api/resign_download?name=' + encodeURIComponent(name) + (isPS4 ? '&ps4=1' : '');
-    a.download = isPS4 ? (name + '.zip') : name;
-    document.body.appendChild(a); a.click(); a.remove();
-    $('ct').innerHTML =
-      '<div class="drop"><div class="dlbl">' + esc(name) + '<br>' + fmtB(d.size) + '</div>'
-      + '<div style="color:#0f0">' + (isPS4 ? t('status.download_started_zip', 'Download started (.zip)') : t('status.download_started', 'Download started')) + '</div>'
-      + '<button class="bbtn" style="margin-top:12px" onclick="switchTab(\'resign\')">' + t('status.resign_another', 'Resign Another') + '</button></div>';
-  } catch (e) {
-    log('Error: ' + e.message, 'err');
-    renderCt();
+  /* For PS4, upload .bin key first */
+  if (isPS4 && binFile) {
+    await uploadSaveKey(binFile);
   }
-  bsy = false;
+
+  log('Uploading ' + imgFile.name + ' (' + fmtB(imgFile.size) + ') for resign...');
+  let rurl = '/api/resign?aid=' + encodeURIComponent(aidv);
+  if (isPS4) rurl += '&ps4=1';
+  if (uidv) rurl += '&uid=' + encodeURIComponent(uidv);
+  const xhr = await upload(rurl, imgFile, (loaded, total) => {
+    const pct = Math.round(loaded * 100 / total);
+    showProgress(pct, loaded, total);
+  });
+  const d = JSON.parse(xhr.responseText);
+  if (d.error) throw new Error(d.error);
+  log('Resigned ' + fmtB(d.size) + ', starting download...', 'ok');
+  const name = imgFile.name + '_resigned';
+  await downloadSaveResult('/api/resign_download?name=' + encodeURIComponent(name) + (isPS4 ? '&ps4=1' : ''), isPS4 ? (name + '.zip') : name);
+  $('ct').innerHTML =
+    '<div class="drop"><div class="dlbl">' + esc(name) + '<br>' + fmtB(d.size) + '</div>'
+    + '<div style="color:#0f0">' + (isPS4 ? t('status.download_started_zip', 'Download started (.zip)') : t('status.download_started', 'Download started')) + '</div>'
+    + '<button class="bbtn" style="margin-top:12px" onclick="switchTab(\'resign\')">' + t('status.resign_another', 'Resign Another') + '</button></div>';
 }
 
 /* ── Import drop ───────────────────────────────────── */
-async function importDrop(files, folderName) {
-  if (bsy || !files || !files.length) return;
+async function importDrop(files, folderName, entries) {
+  return runFolderSaves(files, folderName, entries, 'Import', importDropOne);
+}
 
+async function importDropOne(files, folderName) {
   /* Check for sce_sys/param.sfo in the dropped files */
   let hasSfo = false;
   for (const f of files) {
@@ -1960,66 +2036,55 @@ async function importDrop(files, folderName) {
     if (p.match(/sce_sys\/param\.sfo$/i)) { hasSfo = true; break; }
   }
   if (!hasSfo) {
-    log('Folder must contain sce_sys/param.sfo', 'err');
-    return;
+    throw new Error('Folder must contain sce_sys/param.sfo');
   }
 
-  bsy = true;
-  try {
-    /* Calculate total size */
-    let totalSize = 0;
-    for (const f of files) totalSize += f.size;
+  /* Calculate total size */
+  let totalSize = 0;
+  for (const f of files) totalSize += f.size;
 
-    /* Step 1: create PFS image */
-    log('Creating PFS image for import (' + fmtB(totalSize) + ' of files)...');
-    $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + t('status.creating_pfs', 'Creating PFS image...') + '</div></div>';
-    let r = await fetch('/api/create_pfs?size=' + totalSize);
-    let d = await r.json();
-    if (d.error) throw new Error(d.error);
-    log('PFS image created and mounted', 'ok');
+  /* Step 1: create PFS image */
+  log('Creating PFS image for import (' + fmtB(totalSize) + ' of files)...');
+  $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + t('status.creating_pfs', 'Creating PFS image...') + '</div></div>';
+  let r = await fetch('/api/create_pfs?size=' + totalSize);
+  let d = await r.json();
+  if (d.error) throw new Error(d.error);
+  log('PFS image created and mounted', 'ok');
 
-    /* Step 2: upload each file */
-    for (let i = 0; i < files.length; i++) {
-      const f = files[i];
-      const path = f._path || f.webkitRelativePath || f.name;
-      const parts = path.split('/');
-      const relPath = parts.length > 1 ? parts.slice(1).join('/') : parts[0];
+  /* Step 2: upload each file */
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    const path = f._path || f.webkitRelativePath || f.name;
+    const parts = path.split('/');
+    const relPath = parts.length > 1 ? parts.slice(1).join('/') : parts[0];
 
-      log('Uploading (' + (i + 1) + '/' + files.length + ') ' + relPath + ' (' + fmtB(f.size) + ')...');
-      $('ct').innerHTML = '<div class="drop" id="dz"><div class="dlbl">' + t('status.uploading_file', 'Uploading {name}', {name: esc(relPath)})
-        + '<br>(' + (i + 1) + '/' + files.length + ')</div></div>';
+    log('Uploading (' + (i + 1) + '/' + files.length + ') ' + relPath + ' (' + fmtB(f.size) + ')...');
+    $('ct').innerHTML = '<div class="drop" id="dz"><div class="dlbl">' + t('status.uploading_file', 'Uploading {name}', {name: esc(relPath)})
+      + '<br>(' + (i + 1) + '/' + files.length + ')</div></div>';
 
-      const xhr = await upload('/api/upload_file?name=' + encodeURIComponent(relPath), f, (loaded, total) => {
-        const pct = Math.round(loaded * 100 / total);
-        showProgress(pct, loaded, total);
-      });
-      const rd = JSON.parse(xhr.responseText);
-      if (!rd.ok) throw new Error(rd.error || 'Upload failed for ' + relPath);
-    }
-    log('All ' + files.length + ' files uploaded', 'ok');
-
-    /* Check if save already exists */
-    r = await fetch('/api/import_check?uid=' + encodeURIComponent(curUid));
-    d = await r.json();
-    if (d.exists) {
-      const ok = await showConfirmModal(t('confirm.overwrite_save', 'This will overwrite an existing save. Are you sure?'));
-      if (!ok) {
-        log('Import cancelled');
-        try { await fetch('/api/unmount'); } catch(x) {}
-        renderCt(); bsy = false; return;
-      }
-    }
-
-    /* Step 3: finalize import (resign, unmount, copy to system, update DB) */
-    await doImportFinish();
-
-  } catch (e) {
-    log('Import error: ' + e.message, 'err');
-    /* Try to clean up by unmounting */
-    try { await fetch('/api/unmount'); } catch(x) {}
-    renderCt();
+    const xhr = await upload('/api/upload_file?name=' + encodeURIComponent(relPath), f, (loaded, total) => {
+      const pct = Math.round(loaded * 100 / total);
+      showProgress(pct, loaded, total);
+    });
+    const rd = JSON.parse(xhr.responseText);
+    if (!rd.ok) throw new Error(rd.error || 'Upload failed for ' + relPath);
   }
-  bsy = false;
+  log('All ' + files.length + ' files uploaded', 'ok');
+
+  /* Check if save already exists */
+  r = await fetch('/api/import_check?uid=' + encodeURIComponent(curUid));
+  d = await r.json();
+  if (d.exists) {
+    const ok = await showConfirmModal(t('confirm.overwrite_save', 'This will overwrite an existing save. Are you sure?'));
+    if (!ok) {
+      log('Import cancelled');
+      await unmountUploadedSave();
+      return false;
+    }
+  }
+
+  /* Step 3: finalize import (resign, unmount, copy to system, update DB) */
+  return await doImportFinish();
 }
 
 function showImportSuccess(d) {
@@ -2050,9 +2115,11 @@ function setupImportDZ(id) {
         if (entry) entries.push(entry);
       }
     }
-    if (entries.length && entries[0].isDirectory) {
-      const all = await readEntryRecursive(entries[0], '');
-      if (all.length) importDrop(all, entries[0].name);
+    if (entries.some(entry => entry.isDirectory)) {
+      if (entries.some(entry => !entry.isDirectory)) {
+        log('Drop save folders separately from encrypted files', 'err'); return;
+      }
+      importDrop([], '', entries);
     } else {
       importEncrypted(e.dataTransfer.files);
     }
@@ -2080,86 +2147,61 @@ function browseEncFile() {
 
 /* ── Import encrypted save ─────────────────────────── */
 async function importEncrypted(files) {
-  if (bsy || !files.length) return;
+  return runSaveBatch(files, 'Import', importEncryptedOne);
+}
 
-  /* Find image file (largest non-.bin) and detect PS4 */
-  let imgFile = null, binFile = null;
-  for (let i = 0; i < files.length; i++) {
-    if (files[i].name.endsWith('.bin')) binFile = files[i];
-    else if (!imgFile || files[i].size > imgFile.size) imgFile = files[i];
-  }
-  if (!imgFile) { log('No save file found', 'err'); return; }
-
-  const hdr = new Uint8Array(await imgFile.slice(0, 1).arrayBuffer());
-  const isPS4 = (hdr[0] === 0x01);
-
-  if (isPS4 && !binFile) {
-    log('PS4 save detected — drop both the save image and .bin key together', 'err');
-    return;
-  }
-
-  bsy = true;
+async function importEncryptedOne(save) {
+  const {imgFile, binFile, isPS4} = save;
   $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + t('status.uploading_encrypted', 'Uploading encrypted save...') + '</div></div>';
-  try {
-    /* Upload .bin key first if PS4 */
-    if (isPS4 && binFile) {
-      log('Uploading PS4 sealed key ' + binFile.name + '...');
-      const kxhr = await upload('/api/upload_key', binFile);
-      if (kxhr.status !== 200) throw new Error('Failed to upload .bin key');
-    }
-
-    log('Uploading ' + imgFile.name + ' (' + fmtB(imgFile.size) + ')...');
-    const xhr = await upload('/api/import_encrypted?uid=' + encodeURIComponent(curUid) + (isPS4 ? '&ps4=1' : ''), imgFile, (loaded, total) => {
-      showProgress(Math.round(loaded * 100 / total), loaded, total);
-    });
-    const d = JSON.parse(xhr.responseText);
-    if (d.error) throw new Error(d.error);
-
-    if (d.sfo_zeroed) {
-      log('Encrypted save has zeroed param.sfo', 'err');
-      await doImportFinish();
-      bsy = false;
-      return;
-    }
-
-    log('Save verified: ' + d.title_id + ' / ' + d.dir_name, 'ok');
-
-    /* Check if save already exists */
-    if (d.exists) {
-      const ok = await showConfirmModal(t('confirm.overwrite_save', 'This will overwrite an existing save. Are you sure?'));
-      if (!ok) {
-        log('Import cancelled');
-        try { await fetch('/api/unmount'); } catch(x) {}
-        renderCt(); bsy = false; return;
-      }
-    }
-
-    if (d.match) {
-      /* Account ID matches — proceed to import */
-      await doImportFinish();
-    } else {
-      /* Account ID mismatch — show modal */
-      const resign = await showConfirmModal(
-        t('import.account_mismatch', 'Account ID Mismatch!') + '<br><br>'
-        + '<span style="font-size:13px;color:var(--dm)">'
-        + t('import.save_account', 'Save') + ': <b style="color:var(--tx)">' + esc(d.save_aid) + '</b><br>'
-        + t('import.your_account', 'Your account') + ': <b style="color:var(--tx)">' + esc(d.user_aid) + '</b></span><br><br>'
-        + t('import.resign_question', 'Do you want to resign to your account ID?'),
-        t('import.yes_resign', 'Yes, Resign'), t('common.cancel', 'Cancel'));
-      if (resign) {
-        await doImportFinish();
-      } else {
-        log('Import cancelled');
-        try { await fetch('/api/unmount'); } catch(x) {}
-        renderCt();
-      }
-    }
-  } catch (e) {
-    log('Import error: ' + e.message, 'err');
-    try { await fetch('/api/unmount'); } catch(x) {}
-    renderCt();
+  /* Upload .bin key first if PS4 */
+  if (isPS4 && binFile) {
+    await uploadSaveKey(binFile);
   }
-  bsy = false;
+
+  log('Uploading ' + imgFile.name + ' (' + fmtB(imgFile.size) + ')...');
+  const xhr = await upload('/api/import_encrypted?uid=' + encodeURIComponent(curUid) + (isPS4 ? '&ps4=1' : ''), imgFile, (loaded, total) => {
+    showProgress(Math.round(loaded * 100 / total), loaded, total);
+  });
+  const d = JSON.parse(xhr.responseText);
+  if (d.error) throw new Error(d.error);
+
+  if (d.sfo_zeroed) {
+    log('Encrypted save has zeroed param.sfo', 'err');
+    return await doImportFinish();
+  }
+
+  log('Save verified: ' + d.title_id + ' / ' + d.dir_name, 'ok');
+
+  /* Check if save already exists */
+  if (d.exists) {
+    const ok = await showConfirmModal(t('confirm.overwrite_save', 'This will overwrite an existing save. Are you sure?'));
+    if (!ok) {
+      log('Import cancelled');
+      await unmountUploadedSave();
+      return false;
+    }
+  }
+
+  if (d.match) {
+    /* Account ID matches — proceed to import */
+    return await doImportFinish();
+  } else {
+    /* Account ID mismatch — show modal */
+    const resign = await showConfirmModal(
+      t('import.account_mismatch', 'Account ID Mismatch!') + '<br><br>'
+      + '<span style="font-size:13px;color:var(--dm)">'
+      + t('import.save_account', 'Save') + ': <b style="color:var(--tx)">' + esc(d.save_aid) + '</b><br>'
+      + t('import.your_account', 'Your account') + ': <b style="color:var(--tx)">' + esc(d.user_aid) + '</b></span><br><br>'
+      + t('import.resign_question', 'Do you want to resign to your account ID?'),
+      t('import.yes_resign', 'Yes, Resign'), t('common.cancel', 'Cancel'));
+    if (resign) {
+      return await doImportFinish();
+    } else {
+      log('Import cancelled');
+      await unmountUploadedSave();
+      return false;
+    }
+  }
 }
 
 function showConfirmModal(msg, yesText, noText) {
@@ -2249,14 +2291,16 @@ async function doImportFinish() {
       if (d.error) throw new Error(d.error);
     } else {
       log('Import cancelled');
-      try { await fetch('/api/unmount'); } catch(x) {}
+      await unmountUploadedSave();
       renderCt();
-      return;
+      return false;
     }
   }
   if (d.error) throw new Error(d.error);
   log('Import complete: ' + d.title_id + '/' + d.dir_name + (d.exists ? ' (updated)' : ' (new)'), 'ok');
   showImportSuccess(d);
+  if (d.warning) log('Warning: ' + d.warning, 'warn');
+  return d;
 }
 
 /* ── Mount & browse save ───────────────────────────── */
@@ -2542,6 +2586,7 @@ async function importSingleUsb(idx) {
     let d = await r.json();
     if (d.error) throw new Error(d.error);
     log('Imported ' + d.title_id + '/' + d.dir_name, 'ok');
+    if (d.warning) log('Warning: ' + d.warning, 'warn');
     await load();
     renderL();
   } catch(e) {
@@ -2570,6 +2615,7 @@ async function importAllUsb(titleId) {
       if (d.error) throw new Error(d.error);
       imported++;
       log('Imported ' + d.title_id + '/' + d.dir_name, 'ok');
+      if (d.warning) log('Warning: ' + d.warning, 'warn');
     } catch(e) {
       failed++;
       log('Failed to import ' + x.s.save_name + ': ' + e.message, 'err');
@@ -2693,10 +2739,12 @@ function tog(i) {
   renderF();
 }
 
-/* ── Hex / Text Editor (server-side) ──────────────── */
+/* ── Hex / Text / PNG Editor (server-side) ────────── */
 let edName = '';           /* file path relative to mount */
 let edTotal = 0;           /* total file size */
-let edMode = 'hex';        /* 'hex' or 'text' */
+let edMode = 'hex';        /* 'hex', 'text', or 'image' */
+let edImageUrl = '';
+let edImageLoadId = 0;
 let edOpen = false;        /* file open on server */
 let edRowH = 22;           /* row height in px */
 let edFontSize = 14;       /* hex editor font size */
@@ -2709,7 +2757,7 @@ const ED_TEXT_CHUNK = 65536; /* bytes per text chunk */
 
 async function openEditor(name, size) {
   if (bsy) return;
-  edName = name; edTotal = size; edMode = 'hex';
+  edName = name; edTotal = size; edMode = /\.png$/i.test(name) ? 'image' : 'hex';
   edOpen = false; edCache = {}; edDirty = {}; edTextDirty = false; edTextLoaded = 0;
   renderEditorShell();
   try {
@@ -2781,17 +2829,19 @@ function edZoom(dir) {
 }
 
 function renderEditorShell() {
+  edClearImagePreview();
   const c = $('ct');
   c.className = 'ct';
   const fname = edName.split('/').pop();
   const isUsb = si >= 0 && S[si] && S[si].usb;
   let bar = '<div class="editor-bar">'
     + '<button class="ebtn" onclick="closeEditor()">\u2190 ' + t('common.back', 'Back') + '</button>'
+    + (/\.png$/i.test(edName) ? '<button class="ebtn' + (edMode==='image'?' eact':'') + '" onclick="edSwitchMode(\'image\')">' + t('editor.image', 'Image') + '</button>' : '')
     + '<button class="ebtn' + (edMode==='hex'?' eact':'') + '" onclick="edSwitchMode(\'hex\')">' + t('editor.hex', 'Hex') + '</button>'
     + '<button class="ebtn' + (edMode==='text'?' eact':'') + '" onclick="edSwitchMode(\'text\')">' + t('editor.text', 'Text') + '</button>'
     + '<span class="ename">' + esc(fname) + '</span>'
-    + '<span class="esz">' + fmtB(edTotal) + '</span>'
-    + '<button class="ebtn" onclick="edZoom(-1)" style="padding:4px 8px;font-size:14px">\u2212</button>'
+    + '<span class="esz">' + fmtB(edTotal) + '</span>';
+  if (edMode !== 'image') bar += '<button class="ebtn" onclick="edZoom(-1)" style="padding:4px 8px;font-size:14px">\u2212</button>'
     + '<span style="font-size:11px;color:var(--dm);min-width:30px;text-align:center">' + edFontSize + 'px</span>'
     + '<button class="ebtn" onclick="edZoom(1)" style="padding:4px 8px;font-size:14px">+</button>';
   if (!isUsb) bar += '<button class="ebtn" style="border-color:var(--ok);color:var(--ok)" onclick="saveEditor()">' + t('common.save', 'Save') + '</button>';
@@ -2807,6 +2857,12 @@ function renderEditorShell() {
       + '</div>';
     const wrap = $('hexwrap');
     if (wrap) wrap.onscroll = edOnScroll;
+  } else if (edMode === 'image') {
+    c.innerHTML = bar + '<div style="flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:16px;gap:12px">'
+      + '<div id="imageStatus" style="color:var(--dm);font-size:12px">' + t('editor.loading', 'Loading...') + '</div>'
+      + '<img id="imagePreview" alt="' + esc(fname) + '" style="display:none;max-width:100%;max-height:100%;object-fit:contain;min-height:0">'
+      + '</div>';
+    edRenderImage();
   } else {
     c.innerHTML = bar
       + '<div class="text-wrap">'
@@ -2816,6 +2872,43 @@ function renderEditorShell() {
       + '<div id="etload" style="display:none;text-align:center;padding:4px;font-size:11px;color:var(--dm)">' + t('editor.loading_more', 'Loading more...') + '</div>';
     edTextLoaded = 0;
     edLoadTextChunk();
+  }
+}
+
+function edClearImagePreview() {
+  edImageLoadId++;
+  if (edImageUrl) URL.revokeObjectURL(edImageUrl);
+  edImageUrl = '';
+}
+
+async function edRenderImage() {
+  if (!edOpen || edMode !== 'image' || !/\.png$/i.test(edName)) return;
+  const loadId = edImageLoadId;
+  const img = $('imagePreview'), status = $('imageStatus');
+  if (!img || !status) return;
+  try {
+    const r = await fetch('/api/editor/read?offset=0&length=' + edTotal);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    if ((r.headers.get('Content-Type') || '').includes('application/json')) {
+      const d = await r.json();
+      throw new Error(d.error || 'Image unavailable');
+    }
+    const data = await r.arrayBuffer();
+    if (loadId !== edImageLoadId || edMode !== 'image' || !edOpen) return;
+    edImageUrl = URL.createObjectURL(new Blob([data], {type: 'image/png'}));
+    img.onload = () => {
+      if (loadId !== edImageLoadId) return;
+      img.style.display = 'block';
+      status.textContent = img.naturalWidth + ' × ' + img.naturalHeight;
+    };
+    img.onerror = () => {
+      if (loadId !== edImageLoadId) return;
+      img.style.display = 'none';
+      status.textContent = t('editor.image_error', 'Unable to display this PNG image.');
+    };
+    img.src = edImageUrl;
+  } catch (e) {
+    if (loadId === edImageLoadId) status.textContent = t('editor.image_error', 'Unable to display this PNG image.') + ' ' + e.message;
   }
 }
 
@@ -3021,6 +3114,7 @@ function edHasEdits() {
 }
 
 async function edSwitchMode(mode) {
+  if (!['hex', 'text', 'image'].includes(mode) || (mode === 'image' && !/\.png$/i.test(edName))) return;
   if (mode === edMode) return;
   /* If switching from text, flush current page edits */
   if (edMode === 'text') await edFlushText();
@@ -3103,6 +3197,7 @@ async function closeEditor() {
   if (edHasEdits()) {
     if (!confirm(t('editor.discard_changes', 'You have unsaved changes. Discard?'))) return;
   }
+  edClearImagePreview();
   try { await fetch('/api/editor/close'); } catch(e) {}
   edName = ''; edTotal = 0; edOpen = false; edCache = {}; edDirty = {}; edTextDirty = false;
   renderF();
@@ -3531,6 +3626,7 @@ async function importUsb() {
     const d = await r.json();
     if (d.error) throw new Error(d.error);
     log('Imported ' + d.title_id + '/' + d.dir_name, 'ok');
+    if (d.warning) log('Warning: ' + d.warning, 'warn');
     await load();
     renderL();
   } catch (e) {
