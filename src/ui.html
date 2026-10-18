@@ -1800,14 +1800,18 @@ async function collectEncryptedSaves(files) {
 }
 
 /* Fetch the entire result before the next save overwrites the payload's temp files. */
-async function downloadSaveResult(url, name) {
+async function fetchSaveResult(url) {
   const r = await fetch(url);
   if (!r.ok) throw new Error('Download failed: HTTP ' + r.status);
   if ((r.headers.get('Content-Type') || '').includes('application/json')) {
     const d = await r.json();
     throw new Error(d.error || 'Download failed');
   }
-  const blob = await r.blob();
+  return r.blob();
+}
+
+async function downloadSaveResult(url, name) {
+  const blob = await fetchSaveResult(url);
   const objectUrl = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = objectUrl; a.download = name;
@@ -1829,7 +1833,7 @@ async function uploadSaveKey(binFile) {
   if (!d.ok) throw new Error(d.error || 'Failed to upload .bin key');
 }
 
-async function runSaveBatch(files, label, process, prepare = collectEncryptedSaves) {
+async function runSaveBatch(files, label, process, prepare = collectEncryptedSaves, finish) {
   if (bsy || !files || !files.length) return;
   bsy = true;
   let succeeded = 0, failed = 0, skipped = 0;
@@ -1854,6 +1858,7 @@ async function runSaveBatch(files, label, process, prepare = collectEncryptedSav
         await unmountUploadedSave();
       }
     }
+    if (finish) await finish();
     if (saves.length > 1 || failed || skipped || warnings.length) {
       const summary = label + ': ' + succeeded + ' succeeded, ' + failed + ' failed, ' + skipped + ' skipped'
         + (warnings.length ? ', ' + warnings.length + ' with warnings' : '');
@@ -1888,8 +1893,96 @@ function runFolderSaves(files, folderName, entries, label, process) {
 }
 
 /* ── Decrypt drop ──────────────────────────────────── */
+/* Repackage the stored ZIPs returned by /api/download without copying file data
+ * into JavaScript buffers. Each save gets its own folder in one classic ZIP. */
+function createDecryptArchive() {
+  const parts = [], directory = [], folders = new Set();
+  let offset = 0, count = 0;
+  return {
+    async add(blob, folder) {
+      const tail = new DataView(await blob.slice(-22).arrayBuffer());
+      if (tail.byteLength !== 22 || tail.getUint32(0, true) !== 0x06054b50)
+        throw new Error('Invalid decrypted ZIP');
+      const entries = tail.getUint16(10, true), cdSize = tail.getUint32(12, true);
+      const cdOffset = tail.getUint32(16, true);
+      if (count + entries > 65535 || cdOffset + cdSize !== blob.size - 22)
+        throw new Error('Decrypted ZIP exceeds supported limits');
+      const cd = new DataView(await blob.slice(cdOffset, cdOffset + cdSize).arrayBuffer());
+      const base = folder.replace(/[\\/]/g, '_') || 'save';
+      folder = base;
+      for (let suffix = 2; folders.has(folder.toLowerCase()); suffix++) folder = base + '_' + suffix;
+      const newParts = [], newDirectory = [];
+      let nextOffset = offset, pos = 0;
+      for (let i = 0; i < entries; i++) {
+        if (pos + 46 > cd.byteLength || cd.getUint32(pos, true) !== 0x02014b50)
+          throw new Error('Invalid decrypted ZIP directory');
+        const nameLen = cd.getUint16(pos + 28, true), extraLen = cd.getUint16(pos + 30, true);
+        const commentLen = cd.getUint16(pos + 32, true), size = cd.getUint32(pos + 20, true);
+        const localOffset = cd.getUint32(pos + 42, true);
+        if (pos + 46 + nameLen + extraLen + commentLen > cd.byteLength || cd.getUint16(pos + 10, true) !== 0)
+          throw new Error('Unsupported decrypted ZIP entry');
+        const originalName = new Uint8Array(cd.buffer, pos + 46, nameLen);
+        const path = new TextDecoder().decode(originalName);
+        if (path.startsWith('/') || path.includes('\\') || path.split('/').some(p => p === '..' || p === '.'))
+          throw new Error('Invalid decrypted ZIP path');
+        const name = new TextEncoder().encode(folder + '/' + path);
+        const local = new DataView(await blob.slice(localOffset, localOffset + 30).arrayBuffer());
+        if (local.byteLength !== 30 || local.getUint32(0, true) !== 0x04034b50)
+          throw new Error('Invalid decrypted ZIP entry');
+        const dataOffset = localOffset + 30 + local.getUint16(26, true) + local.getUint16(28, true);
+        if (dataOffset + size > cdOffset || name.length > 65535 || nextOffset + 30 + name.length + size > 0xffffffff)
+          throw new Error('Decrypted ZIP exceeds supported limits');
+        local.setUint16(6, 0x800, true);
+        local.setUint16(26, name.length, true);
+        local.setUint16(28, 0, true);
+        const central = new DataView(cd.buffer.slice(pos, pos + 46));
+        central.setUint16(8, 0x800, true);
+        central.setUint16(28, name.length, true);
+        central.setUint16(30, 0, true);
+        central.setUint16(32, 0, true);
+        central.setUint32(42, nextOffset, true);
+        newParts.push(local.buffer, name, blob.slice(dataOffset, dataOffset + size));
+        newDirectory.push(central.buffer, name);
+        nextOffset += 30 + name.length + size;
+        pos += 46 + nameLen + extraLen + commentLen;
+      }
+      parts.push(...newParts);
+      directory.push(...newDirectory);
+      folders.add(folder.toLowerCase());
+      offset = nextOffset;
+      count += entries;
+    },
+    build() {
+      const cd = new Blob(directory);
+      if (offset + cd.size + 22 > 0xffffffff) throw new Error('Combined ZIP exceeds 4 GB');
+      const end = new DataView(new ArrayBuffer(22));
+      end.setUint32(0, 0x06054b50, true);
+      end.setUint16(8, count, true);
+      end.setUint16(10, count, true);
+      end.setUint32(12, cd.size, true);
+      end.setUint32(16, offset, true);
+      return new Blob([...parts, cd, end.buffer], {type: 'application/zip'});
+    }
+  };
+}
+
 async function decDrop(files) {
-  return runSaveBatch(files, 'Decrypt', decDropOne);
+  const archive = createDecryptArchive();
+  let completed = 0, titleId = '';
+  return runSaveBatch(files, 'Decrypt', async (save, batch) => {
+    const result = await decDropOne(save, batch);
+    if (batch) {
+      await archive.add(result.blob, save.imgFile.name);
+      if (!titleId && /^(CUSA|PPSA)\d{5}$/.test(result.titleId)) titleId = result.titleId;
+      completed++;
+    }
+  }, collectEncryptedSaves, () => {
+    if (completed) {
+      const name = (titleId || 'CUSAXXXXX') + '_dec.zip';
+      dl(archive.build(), name);
+      log('Downloaded ' + name + ' (' + completed + ' saves)', 'ok');
+    }
+  });
 }
 
 async function decDropOne(save, batch) {
@@ -1910,12 +2003,12 @@ async function decDropOne(save, batch) {
   }
   const d = JSON.parse(xhr.responseText);
   if (d.error) throw new Error(d.error);
-  log('Mounted — click Download to save decrypted files', 'ok');
+  log(batch ? 'Mounted — collecting decrypted files' : 'Mounted — click Download to save decrypted files', 'ok');
   const name = imgFile.name + '_dec.zip';
   if (batch) {
-    await downloadSaveResult('/api/download', name);
+    const blob = await fetchSaveResult('/api/download');
     await unmountUploadedSave();
-    return;
+    return {blob, titleId: d.title_id};
   }
   $('ct').innerHTML =
     '<div class="drop"><div class="dlbl">' + t('status.decrypt_ok', 'Decrypted successfully!') + '</div>'

@@ -5451,7 +5451,18 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
  
          /* Mount succeeded — return JSON with download URL instead of streaming zip
           * on the same connection (avoids browser XHR issues with large blob responses) */
-         http_json(sock, "{\"ok\":true,\"download\":\"/api/download\"}");
+         char sfo_path[MAX_PATH_LEN], json[256];
+         sfo_info_t sfo;
+         snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
+         parse_sfo(sfo_path, &sfo);
+         /* Only include a safe title ID; missing/zeroed SFOs can still be downloaded. */
+         if (strlen(sfo.title_id) != 9 ||
+             (strncmp(sfo.title_id, "CUSA", 4) != 0 && strncmp(sfo.title_id, "PPSA", 4) != 0) ||
+             strspn(sfo.title_id + 4, "0123456789") != 5)
+             sfo.title_id[0] = '\0';
+         snprintf(json, sizeof(json),
+                  "{\"ok\":true,\"download\":\"/api/download\",\"title_id\":\"%s\"}", sfo.title_id);
+         http_json(sock, json);
          return;
      }
  
