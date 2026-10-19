@@ -323,6 +323,23 @@
     .modal .mbtn-s { background: var(--bd); color: var(--tx) }
     .modal .mbtn-s:hover { background: var(--dm) }
 
+    .sfo-panel { flex: 1; min-height: 0; overflow: auto; padding: 20px }
+    .sfo-summary { display: flex; flex-wrap: wrap; gap: 18px 28px; padding: 20px; margin-bottom: 20px; background: var(--s1); border: 1px solid var(--bd); border-radius: 12px }
+    .sfo-summary-item { min-width: 100px; max-width: 100%; overflow-wrap: anywhere }
+    .sfo-summary-label { color: #8190aa; font-size: 10px; text-transform: uppercase; letter-spacing: .7px; margin-bottom: 6px }
+    .sfo-summary-value { font-size: 13px; font-weight: 600; line-height: 1.6 }
+    .sfo-table-wrap { overflow-x: auto; border: 1px solid var(--bd); border-radius: 10px }
+    .sfo-table { width: 100%; min-width: 600px; border-collapse: collapse; font-size: 12px }
+    .sfo-table th { text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: .7px; color: #8190aa; padding: 12px 14px; background: var(--s1) }
+    .sfo-table td { padding: 12px 14px; border-top: 1px solid var(--bd); vertical-align: top; line-height: 1.7 }
+    .sfo-table tr:hover td { background: rgba(0,112,255,.035) }
+    .sfo-key { font-family: monospace; font-weight: 600; color: var(--ac2); white-space: nowrap }
+    .sfo-value { font-family: monospace; overflow-wrap: anywhere; word-break: break-word; white-space: pre-wrap; min-width: 180px; max-width: 640px }
+    .sfo-type { color: #8190aa; white-space: nowrap }
+    .sfo-value summary { color: var(--ac2); cursor: pointer; white-space: normal }
+    .sfo-note { padding: 12px 0; color: #8190aa; font-size: 11px; line-height: 1.7 }
+    .sfo-error { color: var(--er) }
+
     /* ── Hex/Text editor ─────────────────────────────── */
     .editor-bar {
       display: flex; align-items: center; gap: 8px;
@@ -3215,10 +3232,10 @@ function tog(i) {
   renderF();
 }
 
-/* ── Hex / Text / PNG Editor (server-side) ────────── */
+/* ── SFO / Hex / Text / PNG Editor (server-side) ───── */
 let edName = '';           /* file path relative to mount */
 let edTotal = 0;           /* total file size */
-let edMode = 'hex';        /* 'hex', 'text', or 'image' */
+let edMode = 'hex';        /* 'sfo', 'hex', 'text', or 'image' */
 let edImageUrl = '';
 let edImageLoadId = 0;
 let edOpen = false;        /* file open on server */
@@ -3233,7 +3250,7 @@ const ED_TEXT_CHUNK = 65536; /* bytes per text chunk */
 
 async function openEditor(name, size) {
   if (bsy) return;
-  edName = name; edTotal = size; edMode = /\.png$/i.test(name) ? 'image' : 'hex';
+  edName = name; edTotal = size; edMode = /\.sfo$/i.test(name) ? 'sfo' : /\.png$/i.test(name) ? 'image' : 'hex';
   edOpen = false; edCache = {}; edDirty = {}; edTextDirty = false; edTextLoaded = 0;
   renderEditorShell();
   try {
@@ -3245,7 +3262,10 @@ async function openEditor(name, size) {
     renderEditorShell();
     if (edMode === 'hex') edRenderRows();
     log('Opened ' + name + ' (' + fmtB(edTotal) + ')', 'ok');
-  } catch(e) { log('Error: ' + e.message, 'err'); }
+  } catch(e) {
+    log('Error: ' + e.message, 'err');
+    if (edMode === 'sfo' && $('sfoViewer')) $('sfoViewer').textContent = e.message;
+  }
 }
 
 /* Fetch a range of bytes from server, with caching */
@@ -3312,18 +3332,22 @@ function renderEditorShell() {
   const isUsb = si >= 0 && S[si] && S[si].usb;
   let bar = '<div class="editor-bar">'
     + '<button class="ebtn" onclick="closeEditor()">\u2190 ' + t('common.back', 'Back') + '</button>'
+    + (/\.sfo$/i.test(edName) ? '<button class="ebtn' + (edMode==='sfo'?' eact':'') + '" onclick="edSwitchMode(\'sfo\')">SFO Viewer</button>' : '')
     + (/\.png$/i.test(edName) ? '<button class="ebtn' + (edMode==='image'?' eact':'') + '" onclick="edSwitchMode(\'image\')">' + t('editor.image', 'Image') + '</button>' : '')
     + '<button class="ebtn' + (edMode==='hex'?' eact':'') + '" onclick="edSwitchMode(\'hex\')">' + t('editor.hex', 'Hex') + '</button>'
     + '<button class="ebtn' + (edMode==='text'?' eact':'') + '" onclick="edSwitchMode(\'text\')">' + t('editor.text', 'Text') + '</button>'
     + '<span class="ename">' + esc(fname) + '</span>'
     + '<span class="esz">' + fmtB(edTotal) + '</span>';
-  if (edMode !== 'image') bar += '<button class="ebtn" onclick="edZoom(-1)" style="padding:4px 8px;font-size:14px">\u2212</button>'
+  if (edMode === 'hex' || edMode === 'text') bar += '<button class="ebtn" onclick="edZoom(-1)" style="padding:4px 8px;font-size:14px">\u2212</button>'
     + '<span style="font-size:11px;color:var(--dm);min-width:30px;text-align:center">' + edFontSize + 'px</span>'
     + '<button class="ebtn" onclick="edZoom(1)" style="padding:4px 8px;font-size:14px">+</button>';
   if (!isUsb) bar += '<button class="ebtn" style="border-color:var(--ok);color:var(--ok)" onclick="saveEditor()">' + t('common.save', 'Save') + '</button>';
   bar += '</div>';
 
-  if (edMode === 'hex') {
+  if (edMode === 'sfo') {
+    c.innerHTML = bar + '<div class="sfo-panel" id="sfoViewer" role="region" aria-label="SFO Viewer">Loading SFO fields…</div>';
+    edRenderSfo();
+  } else if (edMode === 'hex') {
     const totalRows = Math.ceil(edTotal / 16);
     const totalH = totalRows * edRowH;
     c.innerHTML = bar
@@ -3348,6 +3372,99 @@ function renderEditorShell() {
       + '<div id="etload" style="display:none;text-align:center;padding:4px;font-size:11px;color:var(--dm)">' + t('editor.loading_more', 'Loading more...') + '</div>';
     edTextLoaded = 0;
     edLoadTextChunk();
+  }
+}
+
+/* Adapted from earthonion/htos-web templates/tools_sfo_viewer.html.
+ * Keep parsing local; validate offsets before creating views into untrusted SFOs. */
+const SFO_FORMAT_NAMES = {0x0004: 'Special', 0x0204: 'UTF-8', 0x0404: 'Integer'};
+
+function parseSfo(buf) {
+  const dv = new DataView(buf), bytes = new Uint8Array(buf);
+  const invalid = () => { throw new Error('Invalid SFO: truncated file or invalid field offsets.'); };
+  if (buf.byteLength < 20 || dv.getUint32(0, false) !== 0x00505346)
+    throw new Error('Not a valid SFO file (bad magic bytes). You can still inspect it in Hex.');
+  const version = dv.getUint32(4, true), keyOff = dv.getUint32(8, true);
+  const dataOff = dv.getUint32(12, true), count = dv.getUint32(16, true);
+  if (count > 4096 || 20 + count * 16 > keyOff || keyOff > dataOff || dataOff > bytes.length) invalid();
+  const entries = [], decoder = new TextDecoder();
+  for (let i = 0; i < count; i++) {
+    const base = 20 + i * 16, kOff = dv.getUint16(base, true), fmt = dv.getUint16(base + 2, true);
+    const usedLen = dv.getUint32(base + 4, true), maxLen = dv.getUint32(base + 8, true);
+    const start = dataOff + dv.getUint32(base + 12, true), keyStart = keyOff + kOff;
+    const keyEnd = bytes.indexOf(0, keyStart);
+    if (keyStart >= dataOff || keyEnd <= keyStart || keyEnd >= dataOff
+        || usedLen > maxLen || start + maxLen > bytes.length) invalid();
+    const key = decoder.decode(bytes.subarray(keyStart, keyEnd));
+    const data = bytes.subarray(start, start + usedLen);
+    let value, displayValue;
+    if (fmt === 0x0204) {
+      const end = data.indexOf(0);
+      value = displayValue = decoder.decode(end < 0 ? data : data.subarray(0, end));
+    } else if (fmt === 0x0404) {
+      if (usedLen < 4) invalid();
+      value = dv.getUint32(start, true);
+      displayValue = value > 9999 ? value + ' (0x' + value.toString(16).toUpperCase() + ')' : String(value);
+    } else {
+      value = displayValue = Array.from(data, b => b.toString(16).padStart(2, '0').toUpperCase()).join(' ');
+      if (key === 'ACCOUNT_ID' && usedLen === 8)
+        displayValue = Array.from(data).reverse().map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+    entries.push({key, fmt, value, displayValue, usedLen, maxLen});
+  }
+  return {version, count, entries};
+}
+
+function sfoViewerHtml(sfo) {
+  const fields = Object.create(null);
+  for (const entry of sfo.entries) fields[entry.key] = entry.value;
+  const titleId = String(fields.TITLE_ID || '—');
+  const format = fields.FORMAT || '';
+  const platform = titleId.startsWith('CUSA') ? 'PS4' : titleId.startsWith('PPSA') ? 'PS5'
+    : ['obs', 'ob'].includes(format) ? 'PS4' : format === 'ppr' ? 'PS5' : '—';
+  const categories = {gd: 'Game', gdc: 'Game Content', gdd: 'Game Demo', gde: 'Game Digital Extra',
+    gdgd: 'Game with Extra', gdk: 'Game Key', gdl: 'Game DLC', gdo: 'Game Trial', gp: 'Game Patch',
+    gpc: 'Game Patch Content', sd: 'Save Data', ac: 'Additional Content'};
+  const category = String(fields.CATEGORY || '—');
+  const summary = [
+    ['Title', fields.MAINTITLE || fields.TITLE || '—'], ['Title ID', titleId], ['Platform', platform],
+    ['Category', categories[category] ? category + ' (' + categories[category] + ')' : category],
+    ['Version', fields.APP_VER || fields.VERSION || '—'],
+    ...(fields.SAVEDATA_DIRECTORY ? [['Save Directory', fields.SAVEDATA_DIRECTORY]] : []),
+    ['Entries', sfo.count]
+  ];
+  return '<div class="sfo-summary">' + summary.map(([label, value]) =>
+    '<div class="sfo-summary-item"><div class="sfo-summary-label">' + esc(label)
+    + '</div><div class="sfo-summary-value">' + esc(String(value)) + '</div></div>').join('')
+    + '</div><div class="sfo-table-wrap"><table class="sfo-table"><thead><tr><th scope="col">Key</th><th scope="col">Type</th><th scope="col">Value</th><th scope="col">Size</th></tr></thead><tbody>'
+    + sfo.entries.map(e => {
+      const value = esc(String(e.displayValue));
+      const display = e.displayValue.length > 200
+        ? '<details><summary>View ' + e.usedLen + ' bytes</summary>' + value + '</details>' : value;
+      return '<tr><td class="sfo-key">' + esc(e.key) + '</td><td class="sfo-type">'
+        + (SFO_FORMAT_NAMES[e.fmt] || '0x' + e.fmt.toString(16).toUpperCase())
+        + '</td><td class="sfo-value">' + display + '</td><td class="sfo-type">' + e.usedLen + '/' + e.maxLen + '</td></tr>';
+    }).join('') + '</tbody></table></div><p class="sfo-note">Read-only view. Switch to Hex or Text to edit the file.</p>';
+}
+
+async function edRenderSfo() {
+  const host = $('sfoViewer'), name = edName;
+  if (!edOpen || edMode !== 'sfo' || !host) return;
+  const current = () => edOpen && edMode === 'sfo' && edName === name && $('sfoViewer') === host;
+  try {
+    if (edTotal > 4 * 1024 * 1024) throw new Error('SFO Viewer supports files up to 4 MB. Use Hex for larger files.');
+    const r = await fetch('/api/editor/read?offset=0&length=' + edTotal);
+    if (!r.ok) throw new Error('Unable to read SFO (HTTP ' + r.status + ')');
+    if ((r.headers.get('Content-Type') || '').includes('application/json')) {
+      const d = await r.json();
+      throw new Error(d.error || 'Unable to read SFO');
+    }
+    const buf = await r.arrayBuffer();
+    if (!current()) return;
+    if (buf.byteLength !== edTotal) throw new Error('SFO download is incomplete. Reopen the file to retry.');
+    host.innerHTML = sfoViewerHtml(parseSfo(buf));
+  } catch (e) {
+    if (current()) host.innerHTML = '<p class="sfo-error" role="alert">' + esc(e.message) + '</p>';
   }
 }
 
@@ -3590,7 +3707,8 @@ function edHasEdits() {
 }
 
 async function edSwitchMode(mode) {
-  if (!['hex', 'text', 'image'].includes(mode) || (mode === 'image' && !/\.png$/i.test(edName))) return;
+  if (!['sfo', 'hex', 'text', 'image'].includes(mode)
+      || (mode === 'sfo' && !/\.sfo$/i.test(edName)) || (mode === 'image' && !/\.png$/i.test(edName))) return;
   if (mode === edMode) return;
   /* If switching from text, flush current page edits */
   if (edMode === 'text') await edFlushText();
