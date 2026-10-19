@@ -136,6 +136,7 @@
  static char g_mount_point[MAX_PATH_LEN] = {0};
  static int g_mounted = 0;
  static int g_mounted_idx = -1;
+ static char g_mount_error[512] = {0};
  static char g_local_copy[MAX_PATH_LEN] = {0};
  static uint8_t g_sealed_key[96] = {0};
  static int g_enc_ps4 = 0;
@@ -1262,6 +1263,26 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
                  if (pread(hfd, &hdr, 1, 0) == 1 && hdr == 0x01) s->is_ps4 = 1;
                  close(hfd);
              }
+             /* Old imports could leave a PS4 image in savedata_prospero
+              * without its key. Prefer the complete re-import in savedata,
+              * keeping the old file untouched instead of listing it twice. */
+             if (!is_ps4 && s->is_ps4 && strncmp(ent->d_name, "sdimg_", 6) == 0) {
+                 char correct_image[MAX_PATH_LEN], correct_key[MAX_PATH_LEN];
+                 struct stat image_st, key_st;
+                 snprintf(correct_image, sizeof(correct_image), "/user/home/%s/savedata/%s/%s", uid, title_id, ent->d_name);
+                 snprintf(correct_key, sizeof(correct_key), "/user/home/%s/savedata/%s/%s.bin", uid, title_id, ent->d_name + 6);
+                 if (stat(correct_image, &image_st) == 0 && S_ISREG(image_st.st_mode) &&
+                     stat(correct_key, &key_st) == 0 && S_ISREG(key_st.st_mode) && key_st.st_size >= 96) {
+                     uint8_t header = 0;
+                     int correct_fd = open(correct_image, O_RDONLY);
+                     int valid = correct_fd >= 0 && pread(correct_fd, &header, 1, 0) == 1 && header == 0x01;
+                     if (correct_fd >= 0) close(correct_fd);
+                     if (valid) {
+                         logprintf("[GarlicMgr] Ignoring misplaced PS4 duplicate: %s (complete copy in savedata)\n", filepath);
+                         g_save_count--;
+                     }
+                 }
+             }
          }
      }
      closedir(d);
@@ -1301,6 +1322,15 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      uint32_t uid_offset;
      char format[4];
  } sfo_info_t;
+ /* Community SFOs may omit FORMAT or use "ob" (Apollo CUSA10812).
+  * Keep the title's platform instead of treating every non-"obs" value as PS5. */
+ static int sfo_is_ps4(const sfo_info_t *sfo, int fallback) {
+     if (strncmp(sfo->title_id, "CUSA", 4) == 0) return 1;
+     if (strncmp(sfo->title_id, "PPSA", 4) == 0) return 0;
+     if (strcmp(sfo->format, "obs") == 0 || strcmp(sfo->format, "ob") == 0) return 1;
+     if (strcmp(sfo->format, "ppr") == 0) return 0;
+     return fallback;
+ }
  static int parse_sfo(const char *path, sfo_info_t *info);
  
  static void scan_usb_saves(const char *garlic_path) {
@@ -1351,7 +1381,7 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
                  char sfo[MAX_PATH_LEN];
                  snprintf(sfo, sizeof(sfo), "%s/sce_sys/param.sfo", filepath);
                  sfo_info_t sfo_info;
-                 if (parse_sfo(sfo, &sfo_info) == 0 && strcmp(sfo_info.format, "obs") == 0)
+                 if (parse_sfo(sfo, &sfo_info) == 0 && sfo_is_ps4(&sfo_info, 0))
                      s->is_ps4 = 1;
              }
          }
@@ -1420,17 +1450,33 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      int sfd = open(src, O_RDONLY);
      if (sfd < 0) return -1;
      int dfd = open(dst, O_CREAT | O_WRONLY | O_TRUNC, 0777);
-     if (dfd < 0) { close(sfd); return -2; }
+     if (dfd < 0) { int saved_errno = errno; close(sfd); errno = saved_errno; return -2; }
      fchmod(dfd, 0777);
      char *buf = malloc(BUF_SIZE);
-     if (!buf) { close(sfd); close(dfd); return -3; }
-     ssize_t n;
-     while ((n = read(sfd, buf, BUF_SIZE)) > 0)
-         write(dfd, buf, n);
+     if (!buf) { close(sfd); close(dfd); errno = ENOMEM; return -3; }
+     int result = 0, saved_errno = 0;
+     for (;;) {
+         ssize_t n = read(sfd, buf, BUF_SIZE);
+         if (n < 0 && errno == EINTR) continue;
+         if (n < 0) { result = -4; saved_errno = errno; break; }
+         if (n == 0) break;
+         ssize_t offset = 0;
+         while (offset < n) {
+             ssize_t written = write(dfd, buf + offset, (size_t)(n - offset));
+             if (written < 0 && errno == EINTR) continue;
+             if (written <= 0) {
+                 result = -5; saved_errno = written < 0 ? errno : EIO;
+                 break;
+             }
+             offset += written;
+         }
+         if (result < 0) break;
+     }
      free(buf);
      close(sfd);
-     close(dfd);
-     return 0;
+     if (close(dfd) < 0 && result == 0) { result = -5; saved_errno = errno; }
+     if (result < 0) errno = saved_errno;
+     return result;
  }
  
  /* ── Recursive directory copy ───────────────────────────────────── */
@@ -1503,6 +1549,7 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
  
  /* ── Mount / unmount ────────────────────────────────────────────── */
  static int mount_save(int idx) {
+     g_mount_error[0] = 0;
      if (g_mounted) return -1;
      if (idx < 0 || idx >= g_save_count) return -2;
  
@@ -1559,7 +1606,18 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
              if (sl) *(sl + 1) = 0;
              snprintf(src_bin, sizeof(src_bin), "%s%s.bin", src_dir, savename);
              snprintf(dst_bin, sizeof(dst_bin), "/data/save_files/%s.bin", savename);
-             copy_file(src_bin, dst_bin);
+             if (copy_file(src_bin, dst_bin) < 0) {
+                 int copy_errno = errno;
+                 snprintf(g_mount_error, sizeof(g_mount_error),
+                          "Cannot copy PS4 key for %.80s/%.80s (errno=%d). Check the installed .bin companion.",
+                          s->title_id, savename, copy_errno);
+                 logprintf("[GarlicMgr] %s Source: %s Destination: %s\n", g_mount_error, src_bin, dst_bin);
+                 /* Never try a leftover key belonging to another title/slot. */
+                 unlink(dst_bin);
+                 unlink(g_local_copy);
+                 g_local_copy[0] = 0;
+                 return -4;
+             }
              chmod(dst_bin, 0755);
              logprintf("[GarlicMgr] Copied .bin key %s -> %s\n", src_bin, dst_bin);
          }
@@ -1588,6 +1646,8 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
  
          int fd = open(bin_path, O_RDONLY);
          if (fd < 0) {
+             snprintf(g_mount_error, sizeof(g_mount_error),
+                      "Cannot open PS4 .bin key (errno=%d). Re-import the save with its companion key.", errno);
              logprintf("[GarlicMgr] mount: cannot open sealed key %s (errno=%d)\n", bin_path, errno);
              free(data);
              return -4;
@@ -1595,6 +1655,7 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
          int r = read(fd, data, 0x60);
          close(fd);
          if (r != 0x60) {
+             snprintf(g_mount_error, sizeof(g_mount_error), "PS4 .bin key is incomplete: read %d of 96 bytes", r);
              logprintf("[GarlicMgr] mount: short read on .bin (%d)\n", r);
              free(data);
              return -5;
@@ -1674,6 +1735,9 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
          g_mounted_idx = idx;
          return 0;
      }
+     snprintf(g_mount_error, sizeof(g_mount_error),
+              "sceFsMountSaveData failed: %d (0x%x), %s, key_decrypted=%s, errno=%d",
+              ret, ret, is_ps4 ? "PS4" : "PS5", key_ok ? "yes" : "no", errno);
      logprintf("[GarlicMgr] Mount failed (0x%x, key_ok=%d, errno=%d: %s)\n", ret, key_ok, errno, strerror(errno));
      return ret;
  }
@@ -4619,8 +4683,13 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          } else {
              int ret = mount_save(idx);
              if (ret < 0) {
-                 char json[256];
-                 snprintf(json, sizeof(json), "{\"error\":\"Mount failed: %d (0x%x)\"}", ret, ret);
+                 char json[1200], escaped_error[1024];
+                 if (g_mount_error[0]) {
+                     json_escape(g_mount_error, escaped_error, sizeof(escaped_error));
+                     snprintf(json, sizeof(json), "{\"error\":\"%s\"}", escaped_error);
+                 } else {
+                     snprintf(json, sizeof(json), "{\"error\":\"Mount failed: %d (0x%x)\"}", ret, ret);
+                 }
                  http_json(sock, json);
                  return;
              }
@@ -5536,7 +5605,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          }
  
          /* Detect PS4 vs PS5 from SFO FORMAT field: "obs"=PS4, "ppr"=PS5 */
-         g_enc_ps4 = (strcmp(sfo.format, "obs") == 0) ? 1 : 0;
+         g_enc_ps4 = sfo_is_ps4(&sfo, g_enc_ps4);
          printf("[GarlicMgr] import_encrypted: FORMAT=%s -> %s\n",
                 sfo.format, g_enc_ps4 ? "PS4" : "PS5");
  
@@ -6147,7 +6216,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              snprintf(sfo_chk, sizeof(sfo_chk), "%s/sce_sys/param.sfo", g_mount_point);
              sfo_info_t sfo_tmp;
              if (parse_sfo(sfo_chk, &sfo_tmp) == 0)
-                 g_enc_ps4 = (strcmp(sfo_tmp.format, "obs") == 0) ? 1 : 0;
+                g_enc_ps4 = sfo_is_ps4(&sfo_tmp, g_enc_ps4);
          }
  
          /* Optional account ID patching */
@@ -6553,7 +6622,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              }
  
              /* Detect PS4/PS5 from FORMAT */
-             g_enc_ps4 = (strcmp(sfo.format, "obs") == 0) ? 1 : 0;
+             g_enc_ps4 = sfo_is_ps4(&sfo, g_enc_ps4);
              printf("[GarlicMgr] import_usb: encrypted %s/%s FORMAT=%s %s\n",
                     sfo.title_id, sfo.dir_name, sfo.format, g_enc_ps4 ? "PS4" : "PS5");
  
@@ -6801,7 +6870,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          }
  
          /* Detect PS4/PS5 from FORMAT */
-         int is_ps4 = (strcmp(sfo.format, "obs") == 0);
+         int is_ps4 = sfo_is_ps4(&sfo, 0);
          g_enc_ps4 = is_ps4;
          printf("[GarlicMgr] import_usb: %s/%s FORMAT=%s %s\n",
                 sfo.title_id, sfo.dir_name, sfo.format, is_ps4 ? "PS4" : "PS5");
@@ -7214,7 +7283,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              return;
          }
          /* Detect PS4 vs PS5 from SFO FORMAT field: "obs"=PS4, "ppr"=PS5 */
-         g_enc_ps4 = (strcmp(sfo.format, "obs") == 0) ? 1 : 0;
+         g_enc_ps4 = sfo_is_ps4(&sfo, g_enc_ps4);
          printf("[GarlicMgr] import: title_id=%s dir=%s title=%s blocks=%u FORMAT=%s %s\n",
                 sfo.title_id, sfo.dir_name, sfo.main_title, sfo.blocks,
                 sfo.format, g_enc_ps4 ? "(PS4)" : "(PS5)");
@@ -7258,7 +7327,34 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          /* Save mounted path before unmount clears it */
          char tmp_path[MAX_PATH_LEN];
          snprintf(tmp_path, sizeof(tmp_path), "%s", g_mounted_path);
+
+         /* Decrypted PS4 imports created by create_pfs have a freshly generated
+          * key, unlike encrypted imports whose companion was uploaded. Stage
+          * that key before installing so we never reuse an old import's key. */
+         if (g_enc_ps4 && strcmp(tmp_path, "/data/save_files/_tmp_enc") == 0) {
+             const char *key_path = "/data/save_files/_tmp_import.bin";
+             int key_fd = open(key_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+             ssize_t key_written = key_fd >= 0 ? write(key_fd, g_sealed_key, sizeof(g_sealed_key)) : -1;
+             if (key_fd >= 0) close(key_fd);
+             if (key_written != (ssize_t)sizeof(g_sealed_key)) {
+                 unlink(key_path);
+                 if (icon_tmp[0]) unlink(icon_tmp);
+                 http_json(sock, "{\"error\":\"Cannot stage PS4 sealed key for import\"}");
+                 return;
+             }
+         }
  
+         /* Refuse to replace the installed image when its required key is
+          * missing. A successful image copy alone is not a valid PS4 import. */
+         if (g_enc_ps4) {
+             struct stat key_st;
+             if (stat("/data/save_files/_tmp_import.bin", &key_st) < 0 || key_st.st_size < 96) {
+                 if (icon_tmp[0]) unlink(icon_tmp);
+                 http_json(sock, "{\"error\":\"PS4 import key is missing or incomplete; existing save was not replaced\"}");
+                 return;
+             }
+         }
+
          /* Unmount (re-encrypts the PFS image) */
          unmount_save();
  
@@ -7296,7 +7392,10 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                  chmod(bin_dst, 0644);
                  printf("[GarlicMgr] import: PS4 .bin key -> %s\n", bin_dst);
              } else {
-                 printf("[GarlicMgr] import: WARNING - failed to copy .bin key\n");
+                 logprintf("[GarlicMgr] import: failed to copy .bin key %s -> %s (errno=%d)\n", bin_src, bin_dst, errno);
+                 if (icon_tmp[0]) unlink(icon_tmp);
+                 http_json(sock, "{\"error\":\"PS4 save image copied but companion key installation failed. Import is incomplete; re-import the save.\"}");
+                 return;
              }
              if (!from_usb) unlink(bin_src);
          }
@@ -8180,4 +8279,3 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
  
      return 0;
  }
- 

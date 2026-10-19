@@ -25,6 +25,58 @@
     ::-webkit-scrollbar-track { background: transparent }
     ::-webkit-scrollbar-thumb { background: var(--bd); border-radius: 3px }
 
+    .online-page { padding: 28px; width: 100%; max-width: 1240px; margin: 0 auto }
+    .online-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 18px }
+    .online-heading h2 { font-size: 20px; margin-bottom: 8px }
+    .online-heading p { color: var(--tx); opacity: .75; font-size: 12px; line-height: 1.7 }
+    .online-heading a { color: var(--ac2) }
+    .online-search { width: 100%; background: var(--s1); border: 1px solid var(--bd); border-radius: 10px; color: var(--tx); padding: 12px; margin-bottom: 12px }
+    #online-status { font-size: 12px; line-height: 1.6; margin-bottom: 12px; color: var(--ac2) }
+    #online-list { display: flex; flex-direction: column; gap: 18px }
+    .online-row { border: 1px solid var(--bd); border-radius: 14px; background: var(--s1); overflow: hidden; flex-shrink: 0 }
+    .online-card-header { display: flex; align-items: center; gap: 16px; padding: 18px 20px; background: linear-gradient(110deg, rgba(0,112,255,.07), transparent); border-bottom: 1px solid var(--bd) }
+    .online-icon { position: relative; flex-shrink: 0; width: 86px; height: 64px; border: 1px solid var(--bd); border-radius: 8px; overflow: hidden; background: var(--bd); display: grid; place-items: center }
+    .online-icon img { position: absolute; width: 100%; height: 100%; object-fit: contain; background: var(--s1) }
+    .online-icon img[hidden] { display: none }
+    .online-icon span { font-size: 12px; color: var(--tx) }
+    .online-game { flex: 1; min-width: 0 }
+    .online-game strong { display: block; font-size: 15px; line-height: 1.5; margin-bottom: 7px; overflow-wrap: anywhere }
+    .online-badge { display: inline-block; font-size: 10px; font-weight: 700; background: #123b69; color: #98d5ff; padding: 3px 7px; border-radius: 5px; vertical-align: middle }
+    .online-save-count { font-size: 11px; color: #8d9cb5; white-space: nowrap }
+    .online-save { display: flex; align-items: center; gap: 16px; padding: 18px 20px }
+    .online-save + .online-save { border-top: 1px solid var(--bd) }
+    .online-save:hover { background: rgba(0,112,255,.035) }
+    .online-save-number { display: grid; place-items: center; width: 28px; height: 28px; flex-shrink: 0; border: 1px solid var(--bd); border-radius: 8px; font-size: 11px; color: #8d9cb5; font-variant-numeric: tabular-nums }
+    .online-descriptions p { flex: 1; min-width: 0; font-size: 12px; line-height: 1.8; overflow-wrap: anywhere }
+    .online-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0 }
+    .online-actions button { white-space: nowrap }
+    .online-actions .bbtn { background: transparent; border: 1px solid #244978; color: #a6ceff }
+    .online-card-message { padding: 20px; font-size: 12px; color: #8d9cb5; display: flex; align-items: center; gap: 12px }
+    .online-actions .bbtn, .online-descriptions > .bbtn { margin: 0 }
+    .online-actions .bbtn:disabled { opacity: .35; cursor: default }
+    .online-error { color: var(--er) }
+    .online-empty { padding: 24px; text-align: center }
+    .ct.import-stage { padding: 24px; align-items: center }
+    .import-stage .drop { margin: auto; flex-shrink: 0; width: 100%; max-width: 520px; padding: 32px; border: 1px solid var(--bd); border-radius: 16px; background: var(--s1); text-align: center }
+    .import-symbol { display: grid; place-items: center; width: 54px; height: 54px; margin: 0 auto 20px; border-radius: 50%; background: var(--gl); color: var(--ac2); font-size: 26px }
+    .import-symbol.success { background: rgba(0,221,119,.1); color: var(--ok) }
+    .import-symbol.error { background: rgba(255,34,68,.1); color: var(--er) }
+    .import-stage h2 { font-size: 19px; margin-bottom: 12px; color: var(--tx) }
+    .import-detail { font-size: 13px; line-height: 1.9; color: #93a2ba; overflow-wrap: anywhere }
+    .import-detail strong { color: var(--tx) }
+    .import-detail .online-badge { margin: 10px 4px }
+    .import-result-actions { display: flex; justify-content: center; flex-wrap: wrap; gap: 10px; margin-top: 24px }
+    .import-result-actions .bbtn { margin: 0 }
+    @media (max-width: 768px) {
+      .online-page { padding: 16px }
+      .online-card-header { padding: 14px; gap: 12px; flex-wrap: wrap }
+      .online-icon { width: 72px; height: 54px }
+      .online-game strong { font-size: 13px }
+      .online-save-count { margin-left: auto }
+      .online-save { flex-wrap: wrap; padding: 16px 14px; gap: 10px }
+      .online-actions { width: 100%; padding-left: 38px; flex-wrap: wrap }
+    }
+
     /* ── Nav ─────────────────────────────────────────── */
     nav {
       height: 48px; background: var(--s1);
@@ -500,6 +552,7 @@
   <button class="tab" data-tab="encrypt" data-i18n="nav.encrypt" onclick="switchTab('encrypt')">Encrypt</button>
   <button class="tab" data-tab="resign" data-i18n="nav.resign" onclick="switchTab('resign')">Resign</button>
   <button class="tab" data-tab="import" data-i18n="nav.import" onclick="switchTab('import')">Import</button>
+  <button class="tab" data-tab="online" onclick="switchTab('online')">Online Sves</button>
   <button class="tab" data-tab="settings" data-i18n="nav.settings" onclick="switchTab('settings')">Settings</button>
   <span class="spacer"></span>
   <button class="shut" data-i18n="nav.kill" onclick="shutdown()">Kill GarlicMgr</button>
@@ -512,6 +565,7 @@
   <button class="tab" data-tab="encrypt" data-i18n="nav.encrypt" onclick="switchTab('encrypt')">Encrypt</button>
   <button class="tab" data-tab="resign" data-i18n="nav.resign" onclick="switchTab('resign')">Resign</button>
   <button class="tab" data-tab="import" data-i18n="nav.import" onclick="switchTab('import')">Import</button>
+  <button class="tab" data-tab="online" onclick="switchTab('online')">Online Sves</button>
   <button class="tab" data-tab="settings" data-i18n="nav.settings" onclick="switchTab('settings')">Settings</button>
   <button class="shut" data-i18n="nav.kill" onclick="shutdown()">Kill GarlicMgr</button>
   <span style="font-size:10px;color:#ffeb3b">__VERSION__</span>
@@ -672,6 +726,7 @@ function upload(url, file, onProgress, respType) {
 }
 
 function showProgress(pct, loaded, total) {
+  if ($('ct').classList.contains('import-stage')) return;
   let el = document.getElementById('upprog');
   if (!el) {
     const ct = $('ct');
@@ -844,6 +899,7 @@ function toggleUserDD() {
 }
 
 function selectUser(uid) {
+  if (onlineImporting) return;
   curUid = uid;
   const u = users.find(x => x.id === uid);
   $('curuser').removeAttribute('data-i18n');
@@ -859,6 +915,7 @@ document.addEventListener('click', e => {
 
 /* ── Tab switching ─────────────────────────────────── */
 function switchTab(t) {
+  if (onlineImporting) return;
   tab = t;
   document.querySelectorAll('nav .tab, .mob-menu .tab').forEach(b => {
     b.className = 'tab' + (b.dataset.tab === t ? ' active' : '');
@@ -1094,6 +1151,9 @@ function renderCt() {
       + '<button class="bbtn" onclick="browseFolder()" style="margin-right:8px">' + t('drop.browse_folder', 'Browse Folder') + '</button>'
       + '<button class="bbtn" onclick="browseEncFile()">' + t('drop.browse_files', 'Browse File') + '</button></div>';
     setupImportDZ('dz');
+
+  } else if (tab === 'online') {
+    renderOnline();
 
   } else if (tab === 'settings') {
     renderSettings();
@@ -2143,12 +2203,311 @@ async function resignDropOne(save, batch, aidv, uidv) {
     + '<button class="bbtn" style="margin-top:12px" onclick="switchTab(\'resign\')">' + t('status.resign_another', 'Resign Another') + '</button></div>';
 }
 
+/* Apollo's public indexes and archives are fetched by the browser only. */
+const APOLLO_PS4 = 'https://raw.githubusercontent.com/bucanero/apollo-saves/master/PS4/';
+let onlineGames = null, onlineLoading = false, onlineError = '', onlineQuery = '';
+let onlineWorking = false, onlineImporting = false;
+const onlineSaves = new Map();
+let onlineObserver = null, onlineLoadQueue = [], onlineLoads = 0, onlineGeneration = 0;
+
+function renderImportStage(title, detail, state = 'busy', actions = '') {
+  if (state === 'busy') {
+    title = 'Importing to PS5...';
+    detail = '';
+  }
+  const c = $('ct');
+  c.className = 'ct import-stage';
+  c.innerHTML = '<div class="drop" role="status" aria-live="polite">'
+    + '<div class="import-symbol ' + state + '" aria-hidden="true">' + (state === 'success' ? '&#10003;' : state === 'error' ? '!' : '&#8595;') + '</div>'
+    + '<h2>' + esc(title) + '</h2><div class="import-detail">' + detail + '</div>'
+    + (actions ? '<div class="import-result-actions">' + actions + '</div>' : '') + '</div>';
+}
+
+function onlineImportBackButton() {
+  return '<button class="bbtn" onclick="switchTab(\'online\')">Back to Online Sves</button>';
+}
+
+function parseOnlineIndex(text, validKey) {
+  return text.replace(/^\uFEFF/, '').split(/\r?\n/).flatMap(line => {
+    const eq = line.indexOf('=');
+    if (eq < 1) return [];
+    const id = line.slice(0, eq).trim(), name = line.slice(eq + 1).trim();
+    return validKey.test(id) && name ? [{id, name}] : [];
+  });
+}
+
+async function fetchOnline(path, binary = false) {
+  const r = await fetch(APOLLO_PS4 + path, {signal: AbortSignal.timeout(120000)});
+  if (!r.ok) throw new Error('Apollo download failed (HTTP ' + r.status + ')');
+  if (binary && Number(r.headers.get('Content-Length')) > 512 * 1024 * 1024)
+    throw new Error('Archive exceeds the 512 MB browser limit');
+  if (!binary) return r.text();
+  const blob = await r.blob();
+  if (blob.size > 512 * 1024 * 1024) throw new Error('Archive exceeds the 512 MB browser limit');
+  return blob;
+}
+
+async function loadOnlineGames() {
+  if (onlineLoading) return;
+  onlineLoading = true; onlineError = '';
+  try {
+    onlineGames = parseOnlineIndex(await fetchOnline('games.txt'), /^CUSA\d{5}$/);
+    if (!onlineGames.length) throw new Error('Apollo returned an empty game list');
+  } catch (e) { onlineError = e.message; }
+  finally {
+    onlineLoading = false;
+    if (tab === 'online' && !onlineImporting) renderOnline();
+  }
+}
+
+function renderOnline() {
+  const c = $('ct');
+  c.className = 'ct';
+  c.innerHTML = '<div class="online-page">'
+    + '<div class="online-heading"><div><h2>Online Sves <span class="online-badge">PS4</span></h2>'
+    + '<p>Community saves from <a href="https://github.com/bucanero/apollo-saves/tree/master/PS4" target="_blank" rel="noopener noreferrer">Apollo Save Database</a>.</p>'
+    + '<p>Import installs to the selected console user. Download as zip saves to this device only.</p></div>'
+    + '<button class="btn" id="online-refresh" ' + (onlineWorking || onlineLoading ? 'disabled' : '') + '>Refresh</button></div>'
+    + '<input class="online-search" id="online-search" type="search" placeholder="Search game name or CUSA…" aria-label="Search online games" value="' + esc(onlineQuery) + '">'
+    + '<div id="online-status" role="status" aria-live="polite"></div><div id="online-list"></div></div>';
+  $('online-refresh').onclick = () => {
+    onlineGeneration++;
+    onlineGames = null; onlineSaves.clear(); onlineLoadQueue = [];
+    loadOnlineGames(); renderOnline();
+  };
+  $('online-search').oninput = e => { onlineQuery = e.target.value; renderOnlineRows(); };
+  renderOnlineRows();
+  if (!onlineGames && !onlineLoading && !onlineError) { loadOnlineGames(); renderOnlineRows(); }
+}
+
+function renderOnlineRows() {
+  if (!$('online-list')) return;
+  if (onlineObserver) onlineObserver.disconnect();
+  onlineLoadQueue = [];
+  if (onlineError || onlineLoading) $('online-status').textContent = onlineError || 'Loading Apollo games…';
+  const games = (onlineGames || []).filter(g => (g.name + ' ' + g.id).toLowerCase().includes(onlineQuery.toLowerCase()));
+  $('online-list').innerHTML = games.map(g => {
+    const state = onlineSaves.get(g.id);
+    return '<article class="online-row" id="online-card-' + g.id + '" data-online-id="' + g.id + '"><header class="online-card-header"><div class="online-icon"><img loading="lazy" src="' + APOLLO_PS4 + g.id + '/icon0.png" alt="" onerror="this.hidden=true"><span>PS4</span></div>'
+      + '<div class="online-game"><strong>' + esc(g.name) + '</strong><span class="online-badge">' + g.id + '</span></div>'
+      + '<span class="online-save-count">' + onlineSaveCount(state) + '</span></header>'
+      + '<div class="online-descriptions">' + onlineSaveList(g.id, state) + '</div></article>';
+  }).join('') || (onlineGames && !onlineLoading ? '<p class="online-empty">No games found.</p>' : '');
+  bindOnlineActions($('online-list'));
+  /* Load visible cards automatically, at most four requests at a time. Update
+   * only the completed card so other game headers and scroll positions stay put. */
+  onlineObserver = new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      onlineObserver.unobserve(entry.target);
+      const id = entry.target.dataset.onlineId;
+      if (!onlineSaves.has(id) && !onlineLoadQueue.includes(id)) onlineLoadQueue.push(id);
+    }
+    pumpOnlineSaves();
+  }, {root: $('ct'), rootMargin: '200px 0px'});
+  $('online-list').querySelectorAll('[data-online-id]').forEach(card => {
+    if (!onlineSaves.has(card.dataset.onlineId)) onlineObserver.observe(card);
+  });
+}
+
+function onlineSaveCount(state) {
+  return state?.saves ? state.saves.length + (state.saves.length === 1 ? ' save' : ' saves') : '';
+}
+
+function onlineSaveList(id, state) {
+  if (!state || state.loading) return '<div class="online-card-message" role="status">Loading saves…</div>';
+  if (state.error) return '<div class="online-card-message"><p class="online-error">' + esc(state.error)
+    + '</p><button class="bbtn" data-game="' + id + '">Retry</button></div>';
+  return state.saves.map((s, i) => '<div class="online-save"><span class="online-save-number">'
+    + String(i + 1).padStart(2, '0') + '</span><p>' + esc(s.name) + '</p><div class="online-actions">'
+    + '<button class="btn grn" data-import="' + id + '" data-save="' + i + '" ' + (onlineWorking || bsy || bulkRunning ? 'disabled' : '') + '>Import</button>'
+    + '<button class="bbtn" data-download="' + id + '" data-save="' + i + '" ' + (onlineWorking ? 'disabled' : '') + '>Download as zip</button>'
+    + '</div></div>').join('');
+}
+
+function bindOnlineActions(root) {
+  root.querySelectorAll('[data-game]').forEach(b => { b.onclick = () => loadOnlineSaves(b.dataset.game); });
+  root.querySelectorAll('[data-import], [data-download]').forEach(b => {
+    b.onclick = () => onlineSaveAction(b.dataset.import || b.dataset.download, Number(b.dataset.save), !!b.dataset.import);
+  });
+}
+
+function updateOnlineCard(id) {
+  if (tab !== 'online' || onlineImporting) return;
+  const card = $('online-card-' + id);
+  if (!card) return;
+  const state = onlineSaves.get(id);
+  card.querySelector('.online-save-count').textContent = onlineSaveCount(state);
+  card.querySelector('.online-descriptions').innerHTML = onlineSaveList(id, state);
+  bindOnlineActions(card);
+}
+
+function pumpOnlineSaves() {
+  while (onlineLoads < 4 && onlineLoadQueue.length && tab === 'online' && !onlineImporting) {
+    const id = onlineLoadQueue.shift();
+    if (onlineSaves.has(id)) continue;
+    onlineLoads++;
+    loadOnlineSaves(id).finally(() => { onlineLoads--; pumpOnlineSaves(); });
+  }
+}
+
+async function loadOnlineSaves(id) {
+  if (onlineSaves.get(id)?.loading) return;
+  const generation = onlineGeneration;
+  onlineSaves.set(id, {loading: true}); updateOnlineCard(id);
+  try {
+    const saves = parseOnlineIndex(await fetchOnline(id + '/saves.txt'), /^[a-zA-Z0-9_-]+\.zip$/i);
+    if (!saves.length) throw new Error('No saves available for this game');
+    if (generation === onlineGeneration) onlineSaves.set(id, {saves});
+  } catch (e) { if (generation === onlineGeneration) onlineSaves.set(id, {error: e.message}); }
+  if (generation === onlineGeneration) updateOnlineCard(id);
+}
+
+function onlineCRC(bytes) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+/* Validate the entire ZIP before sending any of its contents to the console.
+ * Apollo archives contain decrypted save folders; support stored and deflated ZIPs. */
+async function extractOnlineZip(blob) {
+  const bytes = new Uint8Array(await blob.arrayBuffer()), v = new DataView(bytes.buffer);
+  const invalid = () => { throw new Error('Invalid or unsupported Apollo ZIP'); };
+  let end = bytes.length - 22;
+  for (; end >= Math.max(0, bytes.length - 65557); end--) {
+    if (v.getUint32(end, true) === 0x06054b50 && end + 22 + v.getUint16(end + 20, true) === bytes.length) break;
+  }
+  if (end < 0 || end < bytes.length - 65557) invalid();
+  const count = v.getUint16(end + 10, true), cdSize = v.getUint32(end + 12, true), cd = v.getUint32(end + 16, true);
+  if (v.getUint16(end + 4, true) || v.getUint16(end + 6, true) || !count || count > 4096
+      || v.getUint16(end + 8, true) !== count || cd + cdSize !== end) invalid();
+  const files = [], names = new Set();
+  let pos = cd, total = 0;
+  for (let i = 0; i < count; i++) {
+    if (pos + 46 > end || v.getUint32(pos, true) !== 0x02014b50) invalid();
+    const flags = v.getUint16(pos + 8, true), method = v.getUint16(pos + 10, true);
+    const crc = v.getUint32(pos + 16, true), packed = v.getUint32(pos + 20, true), size = v.getUint32(pos + 24, true);
+    const n = v.getUint16(pos + 28, true), extra = v.getUint16(pos + 30, true), comment = v.getUint16(pos + 32, true);
+    const local = v.getUint32(pos + 42, true);
+    if (pos + 46 + n + extra + comment > end || flags & 1 || ![0, 8].includes(method)
+        || v.getUint16(pos + 34, true) || (v.getUint32(pos + 38, true) >>> 16 & 0xf000) === 0xa000) invalid();
+    const path = new TextDecoder('utf-8', {fatal: true}).decode(bytes.subarray(pos + 46, pos + 46 + n));
+    if (!path || path.length > 480 || /[\\:\x00-\x1f\x7f]/.test(path) || path.startsWith('/')
+        || path.replace(/\/$/, '').split('/').some(p => !p || p === '.' || p === '..') || names.has(path.toLowerCase())) invalid();
+    names.add(path.toLowerCase());
+    if (local + 30 > cd || v.getUint32(local, true) !== 0x04034b50
+        || v.getUint16(local + 8, true) !== method || v.getUint16(local + 6, true) !== flags) invalid();
+    const ln = v.getUint16(local + 26, true), le = v.getUint16(local + 28, true), start = local + 30 + ln + le;
+    if (start + packed > cd || ln !== n || bytes.subarray(local + 30, local + 30 + ln).some((b, j) => b !== bytes[pos + 46 + j])) invalid();
+    pos += 46 + n + extra + comment;
+    if (path.endsWith('/')) { if (size || packed) invalid(); continue; }
+    total += size;
+    if (total > 512 * 1024 * 1024) throw new Error('Expanded save exceeds the 512 MB browser limit');
+    let data = bytes.subarray(start, start + packed);
+    if (method === 8) {
+      let inflater;
+      try { inflater = new DecompressionStream('deflate-raw'); }
+      catch (_) { throw new Error('Import needs a current browser with ZIP decompression support. Download as zip is still available.'); }
+      const reader = new Blob([data]).stream().pipeThrough(inflater).getReader(), chunks = [];
+      let length = 0;
+      for (;;) {
+        const {done, value} = await reader.read();
+        if (done) break;
+        length += value.length;
+        if (length > size) { await reader.cancel(); invalid(); }
+        chunks.push(value);
+      }
+      data = new Uint8Array(await new Blob(chunks).arrayBuffer());
+    }
+    if (data.length !== size || onlineCRC(data) !== crc) invalid();
+    const file = new File([data], path.split('/').pop());
+    file._path = path;
+    files.push(file);
+  }
+  if (pos !== end) invalid();
+  return files;
+}
+
+function groupOnlineSaves(files) {
+  const roots = files.filter(f => /(^|\/)sce_sys\/param\.sfo$/i.test(f._path))
+    .map(f => f._path.slice(0, -'sce_sys/param.sfo'.length));
+  if (!roots.length) throw new Error('Archive does not contain a decrypted save (sce_sys/param.sfo)');
+  if (roots.some((root, i) => roots.some((other, j) => i !== j && root.startsWith(other))))
+    throw new Error('Archive contains overlapping save folders');
+  const groups = roots.map(root => ({root, files: files.filter(f => f._path.startsWith(root))}));
+  return groups.map(({root, files}) => files.map(f => {
+    f._path = 'online-save/' + f._path.slice(root.length);
+    return f;
+  }));
+}
+
+async function onlineSaveAction(id, index, install) {
+  if (onlineWorking || (install && (bsy || bulkRunning))) return;
+  const save = onlineSaves.get(id)?.saves?.[index];
+  if (!save) return;
+  if (install && !curUid) { log('Select a console user before importing', 'err'); return; }
+  onlineWorking = true; onlineImporting = install;
+  if (install) bsy = true;
+  renderOnline();
+  $('online-refresh').disabled = true;
+  $('online-status').textContent = 'Downloading ' + id + ' / ' + save.id + '…';
+  if (install) renderImportStage('Downloading save', '<strong>' + esc(id) + '</strong><br>' + esc(save.name));
+  let mounted = false;
+  try {
+    const blob = await fetchOnline(id + '/' + encodeURIComponent(save.id), true);
+    if (!install) {
+      dl(blob, id + '_' + save.id);
+      log('Downloaded ' + id + ' / ' + save.id + ' to this device', 'ok');
+      if (tab === 'online') $('online-status').textContent = 'ZIP downloaded to this device.';
+      return;
+    }
+    const groups = groupOnlineSaves(await extractOnlineZip(blob));
+    if (mt) await unmountUploadedSave();
+    mt = false; si = -1; cf = [];
+    for (const files of groups) {
+      mounted = true;
+      const result = await importDropOne(files, 'online-save', true);
+      mounted = false;
+      if (result === false) {
+        renderImportStage('Import cancelled', 'The selected save was not installed.', 'cancelled', onlineImportBackButton());
+        break;
+      }
+    }
+    await load();
+  } catch (e) {
+    log('Online save: ' + e.message, 'err');
+    if (mounted) {
+      try { await unmountUploadedSave(); } catch (cleanup) { log(cleanup.message, 'err'); }
+      mt = false; si = -1; cf = [];
+    }
+    if (tab === 'online') {
+      if (install) renderImportStage('Import failed', esc(e.message), 'error', onlineImportBackButton());
+      else {
+        renderOnline();
+        $('online-status').textContent = e.message;
+      }
+    }
+  } finally {
+    onlineWorking = false; onlineImporting = false;
+    if (install) bsy = false;
+    if ($('online-list')) {
+      renderOnlineRows();
+      $('online-refresh').disabled = onlineLoading;
+    }
+    renderTB();
+  }
+}
+
 /* ── Import drop ───────────────────────────────────── */
 async function importDrop(files, folderName, entries) {
   return runFolderSaves(files, folderName, entries, 'Import', importDropOne);
 }
 
-async function importDropOne(files, folderName) {
+async function importDropOne(files, folderName, isPS4 = false) {
   /* Check for sce_sys/param.sfo in the dropped files */
   let hasSfo = false;
   for (const f of files) {
@@ -2165,8 +2524,8 @@ async function importDropOne(files, folderName) {
 
   /* Step 1: create PFS image */
   log('Creating PFS image for import (' + fmtB(totalSize) + ' of files)...');
-  $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + t('status.creating_pfs', 'Creating PFS image...') + '</div></div>';
-  let r = await fetch('/api/create_pfs?size=' + totalSize);
+  renderImportStage(t('status.creating_pfs', 'Creating PFS image...'), 'Preparing the save for your console.');
+  let r = await fetch('/api/create_pfs?size=' + totalSize + (isPS4 ? '&ps4=1' : ''));
   let d = await r.json();
   if (d.error) throw new Error(d.error);
   log('PFS image created and mounted', 'ok');
@@ -2179,8 +2538,7 @@ async function importDropOne(files, folderName) {
     const relPath = parts.length > 1 ? parts.slice(1).join('/') : parts[0];
 
     log('Uploading (' + (i + 1) + '/' + files.length + ') ' + relPath + ' (' + fmtB(f.size) + ')...');
-    $('ct').innerHTML = '<div class="drop" id="dz"><div class="dlbl">' + t('status.uploading_file', 'Uploading {name}', {name: esc(relPath)})
-      + '<br>(' + (i + 1) + '/' + files.length + ')</div></div>';
+    renderImportStage('Uploading save files', '<strong>' + esc(relPath) + '</strong><br>File ' + (i + 1) + ' of ' + files.length);
 
     const xhr = await upload('/api/upload_file?name=' + encodeURIComponent(relPath), f, (loaded, total) => {
       const pct = Math.round(loaded * 100 / total);
@@ -2208,15 +2566,13 @@ async function importDropOne(files, folderName) {
 }
 
 function showImportSuccess(d) {
-  $('ct').innerHTML =
-    '<div class="drop"><div class="dlbl">'
-    + '<div style="color:var(--ok);font-size:16px;font-weight:700;margin-bottom:8px">' + t('status.import_ok', 'Import Successful') + '</div>'
-    + '<b>' + esc(d.main_title || d.title_id) + '</b><br>'
-    + esc(d.title_id) + ' / ' + esc(d.dir_name)
-    + (d.exists ? '<br><span style="color:var(--dm)">' + t('status.existing_save_updated', 'Existing save updated') + '</span>' : '<br><span style="color:var(--dm)">' + t('status.new_save_added', 'New save added') + '</span>')
+  renderImportStage(t('status.import_ok', 'Import Successful'),
+    '<strong>' + esc(d.main_title || d.title_id) + '</strong><br>'
+    + '<span class="online-badge">' + esc(d.title_id) + '</span> / ' + esc(d.dir_name)
+    + '<br>' + (d.exists ? t('status.existing_save_updated', 'Existing save updated') : t('status.new_save_added', 'New save added'))
     + (d.warning ? '<br><span style="color:#c89b00">' + esc(d.warning) + '</span>' : '')
-    + '</div>'
-    + '<button class="bbtn" style="margin-top:12px" onclick="switchTab(\'import\')">' + t('status.import_another', 'Import Another') + '</button></div>';
+    , 'success', tab === 'online' ? onlineImportBackButton()
+      : '<button class="bbtn" onclick="switchTab(\'import\')">' + t('status.import_another', 'Import Another') + '</button>');
 }
 
 /* ── Import DZ setup (accepts both folders and files) ── */
@@ -2394,7 +2750,7 @@ async function showSfoModal(opts) {
 
 async function doImportFinish() {
   log('Importing to system...');
-  $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + t('status.importing', 'Importing save to system...') + '</div></div>';
+  renderImportStage(t('status.importing', 'Importing save to system...'), 'Finishing installation for the selected user.');
   let r = await fetch('/api/import_finish?uid=' + encodeURIComponent(curUid));
   let d = await r.json();
   if (d.sfo_zeroed) {
