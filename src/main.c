@@ -320,6 +320,13 @@
  
  static cloud_state_t g_cloud_state = {0};
  static int g_net_ready = 0;
+ static volatile sig_atomic_t g_resume_pending = 0;
+ static volatile sig_atomic_t g_resume_signal = 0;
+
+ static void handle_sigcont(int sig) {
+     (void)sig;
+     g_resume_signal = 1;
+ }
  
  static const char *json_skip_ws(const char *p) {
      while (p && *p && isspace((unsigned char)*p)) p++;
@@ -2978,6 +2985,15 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
      pthread_mutex_unlock(&g_auto_mtx);
  
      while (1) {
+         if (g_resume_pending) {
+             g_resume_pending = 0;
+             pthread_mutex_lock(&g_mtx);
+             scan_saves();
+             pthread_mutex_unlock(&g_mtx);
+             auto_set_result(NULL, "Console resumed; rescanned saves");
+             logprintf("[GarlicMgr] Auto: console resumed, rescanned saves\n");
+         }
+
          cloud_config_t cfg;
          char err[256] = {0};
          if (cloud_load_config(&cfg, err, sizeof(err)) == 0 && cfg.enabled && cfg.auto_backup.enabled) {
@@ -8061,7 +8077,49 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
      http_send(sock, "404 Not Found", "application/json", "{\"error\":\"Not found\"}", 20);
  }
  
- /* ── Main ───────────────────────────────────────────────────────── */
+  /* ── HTTP listener recovery ──────────────────────────────────────── */
+ static int g_srvfd = -1;
+
+ static uint64_t mono_ms(void) {
+     struct timespec ts;
+     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+ }
+
+ static int server_open_listener(void) {
+     int fd = socket(AF_INET, SOCK_STREAM, 0);
+     if (fd < 0) return -1;
+     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int));
+
+     struct sockaddr_in addr = {0};
+     addr.sin_family = AF_INET;
+     addr.sin_addr.s_addr = htonl(INADDR_ANY);
+     addr.sin_port = htons(PORT);
+
+     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
+         listen(fd, 16) < 0) {
+         close(fd);
+         return -1;
+     }
+     return fd;
+ }
+
+ static void server_recover(const char *reason) {
+     if (g_srvfd >= 0) {
+         close(g_srvfd);
+         g_srvfd = -1;
+     }
+     int fd = server_open_listener();
+     if (fd < 0) {
+         logprintf("[GarlicMgr] listener recovery failed (%s): %s\n",
+                   reason, strerror(errno));
+         return;
+     }
+     g_srvfd = fd;
+     logprintf("[GarlicMgr] listener recovered (%s) on port %d\n", reason, PORT);
+ }
+
+/* ── Main ───────────────────────────────────────────────────────── */
  int main(void) {
      /* Zero the umask so open(..., 0777) really lands at 0777. Files inside
       * a mounted PFS need world-write to pass the game's save-verify at load;
@@ -8072,6 +8130,10 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
      sceUserServiceInitialize(0);
      kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
      signal(SIGPIPE, SIG_IGN);
+     signal(SIGHUP, SIG_IGN);
+     signal(SIGTERM, SIG_IGN);
+     signal(SIGALRM, SIG_IGN);
+     signal(SIGCONT, handle_sigcont);
      init_crc();
      load_app_db();
  
@@ -8112,34 +8174,81 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
      notify("Garlic SaveMgr: port %d", PORT);
      start_auto_watcher();
  
-     int srvfd = socket(AF_INET, SOCK_STREAM, 0);
-     if (srvfd < 0) { perror("socket"); return 1; }
-     setsockopt(srvfd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int));
- 
-     struct sockaddr_in addr = {0};
-     addr.sin_family = AF_INET;
-     addr.sin_addr.s_addr = htonl(INADDR_ANY);
-     addr.sin_port = htons(PORT);
- 
-     if (bind(srvfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-         perror("bind"); close(srvfd); return 1;
-     }
-     if (listen(srvfd, 16) < 0) {
-         perror("listen"); close(srvfd); return 1;
-     }
- 
+     g_srvfd = server_open_listener();
+     if (g_srvfd < 0) { perror("bind/listen"); return 1; }
+
      printf("Listening on port %d\n", PORT);
- 
+
+     uint64_t last_mono = mono_ms();
      while (1) {
+         if (g_resume_signal) {
+             g_resume_signal = 0;
+             logprintf("[GarlicMgr] resume signal (SIGCONT)\n");
+             if (g_srvfd >= 0) { close(g_srvfd); g_srvfd = -1; }
+             usleep(1000000);
+             server_recover("SIGCONT");
+             g_resume_pending = 1;
+             last_mono = mono_ms();
+             if (g_srvfd >= 0)
+                 notify("Garlic SaveMgr: resumed\nPort: %d", PORT);
+             else
+                 notify("Garlic SaveMgr: resume recovery failed");
+             continue;
+         }
+
+         if (g_srvfd < 0) {
+             server_recover("listener unavailable");
+             sleep(1);
+             continue;
+         }
+
+         fd_set rfds;
+         FD_ZERO(&rfds);
+         FD_SET(g_srvfd, &rfds);
+         struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+         int sel = select(g_srvfd + 1, &rfds, NULL, NULL, &tv);
+         uint64_t now = mono_ms();
+
+         /* A large monotonic jump means the process was suspended (rest mode).
+          * Recover the listener and tell the auto watcher to rescan. */
+         if (last_mono && now > last_mono + 30000) {
+             logprintf("[GarlicMgr] resume detected (%llu ms gap)\n",
+                       (unsigned long long)(now - last_mono));
+             if (g_srvfd >= 0) { close(g_srvfd); g_srvfd = -1; }
+             usleep(1000000);
+             server_recover("resume");
+             g_resume_pending = 1;
+             last_mono = now;
+             if (g_srvfd >= 0)
+                 notify("Garlic SaveMgr: resumed\nPort: %d", PORT);
+             continue;
+         }
+         last_mono = now;
+
+         if (sel < 0) {
+             if (errno == EINTR) continue;
+             logprintf("[GarlicMgr] select failed: %s; recreating listener\n", strerror(errno));
+             server_recover("select");
+             sleep(1);
+             continue;
+         }
+         if (sel == 0) continue;
+
          struct sockaddr_in client;
          socklen_t clen = sizeof(client);
-         int conn = accept(srvfd, (struct sockaddr*)&client, &clen);
-         if (conn < 0) continue;
- 
+         int conn = accept(g_srvfd, (struct sockaddr*)&client, &clen);
+         if (conn < 0) {
+             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+             logprintf("[GarlicMgr] accept failed: %s; recreating listener\n", strerror(errno));
+             server_recover("accept");
+             sleep(1);
+             continue;
+         }
+
          int *fd_ptr = malloc(sizeof(int));
          if (!fd_ptr) { close(conn); continue; }
          *fd_ptr = conn;
- 
+
          pthread_t tid;
          pthread_attr_t attr;
          pthread_attr_init(&attr);
@@ -8166,7 +8275,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          }
          pthread_attr_destroy(&attr);
      }
- 
+
      return 0;
  }
  
