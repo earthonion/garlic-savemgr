@@ -1294,6 +1294,8 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      char detail[256];
      char game_title_id[16];
      uint32_t user_param;
+     uint32_t list_param;
+     int has_list_param;
      uint32_t blocks;
      uint64_t account_id;
      uint32_t user_id;
@@ -1900,10 +1902,20 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
              memcpy(&info->user_id, val, 4);
          else if (strcmp(key, "FORMAT") == 0)
              snprintf(info->format, sizeof(info->format), "%.*s", (int)param_len, (char*)val);
-         else if (strcmp(key, "SAVEDATA_LIST_PARAM") == 0 || strcmp(key, "CATEGORY") == 0) {
+         else if (strcmp(key, "SAVEDATA_LIST_PARAM") == 0 && param_len >= 4) {
+             memcpy(&info->list_param, val, 4);
+             info->has_list_param = 1;
+         }
+         else if (strcmp(key, "CATEGORY") == 0) {
              /* game_title_id from CATEGORY not needed, use title_id */
          }
      }
+     /* Fall back to the legacy PARAMS field only when the SFO has no
+      * SAVEDATA_LIST_PARAM entry. Slot 0 is a valid value, so presence must
+      * be tracked separately. */
+     if (!info->has_list_param)
+         info->list_param = info->user_param;
+
      /* Default game_title_id to title_id */
      if (!info->game_title_id[0])
          strncpy(info->game_title_id, info->title_id, sizeof(info->game_title_id) - 1);
@@ -6680,19 +6692,19 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                  char sql[2048];
                  if (db_exists) {
                      snprintf(sql, sizeof(sql),
-                         "UPDATE savedata SET main_title='%s', mtime='%s', account_id=%llu, user_id=%u "
+                         "UPDATE savedata SET main_title='%s', mtime='%s', account_id=%lld, user_id=%u, is_broken=0 "
                          "WHERE title_id='%s' AND dir_name='%s'",
-                         esc_title, mtime, (unsigned long long)aid_val, uid, sfo.title_id, sfo.dir_name);
+                         esc_title, mtime, (long long)(int64_t)aid_val, uid, sfo.title_id, sfo.dir_name);
                  } else {
                      snprintf(sql, sizeof(sql),
                          "INSERT INTO savedata (title_id, dir_name, main_title, sub_title, detail,"
                          "is_broken, user_param, blocks, free_blocks, size_kib, mtime,"
                          "fake_broken, account_id, user_id, faked_owner, cloud_revision,"
                          "game_title_id, system_blocks) VALUES ("
-                         "'%s','%s','%s','','',0,%u,%u,%u,%u,'%s',0,%llu,%u,0,0,'%s',0)",
+                         "'%s','%s','%s','','',0,%u,%u,%u,%u,'%s',0,%lld,%u,0,0,'%s',0)",
                          sfo.title_id, sfo.dir_name, esc_title,
-                         sfo.user_param, sfo.blocks, sfo.blocks, sfo.blocks * 0x40, mtime,
-                         (unsigned long long)aid_val, uid, sfo.title_id);
+                         sfo.list_param, sfo.blocks, sfo.blocks, sfo.blocks * 0x40, mtime,
+                         (long long)(int64_t)aid_val, uid, sfo.title_id);
                  }
                  ret = sqlite3_exec(db, sql, NULL, 0, &err_msg);
                  if (ret != SQLITE_OK) { printf("[GarlicMgr] import_usb: DB error: %s\n", err_msg); sqlite3_free(err_msg); }
@@ -7076,9 +7088,9 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              char sql[2048];
              if (db_exists) {
                  snprintf(sql, sizeof(sql),
-                     "UPDATE savedata SET main_title='%s', mtime='%s', account_id=%llu, user_id=%u "
+                     "UPDATE savedata SET main_title='%s', mtime='%s', account_id=%lld, user_id=%u, is_broken=0 "
                      "WHERE title_id='%s' AND dir_name='%s'",
-                     esc_title, mtime, (unsigned long long)aid_val, uid,
+                     esc_title, mtime, (long long)(int64_t)aid_val, uid,
                      sfo.title_id, sfo.dir_name);
              } else {
                  snprintf(sql, sizeof(sql),
@@ -7086,10 +7098,10 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                      "is_broken, user_param, blocks, free_blocks, size_kib, mtime,"
                      "fake_broken, account_id, user_id, faked_owner, cloud_revision,"
                      "game_title_id, system_blocks) VALUES ("
-                     "'%s','%s','%s','','',0,%u,%u,%u,%u,'%s',0,%llu,%u,0,0,'%s',0)",
+                     "'%s','%s','%s','','',0,%u,%u,%u,%u,'%s',0,%lld,%u,0,0,'%s',0)",
                      sfo.title_id, sfo.dir_name, esc_title,
-                     sfo.user_param, sfo.blocks, sfo.blocks, size_kib, mtime,
-                     (unsigned long long)aid_val, uid, sfo.title_id);
+                     sfo.list_param, sfo.blocks, sfo.blocks, size_kib, mtime,
+                     (long long)(int64_t)aid_val, uid, sfo.title_id);
              }
              ret = sqlite3_exec(db, sql, NULL, 0, &err_msg);
              if (ret != SQLITE_OK) {
@@ -7403,12 +7415,12 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          if (exists) {
              snprintf(sql, sizeof(sql),
                  "UPDATE savedata SET main_title='%s', sub_title='%s', detail='%s',"
-                 "user_param=%u, blocks=%u, free_blocks=%u, size_kib=%u,"
-                 "mtime='%s', account_id=%llu, user_id=%u "
+                 "is_broken=0, user_param=%u, blocks=%u, free_blocks=%u, size_kib=%u,"
+                 "mtime='%s', account_id=%lld, user_id=%u "
                  "WHERE title_id='%s' AND dir_name='%s'",
                  esc_title, esc_sub, esc_detail,
-                 sfo.user_param, sfo.blocks, sfo.blocks, size_kib,
-                 mtime, (unsigned long long)aid_val, uid,
+                 sfo.list_param, sfo.blocks, sfo.blocks, size_kib,
+                 mtime, (long long)(int64_t)aid_val, uid,
                  sfo.title_id, sfo.dir_name);
          } else {
              snprintf(sql, sizeof(sql),
@@ -7418,11 +7430,11 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                  "game_title_id, system_blocks) VALUES ("
                  "'%s','%s','%s','%s','%s',"
                  "0,%u,%u,%u,%u,'%s',"
-                 "0,%llu,%u,0,0,"
+                 "0,%lld,%u,0,0,"
                  "'%s',0)",
                  sfo.title_id, sfo.dir_name, esc_title, esc_sub, esc_detail,
-                 sfo.user_param, sfo.blocks, sfo.blocks, size_kib, mtime,
-                 (unsigned long long)aid_val, uid,
+                 sfo.list_param, sfo.blocks, sfo.blocks, size_kib, mtime,
+                 (long long)(int64_t)aid_val, uid,
                  sfo.game_title_id);
          }
  
