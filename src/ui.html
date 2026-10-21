@@ -569,7 +569,7 @@
   <button class="tab" data-tab="encrypt" data-i18n="nav.encrypt" onclick="switchTab('encrypt')">Encrypt</button>
   <button class="tab" data-tab="resign" data-i18n="nav.resign" onclick="switchTab('resign')">Resign</button>
   <button class="tab" data-tab="import" data-i18n="nav.import" onclick="switchTab('import')">Import</button>
-  <button class="tab" data-tab="online" onclick="switchTab('online')">Online Sves</button>
+  <button class="tab" data-tab="online" onclick="switchTab('online')">Online Saves</button>
   <button class="tab" data-tab="settings" data-i18n="nav.settings" onclick="switchTab('settings')">Settings</button>
   <span class="spacer"></span>
   <button class="shut" data-i18n="nav.kill" onclick="shutdown()">Kill GarlicMgr</button>
@@ -582,7 +582,7 @@
   <button class="tab" data-tab="encrypt" data-i18n="nav.encrypt" onclick="switchTab('encrypt')">Encrypt</button>
   <button class="tab" data-tab="resign" data-i18n="nav.resign" onclick="switchTab('resign')">Resign</button>
   <button class="tab" data-tab="import" data-i18n="nav.import" onclick="switchTab('import')">Import</button>
-  <button class="tab" data-tab="online" onclick="switchTab('online')">Online Sves</button>
+  <button class="tab" data-tab="online" onclick="switchTab('online')">Online Saves</button>
   <button class="tab" data-tab="settings" data-i18n="nav.settings" onclick="switchTab('settings')">Settings</button>
   <button class="shut" data-i18n="nav.kill" onclick="shutdown()">Kill GarlicMgr</button>
   <span style="font-size:10px;color:#ffeb3b">__VERSION__</span>
@@ -2249,7 +2249,7 @@ function renderImportStage(title, detail, state = 'busy', actions = '') {
 }
 
 function onlineImportBackButton() {
-  return '<button class="bbtn" onclick="switchTab(\'online\')">Back to Online Sves</button>';
+  return '<button class="bbtn" onclick="switchTab(\'online\')">Back to Online Saves</button>';
 }
 
 function parseOnlineIndex(text, validKey) {
@@ -2289,7 +2289,7 @@ function renderOnline() {
   const c = $('ct');
   c.className = 'ct';
   c.innerHTML = '<div class="online-page">'
-    + '<div class="online-heading"><div><h2>Online Sves <span class="online-badge">PS4</span></h2>'
+    + '<div class="online-heading"><div><h2>Online Saves <span class="online-badge">PS4</span></h2>'
     + '<p>Community saves from <a href="https://github.com/bucanero/apollo-saves/tree/master/PS4" target="_blank" rel="noopener noreferrer">Apollo Save Database</a>.</p>'
     + '<p>Import installs to the selected console user. Download as zip saves to this device only.</p></div>'
     + '<button class="btn" id="online-refresh" ' + (onlineWorking || onlineLoading ? 'disabled' : '') + '>Refresh</button></div>'
