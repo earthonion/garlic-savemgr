@@ -15,13 +15,16 @@ PREVIEW_PORT ?= 8082
 
 all: garlic-savemgr.elf
 
-src/ui.h: src/ui.html src/i18n $(I18N_FILES)
-	sed 's/__VERSION__/v$(VERSION)/g' $< > src/_ui_tmp.html
-	for file in $(I18N_FILES); do sed -i '/^"__I18N_DICTIONARIES__";$$/r '"$$file" src/_ui_tmp.html; done
-	sed -i '/^"__I18N_DICTIONARIES__";$$/d' src/_ui_tmp.html
-	xxd -i src/_ui_tmp.html > $@
-	sed -i 's/src__ui_tmp_html/src_ui_html/g' $@
-	rm -f src/_ui_tmp.html
+.DELETE_ON_ERROR:
+
+src/ui.h: src/ui.html src/i18n $(I18N_FILES) Makefile
+	@set -e; \
+	ui_tmp=$$(mktemp); \
+	trap 'rm -f "$$ui_tmp"' EXIT HUP INT TERM; \
+	sed 's/__VERSION__/v$(VERSION)/g' $< > "$$ui_tmp"; \
+	for file in $(I18N_FILES); do sed -i '/^"__I18N_DICTIONARIES__";$$/r '"$$file" "$$ui_tmp"; done; \
+	sed -i '/^"__I18N_DICTIONARIES__";$$/d' "$$ui_tmp"; \
+	xxd -i -n src_ui_html "$$ui_tmp" > $@
 
 src/sqlite3.o: src/sqlite3.c
 	$(PS5_CC) -O2 -D_BSD_SOURCE -std=gnu11 -I$(PS5_INCDIR) $(SQLITE_FLAGS) -c -o $@ $<
