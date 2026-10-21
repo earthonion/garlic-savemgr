@@ -3553,6 +3553,28 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
      http_json(sock, json);
  }
  
+ static void cloud_send_oauth_settings(int sock) {
+     cloud_config_t cfg;
+     char err[256] = {0};
+     if (cloud_load_config(&cfg, err, sizeof(err)) < 0) {
+         char eesc[512], json[768];
+         json_escape(err, eesc, sizeof(eesc));
+         snprintf(json, sizeof(json), "{\"error\":\"%s\"}", eesc);
+         http_json(sock, json);
+         return;
+     }
+     char client_id[1024], client_secret[1024], refresh_token[2048], access_token[4096];
+     json_escape(cfg.drive.client_id, client_id, sizeof(client_id));
+     json_escape(cfg.drive.client_secret, client_secret, sizeof(client_secret));
+     json_escape(cfg.drive.refresh_token, refresh_token, sizeof(refresh_token));
+     json_escape(cfg.drive.access_token, access_token, sizeof(access_token));
+     char json[16384];
+     snprintf(json, sizeof(json),
+         "{\"client_id\":\"%s\",\"client_secret\":\"%s\",\"refresh_token\":\"%s\",\"access_token\":\"%s\"}",
+         client_id, client_secret, refresh_token, access_token);
+     http_json(sock, json);
+ }
+
  static void cloud_handle_settings_post(int sock, char *iobuf, char *req, int n) {
      char err[256] = {0};
      char *body = NULL;
@@ -4050,6 +4072,12 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
  
      if (strcmp(method, "GET") == 0 && strcmp(url, "/api/settings/cloud") == 0) {
          cloud_send_settings(sock);
+         close(sock);
+         return NULL;
+     }
+ 
+     if (strcmp(method, "GET") == 0 && strcmp(url, "/api/settings/cloud/oauth") == 0) {
+         cloud_send_oauth_settings(sock);
          close(sock);
          return NULL;
      }
@@ -5255,6 +5283,10 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
      /* GET/POST /api/settings/cloud -> read/write cloud backup settings */
      if (strcmp(method, "GET") == 0 && strcmp(url, "/api/settings/cloud") == 0) {
          cloud_send_settings(sock);
+         return;
+     }
+     if (strcmp(method, "GET") == 0 && strcmp(url, "/api/settings/cloud/oauth") == 0) {
+         cloud_send_oauth_settings(sock);
          return;
      }
      if (strcmp(method, "POST") == 0 && strcmp(url, "/api/settings/cloud") == 0) {

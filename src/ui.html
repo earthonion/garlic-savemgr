@@ -1619,14 +1619,22 @@ function driveAuthMode(cfg) {
   return mode;
 }
 
+function nonMaskedValue(v) {
+  return v && v !== '********' && v !== '__KEEP__' ? v : '';
+}
+
 function driveOAuthCredentials(cfg) {
   const gd = (cfg && cfg.google_drive) || {};
+  const domClientId = $('setDriveClientId') ? $('setDriveClientId').value.trim() : '';
+  const domClientSecret = $('setDriveClientSecret') ? $('setDriveClientSecret').value : '';
+  const domRefreshToken = $('setDriveRefreshToken') ? $('setDriveRefreshToken').value.trim() : '';
+  const domAccessToken = $('setDriveAccessToken') ? $('setDriveAccessToken').value : '';
   return {
-    clientId: ($('setDriveClientId') ? $('setDriveClientId').value.trim() : '') || gd.client_id || '',
-    clientSecret: ($('setDriveClientSecret') ? $('setDriveClientSecret').value : '') || gd.client_secret || '',
-    refreshToken: ($('setDriveRefreshToken') ? $('setDriveRefreshToken').value.trim() : '') || gd.refresh_token || '',
+    clientId: domClientId || gd.client_id || '',
+    clientSecret: nonMaskedValue(domClientSecret) || gd.client_secret || '',
+    refreshToken: nonMaskedValue(domRefreshToken) || gd.refresh_token || '',
     accessToken: normalizeDriveToken(
-      ($('setDriveAccessToken') ? $('setDriveAccessToken').value : '')
+      nonMaskedValue(domAccessToken)
       || gd.access_token
       || localStorage.getItem('gdrive_access_token')
       || ''
@@ -3405,7 +3413,13 @@ async function loadCloudConfigForAction() {
   const r = await fetch('/api/settings/cloud');
   const d = await r.json();
   if (d.error) throw new Error(d.error);
-  return d.config || { provider: 'ftp' };
+  const cfg = d.config || { provider: 'ftp' };
+  try {
+    const sr = await fetch('/api/settings/cloud/oauth');
+    const sd = await sr.json();
+    if (!sd.error) cfg.google_drive = Object.assign({}, cfg.google_drive || {}, sd);
+  } catch (e) {}
+  return cfg;
 }
 
 async function googleDriveBackup(packageUrl, fallbackName, label) {
