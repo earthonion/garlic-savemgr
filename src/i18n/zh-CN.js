@@ -85,6 +85,8 @@ window.GARLIC_I18N['zh-CN'] = {
     'settings.destinations': '备份目标',
     'settings.local_folder': 'PS5 本地文件夹',
     'settings.usb_folder': 'USB 文件夹',
+    'settings.keep_last': '每个游戏保留最近 N 个备份（0 = 全部保留）',
+    'settings.keep_last_help': '仅适用于本地和 USB 文件夹。备份成功后，会删除同一游戏/存档的旧 ZIP。FTP 和 Google Drive 不受影响。',
     'settings.drive_browser': 'Google Drive 浏览器上传',
     'settings.destinations_help': '手动和自动整游戏备份会把同一个可恢复的加密 ZIP 写入所有已启用的目标。Google Drive 上传由浏览器队列处理。',
     'settings.mode': '模式',

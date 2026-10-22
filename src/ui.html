@@ -1276,6 +1276,8 @@ async function renderSettings() {
       + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx);font-weight:700;margin-top:10px">'
       + '<input id="setTargetUsb" type="checkbox" ' + (usbTarget.enabled ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> ' + t('settings.usb_folder', 'USB folder') + '</label>'
       + settingsInput('setTargetUsbPath', t('settings.usb_folder', 'USB Folder'), usbTarget.path || '/mnt/usb0/garlic-backups')
+      + settingsInput('setTargetKeepLast', t('settings.keep_last', 'Keep last N backups per title (0 = keep all)'), String(targets.keep_last || 0), 'number', 'min="0" max="1000" step="1"')
+      + '<div style="font-size:10px;color:var(--dm);margin:-4px 0 8px">' + t('settings.keep_last_help', 'Applies to Local and USB folders. After a successful backup, older ZIPs of the same title/save are deleted. FTP and Google Drive are not affected.') + '</div>'
       + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx);font-weight:700;margin-top:10px">'
       + '<input id="setTargetFtp" type="checkbox" ' + (ftpTarget.enabled || (!targets.ftp && cfg.provider === 'ftp') ? 'checked' : '') + ' style="accent-color:var(--ac);width:16px;height:16px"> FTP</label>'
       + '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--tx);font-weight:700;margin-top:10px">'
@@ -1390,7 +1392,8 @@ async function saveCloudSettings() {
         path: $('setTargetUsbPath').value.trim() || '/mnt/usb0/garlic-backups'
       },
       ftp: { enabled: $('setTargetFtp').checked },
-      google_drive: { enabled: $('setTargetDrive').checked }
+      google_drive: { enabled: $('setTargetDrive').checked },
+      keep_last: Math.min(1000, Math.max(0, parseInt($('setTargetKeepLast').value || '0', 10) || 0))
     },
     google_drive: {
       mode: $('setDriveMode').value,
