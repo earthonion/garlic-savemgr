@@ -602,6 +602,8 @@
       <button class="bulk-btn" data-i18n="bulk.decrypted" onclick="bulkQueue('dec')" id="bulkDec" disabled>Decrypted</button>
       <button class="bulk-btn" data-i18n="bulk.encrypted" onclick="bulkQueue('enc')" id="bulkEnc" disabled>Encrypted</button>
       <button class="bulk-btn grn" data-i18n="bulk.cloud" onclick="bulkQueue('cloud')" id="bulkCloud" disabled>Cloud</button>
+      <span style="flex:1"></span>
+      <button class="bulk-btn" style="background:rgba(255,160,0,.25);color:#fa0" onclick="showDumpAllUsbModal()" id="bulkDumpAll">Dump All USB</button>
     </div>
     <div class="drawer-toggle" onclick="toggleDrawer()" id="dtog"></div>
     <div class="svs" id="svs"><div class="empty" data-i18n="common.loading">Loading...</div></div>
@@ -1023,6 +1025,8 @@ function updateBulkBar() {
     const b = $(id);
     if (b) b.disabled = dis;
   });
+  const da = $('bulkDumpAll');
+  if (da) da.disabled = bsy || bulkRunning || vis.length === 0;
 }
 
 function renderGroup(g, h) {
@@ -3029,6 +3033,74 @@ async function dumpTitleUsb(titleId, usbNum, decrypted) {
   } catch(e) {
     log('Dump failed: ' + e.message, 'err');
   }
+}
+
+async function showDumpAllUsbModal() {
+  if (bsy || bulkRunning) return;
+  let usbHtml = '<div style="color:var(--dm);font-size:12px;margin-top:8px">Checking USB drives...</div>';
+  const m = document.createElement('div');
+  m.id = 'dumpAllModal';
+  m.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;z-index:999';
+  m.innerHTML =
+    '<div style="background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:24px;max-width:400px;width:90%">'
+    + '<div style="font-size:14px;font-weight:700;color:var(--tx);margin-bottom:8px">Dump All Saves to USB</div>'
+    + '<div style="font-size:11px;color:var(--dm);margin-bottom:16px">Copies every encrypted save for all titles to the selected USB drive.</div>'
+    + '<div id="daUsb">' + usbHtml + '</div>'
+    + '<button class="btn red" style="width:100%;margin-top:12px" onclick="this.closest(\'#dumpAllModal\').remove()">Cancel</button>'
+    + '</div>';
+  document.body.appendChild(m);
+  try {
+    const r = await fetch('/api/usb_list');
+    const d = await r.json();
+    const el = m.querySelector('#daUsb');
+    if (!el) return;
+    if (d.usb && d.usb.length > 0) {
+      el.innerHTML = d.usb.map(u =>
+        '<button class="btn" style="width:100%;margin-bottom:6px;background:var(--bd);color:var(--tx)" onclick="dumpAllUsb(' + u + ')">USB ' + u + '</button>'
+      ).join('');
+    } else {
+      el.innerHTML = '<div style="color:var(--dm);font-size:12px">No USB drives detected</div>';
+    }
+  } catch(e) {
+    const el = m.querySelector('#daUsb');
+    if (el) el.innerHTML = '<div style="color:var(--er);font-size:12px">Failed to check USB drives</div>';
+  }
+}
+
+async function dumpAllUsb(usbNum) {
+  const m = document.getElementById('dumpAllModal');
+  if (m) m.remove();
+  const titles = visibleBulkTitles();
+  if (!titles.length) { log('No saves to dump', 'err'); return; }
+  bulkRunning = true;
+  bsy = true;
+  updateBulkBar();
+  renderTB();
+  log('Dumping all ' + titles.length + ' title(s) to USB ' + usbNum + '...');
+  let ok = 0, fail = 0, totalCopied = 0;
+  for (let n = 0; n < titles.length; n++) {
+    const tid = titles[n];
+    log('[' + (n + 1) + '/' + titles.length + '] ' + tid);
+    try {
+      const r = await fetch('/api/dump_title_usb?id=' + encodeURIComponent(tid) + '&usb=' + usbNum);
+      const d = await r.json();
+      if (d.error) { log('  Failed: ' + d.error, 'err'); fail++; continue; }
+      totalCopied += d.copied || 0;
+      if (d.failed) log('  ' + d.copied + ' copied, ' + d.failed + ' failed', 'err');
+      ok++;
+    } catch(e) {
+      fail++;
+      log('  Failed: ' + e.message, 'err');
+    }
+  }
+  bulkRunning = false;
+  bsy = false;
+  updateBulkBar();
+  renderL();
+  renderTB();
+  renderCt();
+  log('Dump all done: ' + ok + '/' + titles.length + ' titles, ' + totalCopied + ' save(s) copied' + (fail ? ', ' + fail + ' title(s) failed' : ''), fail ? 'err' : 'ok');
+  load();
 }
 
 async function deleteTitle(titleId) {
