@@ -4713,7 +4713,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
      }
  
      /* GET /api/mount?idx=N */
-     if (strcmp(method, "GET") == 0 && strncmp(url, "/api/mount", 10) == 0) {
+     if (strcmp(method, "GET") == 0 && strncmp(url, "/api/mount", 10) == 0 && url[10] != '_') {
          if (g_mounted) unmount_save();
  
          int idx = -1;

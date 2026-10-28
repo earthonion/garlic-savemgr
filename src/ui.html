@@ -2551,13 +2551,28 @@ async function importDropOne(files, folderName, isPS4 = false) {
   let totalSize = 0;
   for (const f of files) totalSize += f.size;
 
+  /* Newer games reject a freshly formatted PS5 image as corrupted. When the
+   * user already has this save, rebuild inside a copy of the native image. */
+  let native = -1;
+  if (!isPS4) {
+    try {
+      const sfoFile = Array.from(files).find(f => /sce_sys\/param\.sfo$/i.test(f._path || f.webkitRelativePath || f.name));
+      const sfo = {};
+      for (const e of parseSfo(await sfoFile.arrayBuffer()).entries) sfo[e.key] = e.value;
+      const saves = (await (await fetch('/api/saves')).json()).saves || [];
+      native = saves.findIndex(s => s.type === 'ps5' && !s.backup && !s.usb && s.uid === curUid
+        && s.title_id === sfo.TITLE_ID && s.save_name === 'sdimg_' + sfo.SAVEDATA_DIRECTORY);
+    } catch (e) {}
+  }
+
   /* Step 1: create PFS image */
   log('Creating PFS image for import (' + fmtB(totalSize) + ' of files)...');
   renderImportStage(t('status.creating_pfs', 'Creating PFS image...'), 'Preparing the save for your console.');
-  let r = await fetch('/api/create_pfs?size=' + totalSize + (isPS4 ? '&ps4=1' : ''));
+  let r = await fetch(native >= 0 ? '/api/mount_copy?idx=' + native
+    : '/api/create_pfs?size=' + totalSize + (isPS4 ? '&ps4=1' : ''));
   let d = await r.json();
   if (d.error) throw new Error(d.error);
-  log('PFS image created and mounted', 'ok');
+  log(native >= 0 ? 'Rebuilding in a copy of the existing console save' : 'PFS image created and mounted', 'ok');
 
   /* Step 2: upload each file */
   for (let i = 0; i < files.length; i++) {

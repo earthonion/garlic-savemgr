@@ -23,30 +23,57 @@ jobs:
         # in PATH). So the runner DOES need llvm/clang/lld installed — but
         # use versioned package names (clang-18, llvm-18, lld-18) because
         # the unversioned `clang` meta-package isn't in the default apt
-        # sources of catthehacker/ubuntu:act-latest.
+        # sources of catthehacker/ubuntu:act-latest. GitHub-hosted runners
+        # are not root, so apt-get needs sudo.
         run: |
-          apt-get update -qq
-          apt-get install -y --no-install-recommends \
-              xxd unzip ca-certificates curl \
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+              xxd bsdextrautils ca-certificates \
               clang-18 llvm-18 lld-18
 
-      - name: Download PS5 Payload SDK
-        run: |
-          curl -fLsS -o /tmp/ps5-payload-sdk.zip \
-            https://github.com/ps5-payload-dev/sdk/releases/latest/download/ps5-payload-sdk.zip
-          unzip -q /tmp/ps5-payload-sdk.zip -d /tmp
+      # Build the SDK from a pinned commit (same as Playstation-5-Save-Mounter)
+      # instead of the moving "latest" release zip.
+      - name: Checkout PS5 Payload SDK
+        uses: actions/checkout@v4
+        with:
+          repository: ps5-payload-dev/sdk
+          ref: 4eb701204fc3f8d31e84cf8ca272974e2be9c867
+          submodules: recursive
+          path: ps5-payload-sdk
 
+      - name: Build and install SDK
+        run: |
+          export PS5_PAYLOAD_SDK="$GITHUB_WORKSPACE/ps5-sdk"
+          make -C ps5-payload-sdk DESTDIR="$PS5_PAYLOAD_SDK" clean install
+          echo "PS5_PAYLOAD_SDK=$PS5_PAYLOAD_SDK" >> "$GITHUB_ENV"
+
+      # Tag builds take their version from the tag (v1.2.3 -> 1.2.3) so the
+      # web UI matches the release; other builds keep the Makefile default.
       - name: Build
-        run: make PS5_PAYLOAD_SDK=/tmp/ps5-payload-sdk
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+              make PS5_PAYLOAD_SDK="$PS5_PAYLOAD_SDK" VERSION="${GITHUB_REF_NAME#v}"
+          else
+              make PS5_PAYLOAD_SDK="$PS5_PAYLOAD_SDK"
+          fi
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: garlic-savemgr
           path: garlic-savemgr.elf
 
+      - name: Publish GitHub release
+        if: ${{ startsWith(github.ref, 'refs/tags/') && github.server_url == 'https://github.com' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: garlic-savemgr.elf
+          prerelease: ${{ contains(github.ref_name, 'beta') }}
+          generate_release_notes: true
+
       - name: Create release (on tag push only)
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        # Uses the Gitea/Forgejo /api/v1 release API, absent on github.com.
+        if: ${{ startsWith(github.ref, 'refs/tags/') && github.server_url != 'https://github.com' }}
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
