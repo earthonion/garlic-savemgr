@@ -98,8 +98,10 @@
  #define CLOUD_MAX_TITLES 64
  /* ProsperoEden, the Switch emulator (PPSA99008), keeps its saves as plain files, one folder per
   * profile and game, in a fixed place on the internal SSD. scan_saves() never lists them (they are
-  * not PS5 save data), so the emulator's own title backs them up, as they are. */
+  * not PS5 save data), so the emulator's own title backs them up, as they are. Its mirror on
+  * ProsperoStore (PPSA99016) is the same emulator under another title, saving in the same place. */
  #define PE_TITLE_ID "PPSA99008"
+ #define PE_MIRROR_TITLE_ID "PPSA99016"
  #define PE_SAVE_ROOT "/data/prosperoeden/user/nand/user/save/0000000000000000"
  #define PE_SAVE_DEPTH 6
 
@@ -3273,6 +3275,11 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
      return name[0] == '.' && (!name[1] || (name[1] == '.' && !name[2]));
  }
 
+ /* title_id is ProsperoEden's, or its mirror's. */
+ static int pe_is_title(const char *title_id) {
+     return strcmp(title_id, PE_TITLE_ID) == 0 || strcmp(title_id, PE_MIRROR_TITLE_ID) == 0;
+ }
+
  /* Grows the three arrays cloud_collect_title_files() fills, together. */
  static int pe_grow(zip_file_t **zfiles, char ***names, char ***allocs, int *cap) {
      int ncap = *cap * 2;
@@ -3290,9 +3297,10 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
  }
 
  /* Adds every file under dir (rel: its path below PE_SAVE_ROOT) to the emulator's backup, as
-  * PPSA99008/<profile>/<game>/<file>. */
- static void pe_collect_files(const char *dir, const char *rel, int depth, zip_file_t **zfiles,
-                              char ***names, char ***allocs, int *nfiles, int *nallocs, int *cap) {
+  * <title_id>/<profile>/<game>/<file>. */
+ static void pe_collect_files(const char *title_id, const char *dir, const char *rel, int depth,
+                              zip_file_t **zfiles, char ***names, char ***allocs, int *nfiles,
+                              int *nallocs, int *cap) {
      DIR *d = opendir(dir);
      if (!d) return;
      struct dirent *ent;
@@ -3305,7 +3313,8 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          if (stat(path, &st) < 0) continue;
          if (S_ISDIR(st.st_mode)) {
              if (depth > 0)
-                 pe_collect_files(path, sub, depth - 1, zfiles, names, allocs, nfiles, nallocs, cap);
+                 pe_collect_files(title_id, path, sub, depth - 1, zfiles, names, allocs, nfiles,
+                                  nallocs, cap);
              continue;
          }
          if (!S_ISREG(st.st_mode)) continue;
@@ -3313,7 +3322,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          char *copy = strdup(path);
          char *name = malloc(512);
          if (!copy || !name) { free(copy); free(name); continue; }
-         snprintf(name, 512, "%s/%s", PE_TITLE_ID, sub);
+         snprintf(name, 512, "%s/%s", title_id, sub);
          (*zfiles)[*nfiles].path = copy;
          (*zfiles)[*nfiles].name = name;
          (*names)[*nfiles] = name;
@@ -3408,8 +3417,8 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              }
          }
      }
-     if (strcmp(title_id, PE_TITLE_ID) == 0)
-         pe_collect_files(PE_SAVE_ROOT, "", PE_SAVE_DEPTH, &zfiles, &names, &allocs,
+     if (pe_is_title(title_id))
+         pe_collect_files(title_id, PE_SAVE_ROOT, "", PE_SAVE_DEPTH, &zfiles, &names, &allocs,
                           &nfiles, &nallocs, &cap);
 
      if (nfiles == 0) {
@@ -3568,7 +3577,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          sig ^= (uint64_t)st.st_size; sig *= 1099511628211ULL;
          sig ^= (uint64_t)st.st_mtime; sig *= 1099511628211ULL;
      }
-     if (strcmp(title_id, PE_TITLE_ID) == 0) pe_signature(PE_SAVE_ROOT, "", PE_SAVE_DEPTH, &sig);
+     if (pe_is_title(title_id)) pe_signature(PE_SAVE_ROOT, "", PE_SAVE_DEPTH, &sig);
      return sig;
  }
 
