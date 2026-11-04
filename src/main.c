@@ -2088,11 +2088,111 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      }
  }
 
- /* Per-user PARAMS HMAC cache.
+ /* ── SHA-256 + HMAC-SHA256 (for PARAMS fingerprint) ────────────── */
+
+static const uint8_t SHELLCORE_HMAC_KEY[16] = {
+    0x13, 0xD1, 0xDF, 0x06, 0x75, 0xC9, 0xFD, 0x95,
+    0x0A, 0x17, 0xE5, 0x64, 0xC2, 0x77, 0x7F, 0x2C
+};
+
+static const uint32_t SHA256_K[64] = {
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+};
+
+#define ROR32(x,n) (((x)>>(n))|((x)<<(32-(n))))
+
+static void sha256_transform(uint32_t state[8], const uint8_t block[64])
+{
+    uint32_t w[64], a,b,c,d,e,f,g,h,t1,t2;
+    int i;
+    for (i = 0; i < 16; i++)
+        w[i] = ((uint32_t)block[i*4]<<24)|((uint32_t)block[i*4+1]<<16)|
+               ((uint32_t)block[i*4+2]<<8)|block[i*4+3];
+    for (i = 16; i < 64; i++) {
+        uint32_t s0 = ROR32(w[i-15],7)^ROR32(w[i-15],18)^(w[i-15]>>3);
+        uint32_t s1 = ROR32(w[i-2],17)^ROR32(w[i-2],19)^(w[i-2]>>10);
+        w[i] = w[i-16]+s0+w[i-7]+s1;
+    }
+    a=state[0]; b=state[1]; c=state[2]; d=state[3];
+    e=state[4]; f=state[5]; g=state[6]; h=state[7];
+    for (i = 0; i < 64; i++) {
+        t1 = h+(ROR32(e,6)^ROR32(e,11)^ROR32(e,25))+((e&f)^(~e&g))+SHA256_K[i]+w[i];
+        t2 = (ROR32(a,2)^ROR32(a,13)^ROR32(a,22))+((a&b)^(a&c)^(b&c));
+        h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+    }
+    state[0]+=a; state[1]+=b; state[2]+=c; state[3]+=d;
+    state[4]+=e; state[5]+=f; state[6]+=g; state[7]+=h;
+}
+
+static void sha256(const uint8_t *msg, size_t len, uint8_t out[32])
+{
+    uint32_t state[8] = {
+        0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+        0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19
+    };
+    uint8_t block[64];
+    size_t i, rem = len;
+    const uint8_t *p = msg;
+    while (rem >= 64) { sha256_transform(state, p); p += 64; rem -= 64; }
+    memset(block, 0, 64);
+    memcpy(block, p, rem);
+    block[rem] = 0x80;
+    if (rem >= 56) { sha256_transform(state, block); memset(block, 0, 64); }
+    uint64_t bits = (uint64_t)len * 8;
+    for (i = 0; i < 8; i++) block[63-i] = (uint8_t)(bits >> (i*8));
+    sha256_transform(state, block);
+    for (i = 0; i < 8; i++) {
+        out[i*4]   = (uint8_t)(state[i]>>24);
+        out[i*4+1] = (uint8_t)(state[i]>>16);
+        out[i*4+2] = (uint8_t)(state[i]>>8);
+        out[i*4+3] = (uint8_t)(state[i]);
+    }
+}
+
+static void hmac_sha256(const uint8_t *key, size_t key_len,
+                        const uint8_t *msg, size_t msg_len,
+                        uint8_t out[32])
+{
+    uint8_t k_ipad[64], k_opad[64], inner[32], buf[128];
+    size_t i;
+    memset(k_ipad, 0, 64);
+    memset(k_opad, 0, 64);
+    if (key_len <= 64) {
+        memcpy(k_ipad, key, key_len);
+        memcpy(k_opad, key, key_len);
+    }
+    for (i = 0; i < 64; i++) {
+        k_ipad[i] ^= 0x36;
+        k_opad[i] ^= 0x5C;
+    }
+    memcpy(buf, k_ipad, 64);
+    memcpy(buf + 64, msg, msg_len);
+    sha256(buf, 64 + msg_len, inner);
+    memcpy(buf, k_opad, 64);
+    memcpy(buf + 64, inner, 32);
+    sha256(buf, 64 + 32, out);
+}
+
+/* Per-user PARAMS HMAC cache.
   * The HMAC at PARAMS offset 0x08 (32 bytes) is identical across all saves
   * for the same user — we cache it from any valid param.sfo we encounter. */
  static uint8_t g_params_hmac[32] = {0};
  static int g_params_hmac_valid = 0;
+
+static void compute_params_hmac(const uint8_t open_psid[16]) {
+    hmac_sha256(SHELLCORE_HMAC_KEY, 16, open_psid, 16, g_params_hmac);
+    g_params_hmac_valid = 1;
+    logprintf("[GarlicMgr] Computed PARAMS fingerprint: %02x%02x%02x%02x...\n",
+              g_params_hmac[0], g_params_hmac[1], g_params_hmac[2], g_params_hmac[3]);
+}
+
  
  /* Try to extract and cache the PARAMS HMAC from a mounted save's param.sfo */
  static void cache_params_hmac(const char *sfo_path) {
@@ -2203,8 +2303,8 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
          } else if (strcmp(keys[i], "DETAIL") == 0) {
              param_len = 1; param_max = 1024;
          } else if (strcmp(keys[i], "FORMAT") == 0) {
-             param_len = 3; param_max = 4;
-             memcpy(buf + data_off + dpos, fmt_str, 3);
+             param_len = 4; param_max = 4;
+             memcpy(buf + data_off + dpos, fmt_str, 4);
          } else if (strcmp(keys[i], "LINEAGE_ID") == 0) {
              param_fmt = 0x0004; param_len = 16; param_max = 16;
          } else if (strcmp(keys[i], "MAINTITLE") == 0) {
@@ -2214,21 +2314,30 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
              memcpy(buf + data_off + dpos, t, param_len);
          } else if (strcmp(keys[i], "PARAMS") == 0) {
              param_fmt = 0x0004; param_len = 1024; param_max = 1024;
-             /* PARAMS internal structure (psdevwiki + RE):
-              * 0x00: reserved (0), 0x04: user_id, 0x08: HMAC (32B, needs key),
-              * 0x28: flags (1), 0x2C: title_id (12B), 0x38: game_title_id (12B),
-              * 0x54: unknown (2) */
+             /* PARAMS: 0x00 sys_blocks_flag, 0x04 user_id, 0x08 HMAC(32B),
+              * 0x28 flags(1), 0x2C title_id(15B), 0x3C game_title_id(15B),
+              * 0x4C const(2), 0x5C const(0x10), 0x68 timestamp */
              uint8_t *p = buf + data_off + dpos;
+             if (system_blocks > 0) {
+                 uint32_t sb_flag = 0x1000000;
+                 memcpy(p + 0x00, &sb_flag, 4);
+             }
              uint32_t uid = user_id;
              memcpy(p + 0x04, &uid, 4);
              if (params_hmac) memcpy(p + 0x08, params_hmac, 32);
              uint32_t flags = 1;
              memcpy(p + 0x28, &flags, 4);
-             strncpy((char *)(p + 0x2C), title_id, 12);
+             strncpy((char *)(p + 0x2C), title_id, 15);
              const char *gtid = game_title_id && game_title_id[0] ? game_title_id : title_id;
-             strncpy((char *)(p + 0x38), gtid, 12);
-             uint32_t unk2 = 2;
-             memcpy(p + 0x54, &unk2, 4);
+             strncpy((char *)(p + 0x3C), gtid, 15);
+             uint32_t unk_4c = 2;
+             memcpy(p + 0x4C, &unk_4c, 4);
+             uint32_t unk_5c = 0x10;
+             memcpy(p + 0x5C, &unk_5c, 4);
+             struct timespec _ts;
+             clock_gettime(CLOCK_REALTIME, &_ts);
+             uint32_t sfo_ts = (uint32_t)_ts.tv_sec;
+             memcpy(p + 0x68, &sfo_ts, 4);
          } else if (strcmp(keys[i], "SAVEDATA_BLOCKS") == 0) {
              param_fmt = 0x0004; param_len = 8; param_max = 8;
              memcpy(buf + data_off + dpos, &blocks, 8);
@@ -8318,6 +8427,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          printf("[GarlicMgr] OpenPsId: ");
          for (int i = 0; i < 16; i++) printf("%02x", g_open_psid.id[i]);
          printf("\n");
+         compute_params_hmac(g_open_psid.id);
      }
  
      printf("=== Garlic SaveMgr for PS5 by earthonion ===\n");
