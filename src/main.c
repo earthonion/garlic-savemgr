@@ -3536,6 +3536,51 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
  }
  
  /* ── Zip extraction (upload) ────────────────────────────────────── */
+ static uint32_t zip_sfo_blocks(const uint8_t *data, size_t len) {
+     size_t off = 0;
+     while (off + 30 <= len) {
+         if (data[off]!=0x50 || data[off+1]!=0x4b ||
+             data[off+2]!=0x03 || data[off+3]!=0x04) break;
+         uint16_t compression = 0, name_len = 0, extra_len = 0;
+         uint32_t comp_size = 0, uncomp_size = 0;
+         memcpy(&compression, data + off + 8, 2);
+         memcpy(&comp_size, data + off + 18, 4);
+         memcpy(&uncomp_size, data + off + 22, 4);
+         memcpy(&name_len, data + off + 26, 2);
+         memcpy(&extra_len, data + off + 28, 2);
+         char name[MAX_PATH_LEN] = {0};
+         uint16_t copy_len = name_len < MAX_PATH_LEN - 1 ? name_len : (uint16_t)(MAX_PATH_LEN - 1);
+         memcpy(name, data + off + 30, copy_len);
+         off += 30 + name_len + extra_len;
+         if (compression == 0 && uncomp_size >= 20 &&
+             (strcasecmp(name, "sce_sys/param.sfo") == 0 ||
+              strcasecmp(name + (strlen(name) > 17 ? strlen(name) - 17 : 0), "sce_sys/param.sfo") == 0)) {
+             const uint8_t *sfo = data + off;
+             if (off + uncomp_size <= len && sfo[0]==0x00 && sfo[1]==0x50 && sfo[2]==0x53 && sfo[3]==0x46) {
+                 uint32_t key_off, data_off, count;
+                 memcpy(&key_off, sfo + 8, 4);
+                 memcpy(&data_off, sfo + 12, 4);
+                 memcpy(&count, sfo + 16, 4);
+                 for (uint32_t i = 0; i < count && 20 + i * 16 + 16 <= uncomp_size; i++) {
+                     uint16_t k_off;
+                     memcpy(&k_off, sfo + 20 + i * 16, 2);
+                     uint32_t d_off;
+                     memcpy(&d_off, sfo + 20 + i * 16 + 12, 4);
+                     if (key_off + k_off < uncomp_size &&
+                         strcmp((const char *)(sfo + key_off + k_off), "SAVEDATA_BLOCKS") == 0 &&
+                         data_off + d_off + 4 <= uncomp_size) {
+                         uint32_t blocks;
+                         memcpy(&blocks, sfo + data_off + d_off, 4);
+                         return blocks;
+                     }
+                 }
+             }
+         }
+         off += comp_size;
+     }
+     return 0;
+ }
+
  static int extract_zip(const char *dest, const uint8_t *data, size_t len) {
      size_t off = 0;
      int count = 0;
@@ -5850,10 +5895,19 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          unlink(tmp);
          kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
  
-         /* Size: data + 25% overhead + 4MB, min 32MB, aligned to 32K */
+         uint64_t req_blocks = 0;
+         char *bp = strstr(url, "blocks=");
+         if (bp) req_blocks = strtoull(bp + 7, NULL, 10);
+         if (req_blocks == 0)
+             req_blocks = zip_sfo_blocks(tar_data, received);
+
          uint64_t img_size = clen + (clen / 4) + (4 * 1024 * 1024);
          if (img_size < 32 * 1024 * 1024)
              img_size = 32 * 1024 * 1024;
+         if (req_blocks > 0) {
+             uint64_t blocks_size = req_blocks * 32768;
+             if (blocks_size > img_size) img_size = blocks_size;
+         }
          img_size = ((img_size + 32767) / 32768) * 32768;
  
          /* Step 1: Create file and allocate space (same as mkpfs) */
@@ -6199,17 +6253,20 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          int is_ps4 = (strstr(url, "ps4=1") != NULL);
          g_enc_ps4 = is_ps4;
  
-         /* Parse optional size (default 256MB) */
          uint64_t img_size = 256 * 1024 * 1024;
          char *sp = strstr(url, "size=");
          if (sp) {
              uint64_t req_size = strtoull(sp + 5, NULL, 10);
              if (req_size > 0) {
-                 /* Add 25% overhead + 4MB, min 32MB */
                  img_size = req_size + (req_size / 4) + (4 * 1024 * 1024);
                  if (img_size < 32 * 1024 * 1024)
                      img_size = 32 * 1024 * 1024;
              }
+         }
+         char *bp = strstr(url, "blocks=");
+         if (bp) {
+             uint64_t blocks_size = strtoull(bp + 7, NULL, 10) * 32768;
+             if (blocks_size > img_size) img_size = blocks_size;
          }
          img_size = ((img_size + 32767) / 32768) * 32768;
  
@@ -7083,9 +7140,12 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          }
          if (total_size == 0) total_size = 1024 * 1024;
  
-         /* Create PFS image: size + 25% overhead + 4MB, min 32MB */
          uint64_t img_size = total_size + (total_size / 4) + (4 * 1024 * 1024);
          if (img_size < 32 * 1024 * 1024) img_size = 32 * 1024 * 1024;
+         if (sfo.blocks > 0) {
+             uint64_t blocks_size = (uint64_t)sfo.blocks * 32768;
+             if (blocks_size > img_size) img_size = blocks_size;
+         }
          img_size = ((img_size + 32767) / 32768) * 32768;
  
          mkdir("/data/save_files", 0777);
