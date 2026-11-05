@@ -5903,7 +5903,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
 
          uint64_t img_size;
          if (req_blocks > 0) {
-             img_size = (uint64_t)req_blocks * 65536;
+             img_size = (uint64_t)req_blocks * 32768;
          } else {
              img_size = clen + (clen / 4) + (4 * 1024 * 1024);
              if (img_size < 32 * 1024 * 1024)
@@ -6259,7 +6259,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          if (bp) {
              uint64_t blk = strtoull(bp + 7, NULL, 10);
              if (blk > 0)
-                 img_size = blk * 65536;
+                 img_size = blk * 32768;
          }
          if (img_size == 0) {
              char *sp = strstr(url, "size=");
@@ -7145,7 +7145,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
  
          uint64_t img_size;
          if (sfo.blocks > 0) {
-             img_size = (uint64_t)sfo.blocks * 65536;
+             img_size = (uint64_t)sfo.blocks * 32768;
          } else {
              img_size = total_size + (total_size / 4) + (4 * 1024 * 1024);
              if (img_size < 32 * 1024 * 1024) img_size = 32 * 1024 * 1024;
