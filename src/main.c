@@ -1348,6 +1348,7 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      return fallback;
  }
  static int parse_sfo(const char *path, sfo_info_t *info);
+ static int parse_sfo_mem(const uint8_t *buf, size_t size, sfo_info_t *info);
  
  static void scan_usb_saves(const char *garlic_path) {
      DIR *d = opendir(garlic_path);
@@ -1726,11 +1727,19 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      uint64_t cur;
      memcpy(&cur, raw, 8);
      *saved = cur;
-     if (cur != 0) { close(fd); return 0; }
-     uint64_t mode = 0x60;
-     if (pwrite(fd, &mode, 8, 0x368) != 8) { close(fd); return -1; }
+     /* Check the LOW u32 specifically — the high u32 at 0x36C is a
+      * separate field that must be preserved.  The old check (cur != 0)
+      * was wrong: 0x0000000100000000 is non-zero but the blob-mode
+      * nibble in the low u32 is still 0, so the kernel rejects ioctls. */
+     uint32_t lo;
+     memcpy(&lo, raw, 4);
+     if ((lo & 0xFF) == 0x60) { close(fd); return 0; } /* already enabled */
+     uint32_t mode32 = 0x60;
+     if (pwrite(fd, &mode32, 4, 0x368) != 4) { close(fd); return -1; }
+     fsync(fd);
      close(fd);
-     logprintf("[GarlicMgr] PS5PARAM: enabled blob mode (0x368=0x60) on %s\n", img);
+     logprintf("[GarlicMgr] PS5PARAM: enabled blob mode (0x368 lo=0x60, was 0x%08x) on %s\n",
+               lo, img);
      return 1;
  }
 
@@ -1772,6 +1781,19 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      memcpy(blob + 16, &off, 4);
      memcpy(blob + 20, sfo, sz);
 
+     /* Log what we're writing into the blob */
+     logprintf("[GarlicMgr] PS5PARAM write: %u B SFO -> %s\n", sz, img);
+     sfo_info_t wr_info;
+     if (parse_sfo_mem(sfo, sz, &wr_info) == 0) {
+         logprintf("[GarlicMgr] PS5PARAM write SFO: TITLE_ID=%s DIR=%s TITLE=%s\n",
+                   wr_info.title_id, wr_info.dir_name, wr_info.main_title);
+         logprintf("[GarlicMgr] PS5PARAM write SFO: BLOCKS=%u FORMAT=%s "
+                   "ACCOUNT_ID=%016llX USER_ID=0x%x LIST_PARAM=%u\n",
+                   wr_info.blocks, wr_info.format,
+                   (unsigned long long)wr_info.account_id,
+                   wr_info.user_id, wr_info.list_param);
+     }
+
      ps5param_elevate();
      int r = ps5param_ioctl(img, blob, sizeof(blob), 1);
      if (r < 0) {
@@ -1785,6 +1807,67 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
                  int fd = open(img, O_RDWR);
                  if (fd >= 0) { pwrite(fd, &saved, 8, 0x368); close(fd); }
              }
+         }
+     }
+     /* Even when ioctl succeeded, the kernel writes to its own buffer and
+      * may not flush to disk before our copy_file reads the image.
+      * Mirror the blob to offset 0xC00 with pwrite so the on-disk file
+      * is always up-to-date for any subsequent file copy. */
+     if (r == 0) {
+         logprintf("[GarlicMgr] PS5PARAM: ioctl OK, mirroring blob to file (magic=%02x%02x%02x%02x%02x%02x%02x%02x)\n",
+                   blob[0],blob[1],blob[2],blob[3],blob[4],blob[5],blob[6],blob[7]);
+         int fd = open(img, O_RDWR);
+         if (fd >= 0) {
+             ssize_t wr2 = pwrite(fd, blob, sizeof(blob), 0xC00);
+             fsync(fd);
+             close(fd);
+             if (wr2 == (ssize_t)sizeof(blob))
+                 logprintf("[GarlicMgr] PS5PARAM: mirrored blob to file at 0xC00 (0x%x bytes)\n",
+                           (unsigned)sizeof(blob));
+             else
+                 logprintf("[GarlicMgr] PS5PARAM: mirror pwrite failed (wrote %zd, errno=%d)\n",
+                           wr2, errno);
+         } else {
+             logprintf("[GarlicMgr] PS5PARAM: mirror open(%s) failed errno=%d\n", img, errno);
+         }
+     } else {
+         logprintf("[GarlicMgr] PS5PARAM: r=%d after ioctl block, skipping mirror\n", r);
+     }
+     /* Fallback: if the kernel ioctl failed (fresh PprCreate images often
+      * reject the write), write the blob directly to offset 0xC00 in the
+      * image file.  The blob is stored in plaintext (the ioctl read returns
+      * the PS5PARAM magic as-is, so no encryption layer). */
+     if (r < 0) {
+         logprintf("[GarlicMgr] PS5PARAM: ioctl write failed (%d), trying direct file write at 0xC00\n", r);
+         int fd = open(img, O_RDWR);
+         if (fd >= 0) {
+             /* Ensure blob mode is set so readers (including the kernel) know
+              * a blob is present at 0xC00.  Write only the low u32 to
+              * preserve the separate field at 0x36C. */
+             uint32_t mode32 = 0x60;
+             pwrite(fd, &mode32, 4, 0x368);
+             ssize_t wr = pwrite(fd, blob, sizeof(blob), 0xC00);
+             fsync(fd);
+             close(fd);
+             if (wr == (ssize_t)sizeof(blob)) {
+                 logprintf("[GarlicMgr] PS5PARAM: direct write OK (0x%x bytes at 0xC00)\n",
+                           (unsigned)sizeof(blob));
+                 /* Try ioctl once more — now that mode is 0x60 and fsynced,
+                  * the kernel may accept and also update the ICV. */
+                 int r2 = ps5param_ioctl(img, blob, sizeof(blob), 1);
+                 if (r2 == 0)
+                     logprintf("[GarlicMgr] PS5PARAM: ioctl write succeeded after direct mode fix\n");
+                 else
+                     logprintf("[GarlicMgr] PS5PARAM: ioctl still fails after direct write (%d), "
+                               "blob is file-only (no ICV update)\n", r2);
+                 r = 0;
+             } else {
+                 logprintf("[GarlicMgr] PS5PARAM: direct write failed (wrote %zd, errno=%d)\n",
+                           wr, errno);
+             }
+         } else {
+             logprintf("[GarlicMgr] PS5PARAM: cannot open %s for direct write (errno=%d)\n",
+                       img, errno);
          }
      }
      return r;
@@ -1801,6 +1884,24 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      if (r > 0) {
          g_mount_real_sfo_len = (uint32_t)r;
          logprintf("[GarlicMgr] PS5PARAM: cached real param.sfo (%d B) from %s\n", r, img);
+         /* Dump key fields from the blob SFO for diagnostics */
+         sfo_info_t blob_info;
+         if (parse_sfo_mem(g_mount_real_sfo, g_mount_real_sfo_len, &blob_info) == 0) {
+             logprintf("[GarlicMgr] PS5PARAM blob SFO: TITLE_ID=%s DIR=%s TITLE=%s\n",
+                       blob_info.title_id, blob_info.dir_name, blob_info.main_title);
+             logprintf("[GarlicMgr] PS5PARAM blob SFO: BLOCKS=%u FORMAT=%s "
+                       "ACCOUNT_ID=%016llX USER_ID=0x%x LIST_PARAM=%u\n",
+                       blob_info.blocks, blob_info.format,
+                       (unsigned long long)blob_info.account_id,
+                       blob_info.user_id, blob_info.list_param);
+             /* Hex dump first 64 bytes of raw SFO for deep inspection */
+             char hexbuf[64*3+1];
+             int hexlen = r < 64 ? r : 64;
+             for (int i = 0; i < hexlen; i++)
+                 sprintf(hexbuf + i*3, "%02X ", g_mount_real_sfo[i]);
+             hexbuf[hexlen*3] = 0;
+             logprintf("[GarlicMgr] PS5PARAM blob hex[0..%d]: %s\n", hexlen-1, hexbuf);
+         }
      } else if (r < 0) {
          logprintf("[GarlicMgr] PS5PARAM: no blob read from %s (%d)\n", img, r);
      }
@@ -3954,51 +4055,6 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
  }
  
  /* ── Zip extraction (upload) ────────────────────────────────────── */
- static uint32_t zip_sfo_blocks(const uint8_t *data, size_t len) {
-     size_t off = 0;
-     while (off + 30 <= len) {
-         if (data[off]!=0x50 || data[off+1]!=0x4b ||
-             data[off+2]!=0x03 || data[off+3]!=0x04) break;
-         uint16_t compression = 0, name_len = 0, extra_len = 0;
-         uint32_t comp_size = 0, uncomp_size = 0;
-         memcpy(&compression, data + off + 8, 2);
-         memcpy(&comp_size, data + off + 18, 4);
-         memcpy(&uncomp_size, data + off + 22, 4);
-         memcpy(&name_len, data + off + 26, 2);
-         memcpy(&extra_len, data + off + 28, 2);
-         char name[MAX_PATH_LEN] = {0};
-         uint16_t copy_len = name_len < MAX_PATH_LEN - 1 ? name_len : (uint16_t)(MAX_PATH_LEN - 1);
-         memcpy(name, data + off + 30, copy_len);
-         off += 30 + name_len + extra_len;
-         if (compression == 0 && uncomp_size >= 20 &&
-             (strcasecmp(name, "sce_sys/param.sfo") == 0 ||
-              strcasecmp(name + (strlen(name) > 17 ? strlen(name) - 17 : 0), "sce_sys/param.sfo") == 0)) {
-             const uint8_t *sfo = data + off;
-             if (off + uncomp_size <= len && sfo[0]==0x00 && sfo[1]==0x50 && sfo[2]==0x53 && sfo[3]==0x46) {
-                 uint32_t key_off, data_off, count;
-                 memcpy(&key_off, sfo + 8, 4);
-                 memcpy(&data_off, sfo + 12, 4);
-                 memcpy(&count, sfo + 16, 4);
-                 for (uint32_t i = 0; i < count && 20 + i * 16 + 16 <= uncomp_size; i++) {
-                     uint16_t k_off;
-                     memcpy(&k_off, sfo + 20 + i * 16, 2);
-                     uint32_t d_off;
-                     memcpy(&d_off, sfo + 20 + i * 16 + 12, 4);
-                     if (key_off + k_off < uncomp_size &&
-                         strcmp((const char *)(sfo + key_off + k_off), "SAVEDATA_BLOCKS") == 0 &&
-                         data_off + d_off + 4 <= uncomp_size) {
-                         uint32_t blocks;
-                         memcpy(&blocks, sfo + data_off + d_off, 4);
-                         return blocks;
-                     }
-                 }
-             }
-         }
-         off += comp_size;
-     }
-     return 0;
- }
-
  static int extract_zip(const char *dest, const uint8_t *data, size_t len) {
      size_t off = 0;
      int count = 0;
@@ -6419,20 +6475,10 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          unlink(tmp);
          kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
  
-         uint64_t req_blocks = 0;
-         char *bp = strstr(url, "blocks=");
-         if (bp) req_blocks = strtoull(bp + 7, NULL, 10);
-         if (req_blocks == 0)
-             req_blocks = zip_sfo_blocks(tar_data, received);
-
-         uint64_t img_size;
-         if (req_blocks > 0) {
-             img_size = (uint64_t)req_blocks * 32768;
-         } else {
-             img_size = clen + (clen / 4) + (4 * 1024 * 1024);
-             if (img_size < 32 * 1024 * 1024)
-                 img_size = 32 * 1024 * 1024;
-         }
+         /* Size: data + 25% overhead + 4MB, min 32MB, aligned to 32K */
+         uint64_t img_size = clen + (clen / 4) + (4 * 1024 * 1024);
+         if (img_size < 32 * 1024 * 1024)
+             img_size = 32 * 1024 * 1024;
          img_size = ((img_size + 32767) / 32768) * 32768;
  
          /* Step 1: Create file and allocate space (same as mkpfs) */
@@ -6441,7 +6487,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              free(tar_data);
              http_json(sock, "{\"error\":\"Cannot create temp file\"}"); return;
          }
-         int ret = sceFsUfsAllocateSaveData(imgfd, img_size, 0x80, 0);
+         int ret = sceFsUfsAllocateSaveData(imgfd, img_size, 0, 0);
          if (ret < 0) {
              printf("[GarlicMgr] UfsAllocate failed (0x%x), using ftruncate\n", ret);
              if (ftruncate(imgfd, img_size) < 0) {
@@ -6456,7 +6502,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          CreateOpt copt;
          memset(&copt, 0, sizeof(copt));
          sceFsInitCreatePfsSaveDataOpt(&copt);
-         /* flags[1] left 0: no compression, matches native PS5 geometry */
+         copt.flags[1] = 0x02;
          uint8_t ckey[0x20] = {0};
          if (!g_pprCreate) {
              free(tar_data); unlink(tmp);
@@ -6529,37 +6575,31 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              }
          }
  
-         /* Optional: patch account ID in param.sfo (skip if SFO is zeroed) */
+         /* Optional: patch account ID in param.sfo */
          char *ap = strstr(url, "aid=");
          if (ap) {
-             char sfo_path[MAX_PATH_LEN];
-             snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
-             sfo_info_t sfo_chk;
-             int sfo_chk_ret = parse_sfo(sfo_path, &sfo_chk);
-             if (sfo_chk_ret == -2) {
-                 printf("[GarlicMgr] encrypt_upload: zeroed param.sfo, skipping account patch\n");
-             } else {
-                 char aid_hex[64] = {0};
-                 strncpy(aid_hex, ap + 4, sizeof(aid_hex) - 1);
-                 char *rp2 = aid_hex, *wp2 = aid_hex;
-                 while (*rp2 && *rp2 != '&') {
-                     if (*rp2 == '%' && rp2[1] && rp2[2]) {
-                         char hx[3] = {rp2[1], rp2[2], 0};
-                         *wp2++ = (char)strtol(hx, NULL, 16);
-                         rp2 += 3;
-                     } else { *wp2++ = *rp2++; }
+             char aid_hex[64] = {0};
+             strncpy(aid_hex, ap + 4, sizeof(aid_hex) - 1);
+             char *rp2 = aid_hex, *wp2 = aid_hex;
+             while (*rp2 && *rp2 != '&') {
+                 if (*rp2 == '%' && rp2[1] && rp2[2]) {
+                     char hx[3] = {rp2[1], rp2[2], 0};
+                     *wp2++ = (char)strtol(hx, NULL, 16);
+                     rp2 += 3;
+                 } else { *wp2++ = *rp2++; }
+             }
+             *wp2 = 0;
+             char *hs = aid_hex;
+             if (hs[0] == '0' && (hs[1] == 'x' || hs[1] == 'X')) hs += 2;
+             if (strlen(hs) == 16) {
+                 uint8_t new_aid[8];
+                 if (sfo_account_from_hex(hs, new_aid) < 0) {
+                     http_json(sock, "{\"error\":\"Invalid Account ID\"}"); return;
                  }
-                 *wp2 = 0;
-                 char *hs = aid_hex;
-                 if (hs[0] == '0' && (hs[1] == 'x' || hs[1] == 'X')) hs += 2;
-                 if (strlen(hs) == 16) {
-                     uint8_t new_aid[8];
-                     if (sfo_account_from_hex(hs, new_aid) < 0) {
-                         http_json(sock, "{\"error\":\"Invalid Account ID\"}"); return;
-                     }
-                     if (patch_sfo_account(sfo_path, new_aid, NULL) < 0) {
-                         http_json(sock, "{\"error\":\"Failed to write and verify Account ID in param.sfo\"}"); return;
-                     }
+                 char sfo_path[MAX_PATH_LEN];
+                 snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
+                 if (patch_sfo_account(sfo_path, new_aid, NULL) < 0) {
+                     http_json(sock, "{\"error\":\"Failed to write and verify Account ID in param.sfo\"}"); return;
                  }
              }
          }
@@ -6843,22 +6883,17 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          int is_ps4 = (strstr(url, "ps4=1") != NULL);
          g_enc_ps4 = is_ps4;
  
-         uint64_t img_size = 0;
-         char *bp = strstr(url, "blocks=");
-         if (bp) {
-             uint64_t blk = strtoull(bp + 7, NULL, 10);
-             if (blk > 0)
-                 img_size = blk * 32768;
-         }
-         if (img_size == 0) {
-             char *sp = strstr(url, "size=");
-             if (sp) {
-                 uint64_t req_size = strtoull(sp + 5, NULL, 10);
-                 if (req_size > 0)
-                     img_size = req_size + (req_size / 4) + (4 * 1024 * 1024);
+         /* Parse optional size (default 256MB) */
+         uint64_t img_size = 256 * 1024 * 1024;
+         char *sp = strstr(url, "size=");
+         if (sp) {
+             uint64_t req_size = strtoull(sp + 5, NULL, 10);
+             if (req_size > 0) {
+                 /* Add 25% overhead + 4MB, min 32MB */
+                 img_size = req_size + (req_size / 4) + (4 * 1024 * 1024);
+                 if (img_size < 32 * 1024 * 1024)
+                     img_size = 32 * 1024 * 1024;
              }
-             if (img_size < 32 * 1024 * 1024)
-                 img_size = 32 * 1024 * 1024;
          }
          img_size = ((img_size + 32767) / 32768) * 32768;
  
@@ -6920,7 +6955,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          if (imgfd < 0) {
              http_json(sock, "{\"error\":\"Cannot create temp file\"}"); return;
          }
-         int ret = sceFsUfsAllocateSaveData(imgfd, img_size, 0x80, 0);
+         int ret = sceFsUfsAllocateSaveData(imgfd, img_size, 0, 0);
          if (ret < 0) {
              printf("[GarlicMgr] UfsAllocate failed (0x%x), using ftruncate\n", ret);
              if (ftruncate(imgfd, img_size) < 0) {
@@ -6940,7 +6975,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              ret = sceFsCreatePfsSaveDataImage(&copt, tmp, 0, img_size, ckey);
          } else {
              /* PS5: use PprCreate with zeroed key + compression flag */
-             /* flags[1] left 0: no compression, matches native PS5 geometry */
+             copt.flags[1] = 0x02;
              if (!g_pprCreate) {
                  unlink(tmp);
                  http_json(sock, "{\"error\":\"PprCreate not available\"}"); return;
@@ -7411,13 +7446,66 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              sfo_info_t sfo;
              int sfo_ret2 = parse_sfo(sfo_path, &sfo);
              if (sfo_ret2 == -2) {
-                 printf("[GarlicMgr] import_usb: zeroed param.sfo (encrypted), leaving as-is\n");
-                 memset(&sfo, 0, sizeof(sfo));
-                 strncpy(sfo.title_id, s->title_id, sizeof(sfo.title_id) - 1);
-                 const char *_dn = s->save_name;
-                 if (strncmp(_dn, "sdimg_", 6) == 0) _dn += 6;
-                 strncpy(sfo.dir_name, _dn, sizeof(sfo.dir_name) - 1);
-             } else if (sfo_ret2 < 0 || !sfo.title_id[0] || !sfo.dir_name[0]) {
+                 /* Zeroed SFO — regenerate from DB */
+                 printf("[GarlicMgr] import_usb: zeroed param.sfo (encrypted), regenerating\n");
+                 char uid_hex_tmp[16] = {0};
+                 char *uidp_tmp = strstr(url, "uid=");
+                 if (uidp_tmp) { strncpy(uid_hex_tmp, uidp_tmp + 4, sizeof(uid_hex_tmp) - 1);
+                     char *amp = strchr(uid_hex_tmp, '&'); if (amp) *amp = 0; }
+                 if (!uid_hex_tmp[0]) {
+                     int lu = 0; sceUserServiceGetForegroundUser(&lu);
+                     snprintf(uid_hex_tmp, sizeof(uid_hex_tmp), "%x", (uint32_t)lu);
+                 }
+                 /* Derive dir_name for DB: strip sdimg_ prefix from save_name */
+                 const char *lookup_dir2 = s->save_name;
+                 if (strncmp(lookup_dir2, "sdimg_", 6) == 0) lookup_dir2 += 6;
+ 
+                 char db_main_title[128] = {0}, db_sub_title[128] = {0}, db_gtid[32] = {0};
+                 uint64_t db_aid = 0, db_blocks = 96, db_sysblocks = 0;
+                 uint32_t db_uid = (uint32_t)strtoul(uid_hex_tmp, NULL, 16);
+                 int db_found = 0, db_is_ps4 = 0;
+                 const char *db_types[] = {"savedata_prospero", "savedata"};
+                 for (int dt = 0; dt < 2 && !db_found; dt++) {
+                     char db_path[MAX_PATH_LEN];
+                     snprintf(db_path, sizeof(db_path), "/system_data/%s/%s/db/user/savedata.db",
+                              db_types[dt], uid_hex_tmp);
+                     sqlite3 *db = NULL;
+                     if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+                         char sql[512];
+                         snprintf(sql, sizeof(sql),
+                             "SELECT main_title, sub_title, blocks, account_id, system_blocks, user_id, game_title_id "
+                             "FROM savedata WHERE title_id='%s' AND dir_name='%s' LIMIT 1",
+                             s->title_id, lookup_dir2);
+                         sqlite3_stmt *stmt = NULL;
+                         if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK &&
+                             sqlite3_step(stmt) == SQLITE_ROW) {
+                             const char *mt = (const char *)sqlite3_column_text(stmt, 0);
+                             const char *st2 = (const char *)sqlite3_column_text(stmt, 1);
+                             const char *gt = (const char *)sqlite3_column_text(stmt, 6);
+                             if (mt) strncpy(db_main_title, mt, sizeof(db_main_title) - 1);
+                             if (st2) strncpy(db_sub_title, st2, sizeof(db_sub_title) - 1);
+                             db_blocks = sqlite3_column_int64(stmt, 2);
+                             db_aid = (uint64_t)sqlite3_column_int64(stmt, 3);
+                             db_sysblocks = sqlite3_column_int64(stmt, 4);
+                             db_uid = (uint32_t)sqlite3_column_int(stmt, 5);
+                             if (gt) strncpy(db_gtid, gt, sizeof(db_gtid) - 1);
+                             db_found = 1;
+                             db_is_ps4 = (dt == 1);
+                         }
+                         if (stmt) sqlite3_finalize(stmt);
+                         sqlite3_close(db);
+                     }
+                 }
+                 if (!db_found) strncpy(db_main_title, s->title_id, sizeof(db_main_title) - 1);
+                 generate_sfo(sfo_path, s->title_id, lookup_dir2,
+                              db_main_title, db_sub_title, db_aid, db_blocks, db_sysblocks,
+                              db_uid, db_gtid[0] ? db_gtid : NULL,
+                              db_is_ps4 || s->is_ps4,
+                              g_params_hmac_valid ? g_params_hmac : NULL);
+                 sync();
+                 sfo_ret2 = parse_sfo(sfo_path, &sfo);
+             }
+             if (sfo_ret2 < 0 || !sfo.title_id[0] || !sfo.dir_name[0]) {
                  unmount_save();
                  http_json(sock, "{\"error\":\"Cannot parse param.sfo\"}"); return;
              }
@@ -7444,18 +7532,13 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                  snprintf(uid_hex, sizeof(uid_hex), "%x", uid);
              }
  
-             /* Resign (skip if SFO was zeroed) */
+             /* Resign */
              uint64_t local_aid = 0;
-             const char *owner_warning = "";
-             if (sfo_ret2 != -2) {
-                 int owner_result = patch_import_sfo_owner(sfo_path, sfo.account_id, uid_hex, uid, g_enc_ps4, &local_aid);
-                 owner_warning = import_owner_warning(owner_result);
-                 if (owner_warning[0]) logprintf("[GarlicMgr] WARNING: %s\n", owner_warning);
-                 printf("[GarlicMgr] import: resigned aid=%016llX uid=0x%x\n",
-                        (unsigned long long)local_aid, uid);
-             } else {
-                 printf("[GarlicMgr] import: zeroed param.sfo, skipping resign\n");
-             }
+             int owner_result = patch_import_sfo_owner(sfo_path, sfo.account_id, uid_hex, uid, g_enc_ps4, &local_aid);
+             const char *owner_warning = import_owner_warning(owner_result);
+             if (owner_warning[0]) logprintf("[GarlicMgr] WARNING: %s\n", owner_warning);
+             printf("[GarlicMgr] import: resigned aid=%016llX uid=0x%x\n",
+                    (unsigned long long)local_aid, uid);
  
              /* Copy icon before unmount */
              char icon_tmp[MAX_PATH_LEN] = {0};
@@ -7598,7 +7681,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                          "game_title_id, system_blocks) VALUES ("
                          "'%s','%s','%s','','',0,%u,%u,%u,%u,'%s',0,%lld,%u,0,0,'%s',0)",
                          sfo.title_id, sfo.dir_name, esc_title,
-                         sfo.list_param, sfo.blocks, sfo.blocks, sfo.blocks * 0x40, mtime,
+                         sfo.list_param, sfo.blocks, 0u, sfo.blocks * 0x40, mtime,
                          (long long)(int64_t)aid_val, uid, sfo.title_id);
                  }
                  ret = sqlite3_exec(db, sql, NULL, 0, &err_msg);
@@ -7621,11 +7704,78 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          sfo_info_t sfo;
          int sfo_ret = parse_sfo(sfo_path, &sfo);
          if (sfo_ret == -2) {
-             printf("[GarlicMgr] import_usb: zeroed param.sfo (decrypted), leaving as-is\n");
-             memset(&sfo, 0, sizeof(sfo));
-             strncpy(sfo.title_id, s->title_id, sizeof(sfo.title_id) - 1);
-             strncpy(sfo.dir_name, s->save_name, sizeof(sfo.dir_name) - 1);
-         } else if (sfo_ret < 0 || !sfo.title_id[0] || !sfo.dir_name[0]) {
+             /* Zeroed param.sfo — regenerate from DB + save entry */
+             printf("[GarlicMgr] import_usb: zeroed param.sfo, regenerating from DB\n");
+ 
+             /* Get uid for DB lookup */
+             char uid_hex_tmp[16] = {0};
+             char *uidp_tmp = strstr(url, "uid=");
+             if (uidp_tmp) { strncpy(uid_hex_tmp, uidp_tmp + 4, sizeof(uid_hex_tmp) - 1);
+                 char *amp = strchr(uid_hex_tmp, '&'); if (amp) *amp = 0; }
+             if (!uid_hex_tmp[0]) {
+                 int lu = 0; sceUserServiceGetForegroundUser(&lu);
+                 snprintf(uid_hex_tmp, sizeof(uid_hex_tmp), "%x", (uint32_t)lu);
+             }
+ 
+             /* Derive dir_name for DB lookup: save_name is the folder name for decrypted saves */
+             const char *lookup_dir = s->save_name;
+ 
+             /* Try both PS5 and PS4 DBs */
+             char db_main_title[128] = {0}, db_sub_title[128] = {0}, db_gtid[32] = {0};
+             uint64_t db_aid = 0, db_blocks = 96, db_sysblocks = 0;
+             uint32_t db_uid = (uint32_t)strtoul(uid_hex_tmp, NULL, 16);
+             int db_found = 0, db_is_ps4 = 0;
+             const char *db_types[] = {"savedata_prospero", "savedata"};
+             for (int dt = 0; dt < 2 && !db_found; dt++) {
+                 char db_path[MAX_PATH_LEN];
+                 snprintf(db_path, sizeof(db_path), "/system_data/%s/%s/db/user/savedata.db",
+                          db_types[dt], uid_hex_tmp);
+                 sqlite3 *db = NULL;
+                 if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+                     char sql[512];
+                     snprintf(sql, sizeof(sql),
+                         "SELECT main_title, sub_title, blocks, account_id, system_blocks, user_id, game_title_id "
+                         "FROM savedata WHERE title_id='%s' AND dir_name='%s' LIMIT 1",
+                         s->title_id, lookup_dir);
+                     sqlite3_stmt *stmt = NULL;
+                     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK &&
+                         sqlite3_step(stmt) == SQLITE_ROW) {
+                         const char *mt = (const char *)sqlite3_column_text(stmt, 0);
+                         const char *st2 = (const char *)sqlite3_column_text(stmt, 1);
+                         const char *gt = (const char *)sqlite3_column_text(stmt, 6);
+                         if (mt) strncpy(db_main_title, mt, sizeof(db_main_title) - 1);
+                         if (st2) strncpy(db_sub_title, st2, sizeof(db_sub_title) - 1);
+                         db_blocks = sqlite3_column_int64(stmt, 2);
+                         db_aid = (uint64_t)sqlite3_column_int64(stmt, 3);
+                         db_sysblocks = sqlite3_column_int64(stmt, 4);
+                         db_uid = (uint32_t)sqlite3_column_int(stmt, 5);
+                         if (gt) strncpy(db_gtid, gt, sizeof(db_gtid) - 1);
+                         db_found = 1;
+                         db_is_ps4 = (dt == 1);
+                     }
+                     if (stmt) sqlite3_finalize(stmt);
+                     sqlite3_close(db);
+                 }
+             }
+ 
+             if (!db_found) {
+                 /* No DB entry — use save entry fields with defaults */
+                 strncpy(db_main_title, s->title_id, sizeof(db_main_title) - 1);
+             }
+ 
+             generate_sfo(sfo_path, s->title_id, lookup_dir,
+                          db_main_title, db_sub_title,
+                          db_aid, db_blocks, db_sysblocks,
+                          db_uid, db_gtid[0] ? db_gtid : NULL,
+                          db_is_ps4 || s->is_ps4,
+                          g_params_hmac_valid ? g_params_hmac : NULL);
+             printf("[GarlicMgr] import_usb: regenerated param.sfo for %s/%s\n",
+                    s->title_id, lookup_dir);
+ 
+             /* Re-parse the generated SFO */
+             sfo_ret = parse_sfo(sfo_path, &sfo);
+         }
+         if (sfo_ret < 0 || !sfo.title_id[0] || !sfo.dir_name[0]) {
              http_json(sock, "{\"error\":\"Cannot parse param.sfo\"}"); return;
          }
  
@@ -7674,13 +7824,9 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          }
          if (total_size == 0) total_size = 1024 * 1024;
  
-         uint64_t img_size;
-         if (sfo.blocks > 0) {
-             img_size = (uint64_t)sfo.blocks * 32768;
-         } else {
-             img_size = total_size + (total_size / 4) + (4 * 1024 * 1024);
-             if (img_size < 32 * 1024 * 1024) img_size = 32 * 1024 * 1024;
-         }
+         /* Create PFS image: size + 25% overhead + 4MB, min 32MB */
+         uint64_t img_size = total_size + (total_size / 4) + (4 * 1024 * 1024);
+         if (img_size < 32 * 1024 * 1024) img_size = 32 * 1024 * 1024;
          img_size = ((img_size + 32767) / 32768) * 32768;
  
          mkdir("/data/save_files", 0777);
@@ -7691,7 +7837,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          if (imgfd < 0) {
              http_json(sock, "{\"error\":\"Cannot create temp file\"}"); return;
          }
-         int ret = sceFsUfsAllocateSaveData(imgfd, img_size, 0x80, 0);
+         int ret = sceFsUfsAllocateSaveData(imgfd, img_size, 0, 0);
          if (ret < 0) {
              if (ftruncate(imgfd, img_size) < 0) {
                  close(imgfd); unlink(tmp);
@@ -7757,7 +7903,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              CreateOpt copt;
              memset(&copt, 0, sizeof(copt));
              sceFsInitCreatePfsSaveDataOpt(&copt);
-             /* flags[1] left 0: no compression, matches native PS5 geometry */
+             copt.flags[1] = 0x02;
              if (!g_pprCreate) {
                  unlink(tmp);
                  http_json(sock, "{\"error\":\"PprCreate not available\"}"); return;
@@ -7798,20 +7944,15 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          sync();
          printf("[GarlicMgr] import_usb: copied files into PFS\n");
  
-         /* Resign param.sfo (skip if SFO was zeroed) */
+         /* Resign param.sfo */
          uint64_t local_aid = 0;
-         const char *owner_warning = "";
          char pfs_sfo[MAX_PATH_LEN];
          snprintf(pfs_sfo, sizeof(pfs_sfo), "%s/sce_sys/param.sfo", g_mount_point);
-         if (sfo_ret != -2) {
-             int owner_result = patch_import_sfo_owner(pfs_sfo, sfo.account_id, uid_hex, uid, is_ps4, &local_aid);
-             owner_warning = import_owner_warning(owner_result);
-             if (owner_warning[0]) logprintf("[GarlicMgr] WARNING: %s\n", owner_warning);
-             printf("[GarlicMgr] import: resigned aid=%016llX uid=0x%x\n",
-                    (unsigned long long)local_aid, uid);
-         } else {
-             printf("[GarlicMgr] import: zeroed param.sfo, skipping resign\n");
-         }
+         int owner_result = patch_import_sfo_owner(pfs_sfo, sfo.account_id, uid_hex, uid, is_ps4, &local_aid);
+         const char *owner_warning = import_owner_warning(owner_result);
+         if (owner_warning[0]) logprintf("[GarlicMgr] WARNING: %s\n", owner_warning);
+         printf("[GarlicMgr] import: resigned aid=%016llX uid=0x%x\n",
+                (unsigned long long)local_aid, uid);
  
          /* Copy icon before unmount */
          char icon_tmp[MAX_PATH_LEN] = {0};
@@ -7960,7 +8101,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                      "game_title_id, system_blocks) VALUES ("
                      "'%s','%s','%s','','',0,%u,%u,%u,%u,'%s',0,%lld,%u,0,0,'%s',0)",
                      sfo.title_id, sfo.dir_name, esc_title,
-                     sfo.list_param, sfo.blocks, sfo.blocks, size_kib, mtime,
+                     sfo.list_param, sfo.blocks, 0u, size_kib, mtime,
                      (long long)(int64_t)aid_val, uid, sfo.title_id);
              }
              ret = sqlite3_exec(db, sql, NULL, 0, &err_msg);
@@ -8179,7 +8320,11 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                            imp_sfo_len);
          }
  
-         /* Build destination paths — PS4: savedata/, PS5: savedata_prospero/ */
+         /* Flush kernel ioctl blob write to disk before copy_file reads it */
+        sync();
+        logprintf("[GarlicMgr] sync() done — flushing kernel buffers before copy\n");
+
+        /* Build destination paths — PS4: savedata/, PS5: savedata_prospero/ */
          char sd_dir[MAX_PATH_LEN], sd_dst[MAX_PATH_LEN];
          snprintf(sd_dir, sizeof(sd_dir),
                   "/user/home/%s/%s/%s", uid_hex,
@@ -8338,7 +8483,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                  "mtime='%s', account_id=%lld, user_id=%u "
                  "WHERE title_id='%s' AND dir_name='%s'",
                  esc_title, esc_sub, esc_detail,
-                 sfo.list_param, sfo.blocks, sfo.blocks, size_kib,
+                 sfo.list_param, sfo.blocks, 0u, size_kib,
                  mtime, (long long)(int64_t)aid_val, uid,
                  sfo.title_id, sfo.dir_name);
          } else {
@@ -8352,7 +8497,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                  "0,%lld,%u,0,0,"
                  "'%s',0)",
                  sfo.title_id, sfo.dir_name, esc_title, esc_sub, esc_detail,
-                 sfo.list_param, sfo.blocks, sfo.blocks, size_kib, mtime,
+                 sfo.list_param, sfo.blocks, 0u, size_kib, mtime,
                  (long long)(int64_t)aid_val, uid,
                  sfo.game_title_id);
          }
@@ -8364,8 +8509,67 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          } else {
              printf("[GarlicMgr] import: DB %s OK\n", exists ? "updated" : "inserted");
          }
+         /* Verify DB entry after update */
+         {
+             char vq[512];
+             snprintf(vq, sizeof(vq),
+                 "SELECT blocks, free_blocks, size_kib, system_blocks, user_param "
+                 "FROM savedata WHERE title_id='%s' AND dir_name='%s' LIMIT 1",
+                 sfo.title_id, sfo.dir_name);
+             sqlite3_stmt *vs = NULL;
+             if (sqlite3_prepare_v2(db, vq, -1, &vs, NULL) == SQLITE_OK &&
+                 sqlite3_step(vs) == SQLITE_ROW) {
+                 logprintf("[GarlicMgr] DB verify: blocks=%lld free_blocks=%lld "
+                           "size_kib=%lld system_blocks=%lld user_param=%lld\n",
+                           sqlite3_column_int64(vs, 0), sqlite3_column_int64(vs, 1),
+                           sqlite3_column_int64(vs, 2), sqlite3_column_int64(vs, 3),
+                           sqlite3_column_int64(vs, 4));
+             }
+             if (vs) sqlite3_finalize(vs);
+         }
+
          sqlite3_close(db);
- 
+
+         /* Verify blob at final destination */
+         {
+             int vfd = open(sd_dst, O_RDONLY);
+             if (vfd >= 0) {
+                 uint8_t vhdr[32];
+                 ssize_t vr = pread(vfd, vhdr, sizeof(vhdr), 0xC00);
+                 if (vr >= 20) {
+                     uint64_t vmag;
+                     uint32_t vsz, voff;
+                     memcpy(&vmag, vhdr, 8);
+                     memcpy(&vsz, vhdr + 12, 4);
+                     memcpy(&voff, vhdr + 16, 4);
+                     logprintf("[GarlicMgr] Blob verify @ dest: magic=%s sfo_sz=%u sfo_off=%u\n",
+                               vmag == 0x4D41524150355350ULL ? "PS5PARAM(OK)" : "BAD",
+                               vsz, voff);
+                     if (vmag == 0x4D41524150355350ULL && vsz > 0) {
+                         uint8_t *vsfo = malloc(vsz);
+                         if (vsfo) {
+                             ssize_t vsn = pread(vfd, vsfo, vsz, 0xC00 + voff);
+                             if (vsn > 0) {
+                                 sfo_info_t vsi;
+                                 if (parse_sfo_mem(vsfo, (size_t)vsn, &vsi) == 0)
+                                     logprintf("[GarlicMgr] Blob verify SFO: BLOCKS=%u FORMAT=%s\n",
+                                               vsi.blocks, vsi.format);
+                             }
+                             free(vsfo);
+                         }
+                     }
+                 } else {
+                     logprintf("[GarlicMgr] Blob verify: no data at 0xC00 (read %zd)\n", vr);
+                 }
+                 /* Also check blob mode at 0x368 */
+                 uint64_t vmode = 0;
+                 pread(vfd, &vmode, 8, 0x368);
+                 logprintf("[GarlicMgr] Blob verify: mode@0x368 = 0x%llx\n",
+                           (unsigned long long)vmode);
+                 close(vfd);
+             }
+         }
+
          char json[1024];
          snprintf(json, sizeof(json),
                   "{\"ok\":true,\"title_id\":\"%s\",\"dir_name\":\"%s\","
@@ -8566,14 +8770,67 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                               g_mount_point, tmp_entries[f].name);
                      cache_params_hmac(sfo_tmp_path);
                  }
-                 /* Check for zeroed param.sfo */
+                 /* Fix zeroed param.sfo: regenerate valid SFO in memory */
                  if (de->data && de->size > 0 &&
                      strstr(tmp_entries[f].name, "sce_sys/param.sfo")) {
                      int zeroed = 1;
                      for (uint32_t b = 0; b < de->size && b < 256; b++)
                          if (de->data[b]) { zeroed = 0; break; }
                      if (zeroed) {
-                         logprintf("[GarlicMgr] Zeroed param.sfo for %s/%s, leaving as-is\n", tid, sname);
+                         logprintf("[GarlicMgr] Fixing zeroed param.sfo for %s/%s\n", tid, sname);
+                         /* Query savedata DB for full metadata */
+                         const char *sd = g_saves[idx].is_ps4 ? "savedata" : "savedata_prospero";
+                         char db_path[MAX_PATH_LEN];
+                         snprintf(db_path, sizeof(db_path),
+                                  "/system_data/%s/%s/db/user/savedata.db",
+                                  sd, g_saves[idx].user_id);
+                         sqlite3 *sdb = NULL;
+                         const char *db_title = NULL, *db_sub = NULL, *db_gtid = NULL;
+                         int64_t db_blocks = 96, db_aid = 0, db_sysblk = 0;
+                         uint32_t db_uid = 0;
+                         if (sqlite3_open_v2(db_path, &sdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+                             sqlite3_stmt *st3 = NULL;
+                             const char *q = "SELECT main_title, sub_title, blocks, account_id, "
+                                             "system_blocks, user_id, game_title_id "
+                                             "FROM savedata WHERE title_id=? AND dir_name=? LIMIT 1";
+                             if (sqlite3_prepare_v2(sdb, q, -1, &st3, NULL) == SQLITE_OK) {
+                                 sqlite3_bind_text(st3, 1, tid, -1, SQLITE_STATIC);
+                                 sqlite3_bind_text(st3, 2, sname, -1, SQLITE_STATIC);
+                                 if (sqlite3_step(st3) == SQLITE_ROW) {
+                                     db_title  = (const char *)sqlite3_column_text(st3, 0);
+                                     db_sub    = (const char *)sqlite3_column_text(st3, 1);
+                                     db_blocks = sqlite3_column_int64(st3, 2);
+                                     db_aid    = sqlite3_column_int64(st3, 3);
+                                     db_sysblk = sqlite3_column_int64(st3, 4);
+                                     db_uid    = (uint32_t)sqlite3_column_int64(st3, 5);
+                                     db_gtid   = (const char *)sqlite3_column_text(st3, 6);
+                                 }
+                             }
+                             /* Generate replacement SFO in temp file, read back */
+                             char tmp_sfo[128];
+                             snprintf(tmp_sfo, sizeof(tmp_sfo), "/data/save_files/_tmp_sfo_%d.bin", n);
+                             generate_sfo(tmp_sfo, tid, sname,
+                                          db_title ? db_title : tid,
+                                          db_sub ? db_sub : "",
+                                          (uint64_t)db_aid, (uint64_t)db_blocks,
+                                          (uint64_t)db_sysblk, db_uid,
+                                          db_gtid, g_saves[idx].is_ps4,
+                                          g_params_hmac_valid ? g_params_hmac : NULL);
+                             if (st3) sqlite3_finalize(st3);
+                             sqlite3_close(sdb);
+                             int sfd = open(tmp_sfo, O_RDONLY);
+                             if (sfd >= 0) {
+                                 struct stat st2;
+                                 if (fstat(sfd, &st2) == 0 && st2.st_size > 0) {
+                                     free(de->data);
+                                     de->size = st2.st_size;
+                                     de->data = malloc(de->size);
+                                     if (de->data) read(sfd, de->data, de->size);
+                                 }
+                                 close(sfd);
+                                 unlink(tmp_sfo);
+                             }
+                         }
                      }
                  }
  
