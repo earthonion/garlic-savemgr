@@ -5976,31 +5976,37 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          sync();
          printf("[GarlicMgr] Extracted %d files for encrypt\n", files);
  
-         /* Optional: patch account ID in param.sfo */
+         /* Optional: patch account ID in param.sfo (skip if SFO is zeroed) */
          char *ap = strstr(url, "aid=");
          if (ap) {
-             char aid_hex[64] = {0};
-             strncpy(aid_hex, ap + 4, sizeof(aid_hex) - 1);
-             char *rp2 = aid_hex, *wp2 = aid_hex;
-             while (*rp2 && *rp2 != '&') {
-                 if (*rp2 == '%' && rp2[1] && rp2[2]) {
-                     char hx[3] = {rp2[1], rp2[2], 0};
-                     *wp2++ = (char)strtol(hx, NULL, 16);
-                     rp2 += 3;
-                 } else { *wp2++ = *rp2++; }
-             }
-             *wp2 = 0;
-             char *hs = aid_hex;
-             if (hs[0] == '0' && (hs[1] == 'x' || hs[1] == 'X')) hs += 2;
-             if (strlen(hs) == 16) {
-                 uint8_t new_aid[8];
-                 if (sfo_account_from_hex(hs, new_aid) < 0) {
-                     http_json(sock, "{\"error\":\"Invalid Account ID\"}"); return;
+             char sfo_path[MAX_PATH_LEN];
+             snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
+             sfo_info_t sfo_chk;
+             int sfo_chk_ret = parse_sfo(sfo_path, &sfo_chk);
+             if (sfo_chk_ret == -2) {
+                 printf("[GarlicMgr] encrypt_upload: zeroed param.sfo, skipping account patch\n");
+             } else {
+                 char aid_hex[64] = {0};
+                 strncpy(aid_hex, ap + 4, sizeof(aid_hex) - 1);
+                 char *rp2 = aid_hex, *wp2 = aid_hex;
+                 while (*rp2 && *rp2 != '&') {
+                     if (*rp2 == '%' && rp2[1] && rp2[2]) {
+                         char hx[3] = {rp2[1], rp2[2], 0};
+                         *wp2++ = (char)strtol(hx, NULL, 16);
+                         rp2 += 3;
+                     } else { *wp2++ = *rp2++; }
                  }
-                 char sfo_path[MAX_PATH_LEN];
-                 snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
-                 if (patch_sfo_account(sfo_path, new_aid, NULL) < 0) {
-                     http_json(sock, "{\"error\":\"Failed to write and verify Account ID in param.sfo\"}"); return;
+                 *wp2 = 0;
+                 char *hs = aid_hex;
+                 if (hs[0] == '0' && (hs[1] == 'x' || hs[1] == 'X')) hs += 2;
+                 if (strlen(hs) == 16) {
+                     uint8_t new_aid[8];
+                     if (sfo_account_from_hex(hs, new_aid) < 0) {
+                         http_json(sock, "{\"error\":\"Invalid Account ID\"}"); return;
+                     }
+                     if (patch_sfo_account(sfo_path, new_aid, NULL) < 0) {
+                         http_json(sock, "{\"error\":\"Failed to write and verify Account ID in param.sfo\"}"); return;
+                     }
                  }
              }
          }
@@ -6786,66 +6792,13 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              sfo_info_t sfo;
              int sfo_ret2 = parse_sfo(sfo_path, &sfo);
              if (sfo_ret2 == -2) {
-                 /* Zeroed SFO — regenerate from DB */
-                 printf("[GarlicMgr] import_usb: zeroed param.sfo (encrypted), regenerating\n");
-                 char uid_hex_tmp[16] = {0};
-                 char *uidp_tmp = strstr(url, "uid=");
-                 if (uidp_tmp) { strncpy(uid_hex_tmp, uidp_tmp + 4, sizeof(uid_hex_tmp) - 1);
-                     char *amp = strchr(uid_hex_tmp, '&'); if (amp) *amp = 0; }
-                 if (!uid_hex_tmp[0]) {
-                     int lu = 0; sceUserServiceGetForegroundUser(&lu);
-                     snprintf(uid_hex_tmp, sizeof(uid_hex_tmp), "%x", (uint32_t)lu);
-                 }
-                 /* Derive dir_name for DB: strip sdimg_ prefix from save_name */
-                 const char *lookup_dir2 = s->save_name;
-                 if (strncmp(lookup_dir2, "sdimg_", 6) == 0) lookup_dir2 += 6;
- 
-                 char db_main_title[128] = {0}, db_sub_title[128] = {0}, db_gtid[32] = {0};
-                 uint64_t db_aid = 0, db_blocks = 96, db_sysblocks = 0;
-                 uint32_t db_uid = (uint32_t)strtoul(uid_hex_tmp, NULL, 16);
-                 int db_found = 0, db_is_ps4 = 0;
-                 const char *db_types[] = {"savedata_prospero", "savedata"};
-                 for (int dt = 0; dt < 2 && !db_found; dt++) {
-                     char db_path[MAX_PATH_LEN];
-                     snprintf(db_path, sizeof(db_path), "/system_data/%s/%s/db/user/savedata.db",
-                              db_types[dt], uid_hex_tmp);
-                     sqlite3 *db = NULL;
-                     if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
-                         char sql[512];
-                         snprintf(sql, sizeof(sql),
-                             "SELECT main_title, sub_title, blocks, account_id, system_blocks, user_id, game_title_id "
-                             "FROM savedata WHERE title_id='%s' AND dir_name='%s' LIMIT 1",
-                             s->title_id, lookup_dir2);
-                         sqlite3_stmt *stmt = NULL;
-                         if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK &&
-                             sqlite3_step(stmt) == SQLITE_ROW) {
-                             const char *mt = (const char *)sqlite3_column_text(stmt, 0);
-                             const char *st2 = (const char *)sqlite3_column_text(stmt, 1);
-                             const char *gt = (const char *)sqlite3_column_text(stmt, 6);
-                             if (mt) strncpy(db_main_title, mt, sizeof(db_main_title) - 1);
-                             if (st2) strncpy(db_sub_title, st2, sizeof(db_sub_title) - 1);
-                             db_blocks = sqlite3_column_int64(stmt, 2);
-                             db_aid = (uint64_t)sqlite3_column_int64(stmt, 3);
-                             db_sysblocks = sqlite3_column_int64(stmt, 4);
-                             db_uid = (uint32_t)sqlite3_column_int(stmt, 5);
-                             if (gt) strncpy(db_gtid, gt, sizeof(db_gtid) - 1);
-                             db_found = 1;
-                             db_is_ps4 = (dt == 1);
-                         }
-                         if (stmt) sqlite3_finalize(stmt);
-                         sqlite3_close(db);
-                     }
-                 }
-                 if (!db_found) strncpy(db_main_title, s->title_id, sizeof(db_main_title) - 1);
-                 generate_sfo(sfo_path, s->title_id, lookup_dir2,
-                              db_main_title, db_sub_title, db_aid, db_blocks, db_sysblocks,
-                              db_uid, db_gtid[0] ? db_gtid : NULL,
-                              db_is_ps4 || s->is_ps4,
-                              g_params_hmac_valid ? g_params_hmac : NULL);
-                 sync();
-                 sfo_ret2 = parse_sfo(sfo_path, &sfo);
-             }
-             if (sfo_ret2 < 0 || !sfo.title_id[0] || !sfo.dir_name[0]) {
+                 printf("[GarlicMgr] import_usb: zeroed param.sfo (encrypted), leaving as-is\n");
+                 memset(&sfo, 0, sizeof(sfo));
+                 strncpy(sfo.title_id, s->title_id, sizeof(sfo.title_id) - 1);
+                 const char *_dn = s->save_name;
+                 if (strncmp(_dn, "sdimg_", 6) == 0) _dn += 6;
+                 strncpy(sfo.dir_name, _dn, sizeof(sfo.dir_name) - 1);
+             } else if (sfo_ret2 < 0 || !sfo.title_id[0] || !sfo.dir_name[0]) {
                  unmount_save();
                  http_json(sock, "{\"error\":\"Cannot parse param.sfo\"}"); return;
              }
@@ -6872,13 +6825,17 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                  snprintf(uid_hex, sizeof(uid_hex), "%x", uid);
              }
  
-             /* Resign */
+             /* Resign (skip if SFO was zeroed) */
              uint64_t local_aid = 0;
-             int owner_result = patch_import_sfo_owner(sfo_path, sfo.account_id, uid_hex, uid, g_enc_ps4, &local_aid);
-             const char *owner_warning = import_owner_warning(owner_result);
-             if (owner_warning[0]) logprintf("[GarlicMgr] WARNING: %s\n", owner_warning);
-             printf("[GarlicMgr] import: resigned aid=%016llX uid=0x%x\n",
-                    (unsigned long long)local_aid, uid);
+             if (sfo_ret2 != -2) {
+                 int owner_result = patch_import_sfo_owner(sfo_path, sfo.account_id, uid_hex, uid, g_enc_ps4, &local_aid);
+                 const char *owner_warning = import_owner_warning(owner_result);
+                 if (owner_warning[0]) logprintf("[GarlicMgr] WARNING: %s\n", owner_warning);
+                 printf("[GarlicMgr] import: resigned aid=%016llX uid=0x%x\n",
+                        (unsigned long long)local_aid, uid);
+             } else {
+                 printf("[GarlicMgr] import: zeroed param.sfo, skipping resign\n");
+             }
  
              /* Copy icon before unmount */
              char icon_tmp[MAX_PATH_LEN] = {0};
@@ -7023,78 +6980,11 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          sfo_info_t sfo;
          int sfo_ret = parse_sfo(sfo_path, &sfo);
          if (sfo_ret == -2) {
-             /* Zeroed param.sfo — regenerate from DB + save entry */
-             printf("[GarlicMgr] import_usb: zeroed param.sfo, regenerating from DB\n");
- 
-             /* Get uid for DB lookup */
-             char uid_hex_tmp[16] = {0};
-             char *uidp_tmp = strstr(url, "uid=");
-             if (uidp_tmp) { strncpy(uid_hex_tmp, uidp_tmp + 4, sizeof(uid_hex_tmp) - 1);
-                 char *amp = strchr(uid_hex_tmp, '&'); if (amp) *amp = 0; }
-             if (!uid_hex_tmp[0]) {
-                 int lu = 0; sceUserServiceGetForegroundUser(&lu);
-                 snprintf(uid_hex_tmp, sizeof(uid_hex_tmp), "%x", (uint32_t)lu);
-             }
- 
-             /* Derive dir_name for DB lookup: save_name is the folder name for decrypted saves */
-             const char *lookup_dir = s->save_name;
- 
-             /* Try both PS5 and PS4 DBs */
-             char db_main_title[128] = {0}, db_sub_title[128] = {0}, db_gtid[32] = {0};
-             uint64_t db_aid = 0, db_blocks = 96, db_sysblocks = 0;
-             uint32_t db_uid = (uint32_t)strtoul(uid_hex_tmp, NULL, 16);
-             int db_found = 0, db_is_ps4 = 0;
-             const char *db_types[] = {"savedata_prospero", "savedata"};
-             for (int dt = 0; dt < 2 && !db_found; dt++) {
-                 char db_path[MAX_PATH_LEN];
-                 snprintf(db_path, sizeof(db_path), "/system_data/%s/%s/db/user/savedata.db",
-                          db_types[dt], uid_hex_tmp);
-                 sqlite3 *db = NULL;
-                 if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
-                     char sql[512];
-                     snprintf(sql, sizeof(sql),
-                         "SELECT main_title, sub_title, blocks, account_id, system_blocks, user_id, game_title_id "
-                         "FROM savedata WHERE title_id='%s' AND dir_name='%s' LIMIT 1",
-                         s->title_id, lookup_dir);
-                     sqlite3_stmt *stmt = NULL;
-                     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK &&
-                         sqlite3_step(stmt) == SQLITE_ROW) {
-                         const char *mt = (const char *)sqlite3_column_text(stmt, 0);
-                         const char *st2 = (const char *)sqlite3_column_text(stmt, 1);
-                         const char *gt = (const char *)sqlite3_column_text(stmt, 6);
-                         if (mt) strncpy(db_main_title, mt, sizeof(db_main_title) - 1);
-                         if (st2) strncpy(db_sub_title, st2, sizeof(db_sub_title) - 1);
-                         db_blocks = sqlite3_column_int64(stmt, 2);
-                         db_aid = (uint64_t)sqlite3_column_int64(stmt, 3);
-                         db_sysblocks = sqlite3_column_int64(stmt, 4);
-                         db_uid = (uint32_t)sqlite3_column_int(stmt, 5);
-                         if (gt) strncpy(db_gtid, gt, sizeof(db_gtid) - 1);
-                         db_found = 1;
-                         db_is_ps4 = (dt == 1);
-                     }
-                     if (stmt) sqlite3_finalize(stmt);
-                     sqlite3_close(db);
-                 }
-             }
- 
-             if (!db_found) {
-                 /* No DB entry — use save entry fields with defaults */
-                 strncpy(db_main_title, s->title_id, sizeof(db_main_title) - 1);
-             }
- 
-             generate_sfo(sfo_path, s->title_id, lookup_dir,
-                          db_main_title, db_sub_title,
-                          db_aid, db_blocks, db_sysblocks,
-                          db_uid, db_gtid[0] ? db_gtid : NULL,
-                          db_is_ps4 || s->is_ps4,
-                          g_params_hmac_valid ? g_params_hmac : NULL);
-             printf("[GarlicMgr] import_usb: regenerated param.sfo for %s/%s\n",
-                    s->title_id, lookup_dir);
- 
-             /* Re-parse the generated SFO */
-             sfo_ret = parse_sfo(sfo_path, &sfo);
-         }
-         if (sfo_ret < 0 || !sfo.title_id[0] || !sfo.dir_name[0]) {
+             printf("[GarlicMgr] import_usb: zeroed param.sfo (decrypted), leaving as-is\n");
+             memset(&sfo, 0, sizeof(sfo));
+             strncpy(sfo.title_id, s->title_id, sizeof(sfo.title_id) - 1);
+             strncpy(sfo.dir_name, s->save_name, sizeof(sfo.dir_name) - 1);
+         } else if (sfo_ret < 0 || !sfo.title_id[0] || !sfo.dir_name[0]) {
              http_json(sock, "{\"error\":\"Cannot parse param.sfo\"}"); return;
          }
  
@@ -7267,15 +7157,19 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          sync();
          printf("[GarlicMgr] import_usb: copied files into PFS\n");
  
-         /* Resign param.sfo */
+         /* Resign param.sfo (skip if SFO was zeroed) */
          uint64_t local_aid = 0;
          char pfs_sfo[MAX_PATH_LEN];
          snprintf(pfs_sfo, sizeof(pfs_sfo), "%s/sce_sys/param.sfo", g_mount_point);
-         int owner_result = patch_import_sfo_owner(pfs_sfo, sfo.account_id, uid_hex, uid, is_ps4, &local_aid);
-         const char *owner_warning = import_owner_warning(owner_result);
-         if (owner_warning[0]) logprintf("[GarlicMgr] WARNING: %s\n", owner_warning);
-         printf("[GarlicMgr] import: resigned aid=%016llX uid=0x%x\n",
-                (unsigned long long)local_aid, uid);
+         if (sfo_ret != -2) {
+             int owner_result = patch_import_sfo_owner(pfs_sfo, sfo.account_id, uid_hex, uid, is_ps4, &local_aid);
+             const char *owner_warning = import_owner_warning(owner_result);
+             if (owner_warning[0]) logprintf("[GarlicMgr] WARNING: %s\n", owner_warning);
+             printf("[GarlicMgr] import: resigned aid=%016llX uid=0x%x\n",
+                    (unsigned long long)local_aid, uid);
+         } else {
+             printf("[GarlicMgr] import: zeroed param.sfo, skipping resign\n");
+         }
  
          /* Copy icon before unmount */
          char icon_tmp[MAX_PATH_LEN] = {0};
@@ -7963,67 +7857,14 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                               g_mount_point, tmp_entries[f].name);
                      cache_params_hmac(sfo_tmp_path);
                  }
-                 /* Fix zeroed param.sfo: regenerate valid SFO in memory */
+                 /* Check for zeroed param.sfo */
                  if (de->data && de->size > 0 &&
                      strstr(tmp_entries[f].name, "sce_sys/param.sfo")) {
                      int zeroed = 1;
                      for (uint32_t b = 0; b < de->size && b < 256; b++)
                          if (de->data[b]) { zeroed = 0; break; }
                      if (zeroed) {
-                         logprintf("[GarlicMgr] Fixing zeroed param.sfo for %s/%s\n", tid, sname);
-                         /* Query savedata DB for full metadata */
-                         const char *sd = g_saves[idx].is_ps4 ? "savedata" : "savedata_prospero";
-                         char db_path[MAX_PATH_LEN];
-                         snprintf(db_path, sizeof(db_path),
-                                  "/system_data/%s/%s/db/user/savedata.db",
-                                  sd, g_saves[idx].user_id);
-                         sqlite3 *sdb = NULL;
-                         const char *db_title = NULL, *db_sub = NULL, *db_gtid = NULL;
-                         int64_t db_blocks = 96, db_aid = 0, db_sysblk = 0;
-                         uint32_t db_uid = 0;
-                         if (sqlite3_open_v2(db_path, &sdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
-                             sqlite3_stmt *st3 = NULL;
-                             const char *q = "SELECT main_title, sub_title, blocks, account_id, "
-                                             "system_blocks, user_id, game_title_id "
-                                             "FROM savedata WHERE title_id=? AND dir_name=? LIMIT 1";
-                             if (sqlite3_prepare_v2(sdb, q, -1, &st3, NULL) == SQLITE_OK) {
-                                 sqlite3_bind_text(st3, 1, tid, -1, SQLITE_STATIC);
-                                 sqlite3_bind_text(st3, 2, sname, -1, SQLITE_STATIC);
-                                 if (sqlite3_step(st3) == SQLITE_ROW) {
-                                     db_title  = (const char *)sqlite3_column_text(st3, 0);
-                                     db_sub    = (const char *)sqlite3_column_text(st3, 1);
-                                     db_blocks = sqlite3_column_int64(st3, 2);
-                                     db_aid    = sqlite3_column_int64(st3, 3);
-                                     db_sysblk = sqlite3_column_int64(st3, 4);
-                                     db_uid    = (uint32_t)sqlite3_column_int64(st3, 5);
-                                     db_gtid   = (const char *)sqlite3_column_text(st3, 6);
-                                 }
-                             }
-                             /* Generate replacement SFO in temp file, read back */
-                             char tmp_sfo[128];
-                             snprintf(tmp_sfo, sizeof(tmp_sfo), "/data/save_files/_tmp_sfo_%d.bin", n);
-                             generate_sfo(tmp_sfo, tid, sname,
-                                          db_title ? db_title : tid,
-                                          db_sub ? db_sub : "",
-                                          (uint64_t)db_aid, (uint64_t)db_blocks,
-                                          (uint64_t)db_sysblk, db_uid,
-                                          db_gtid, g_saves[idx].is_ps4,
-                                          g_params_hmac_valid ? g_params_hmac : NULL);
-                             if (st3) sqlite3_finalize(st3);
-                             sqlite3_close(sdb);
-                             int sfd = open(tmp_sfo, O_RDONLY);
-                             if (sfd >= 0) {
-                                 struct stat st2;
-                                 if (fstat(sfd, &st2) == 0 && st2.st_size > 0) {
-                                     free(de->data);
-                                     de->size = st2.st_size;
-                                     de->data = malloc(de->size);
-                                     if (de->data) read(sfd, de->data, de->size);
-                                 }
-                                 close(sfd);
-                                 unlink(tmp_sfo);
-                             }
-                         }
+                         logprintf("[GarlicMgr] Zeroed param.sfo for %s/%s, leaving as-is\n", tid, sname);
                      }
                  }
  
