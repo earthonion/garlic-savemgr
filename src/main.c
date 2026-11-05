@@ -6827,9 +6827,10 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
  
              /* Resign (skip if SFO was zeroed) */
              uint64_t local_aid = 0;
+             const char *owner_warning = "";
              if (sfo_ret2 != -2) {
                  int owner_result = patch_import_sfo_owner(sfo_path, sfo.account_id, uid_hex, uid, g_enc_ps4, &local_aid);
-                 const char *owner_warning = import_owner_warning(owner_result);
+                 owner_warning = import_owner_warning(owner_result);
                  if (owner_warning[0]) logprintf("[GarlicMgr] WARNING: %s\n", owner_warning);
                  printf("[GarlicMgr] import: resigned aid=%016llX uid=0x%x\n",
                         (unsigned long long)local_aid, uid);
@@ -7159,11 +7160,12 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
  
          /* Resign param.sfo (skip if SFO was zeroed) */
          uint64_t local_aid = 0;
+         const char *owner_warning = "";
          char pfs_sfo[MAX_PATH_LEN];
          snprintf(pfs_sfo, sizeof(pfs_sfo), "%s/sce_sys/param.sfo", g_mount_point);
          if (sfo_ret != -2) {
              int owner_result = patch_import_sfo_owner(pfs_sfo, sfo.account_id, uid_hex, uid, is_ps4, &local_aid);
-             const char *owner_warning = import_owner_warning(owner_result);
+             owner_warning = import_owner_warning(owner_result);
              if (owner_warning[0]) logprintf("[GarlicMgr] WARNING: %s\n", owner_warning);
              printf("[GarlicMgr] import: resigned aid=%016llX uid=0x%x\n",
                     (unsigned long long)local_aid, uid);
