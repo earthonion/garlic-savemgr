@@ -5916,7 +5916,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              free(tar_data);
              http_json(sock, "{\"error\":\"Cannot create temp file\"}"); return;
          }
-         int ret = sceFsUfsAllocateSaveData(imgfd, img_size, 0, 0);
+         int ret = sceFsUfsAllocateSaveData(imgfd, img_size, 0x80, 0);
          if (ret < 0) {
              printf("[GarlicMgr] UfsAllocate failed (0x%x), using ftruncate\n", ret);
              if (ftruncate(imgfd, img_size) < 0) {
@@ -5931,7 +5931,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          CreateOpt copt;
          memset(&copt, 0, sizeof(copt));
          sceFsInitCreatePfsSaveDataOpt(&copt);
-         copt.flags[1] = 0x02;
+         /* flags[1] left 0: no compression, matches native PS5 geometry */
          uint8_t ckey[0x20] = {0};
          if (!g_pprCreate) {
              free(tar_data); unlink(tmp);
@@ -6328,7 +6328,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          if (imgfd < 0) {
              http_json(sock, "{\"error\":\"Cannot create temp file\"}"); return;
          }
-         int ret = sceFsUfsAllocateSaveData(imgfd, img_size, 0, 0);
+         int ret = sceFsUfsAllocateSaveData(imgfd, img_size, 0x80, 0);
          if (ret < 0) {
              printf("[GarlicMgr] UfsAllocate failed (0x%x), using ftruncate\n", ret);
              if (ftruncate(imgfd, img_size) < 0) {
@@ -6348,7 +6348,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              ret = sceFsCreatePfsSaveDataImage(&copt, tmp, 0, img_size, ckey);
          } else {
              /* PS5: use PprCreate with zeroed key + compression flag */
-             copt.flags[1] = 0x02;
+             /* flags[1] left 0: no compression, matches native PS5 geometry */
              if (!g_pprCreate) {
                  unlink(tmp);
                  http_json(sock, "{\"error\":\"PprCreate not available\"}"); return;
@@ -7156,7 +7156,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          if (imgfd < 0) {
              http_json(sock, "{\"error\":\"Cannot create temp file\"}"); return;
          }
-         int ret = sceFsUfsAllocateSaveData(imgfd, img_size, 0, 0);
+         int ret = sceFsUfsAllocateSaveData(imgfd, img_size, 0x80, 0);
          if (ret < 0) {
              if (ftruncate(imgfd, img_size) < 0) {
                  close(imgfd); unlink(tmp);
@@ -7222,7 +7222,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              CreateOpt copt;
              memset(&copt, 0, sizeof(copt));
              sceFsInitCreatePfsSaveDataOpt(&copt);
-             copt.flags[1] = 0x02;
+             /* flags[1] left 0: no compression, matches native PS5 geometry */
              if (!g_pprCreate) {
                  unlink(tmp);
                  http_json(sock, "{\"error\":\"PprCreate not available\"}"); return;
