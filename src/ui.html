@@ -2115,21 +2115,26 @@ async function detectEncryptPlatform(files) {
   const count = view.getUint32(16, true);
   if (20 + count * 16 > keyOffset || keyOffset > dataOffset || dataOffset > bytes.length) invalid();
   const decoder = new TextDecoder();
+  const fields = {};
   for (let i = 0; i < count; i++) {
     const entry = 20 + i * 16;
     const keyStart = keyOffset + view.getUint16(entry, true);
     const keyEnd = bytes.indexOf(0, keyStart);
     if (keyStart >= dataOffset || keyEnd < keyStart || keyEnd >= dataOffset) invalid();
-    if (decoder.decode(bytes.subarray(keyStart, keyEnd)) !== 'TITLE_ID') continue;
-    const start = dataOffset + view.getUint32(entry + 12, true);
-    const length = view.getUint32(entry + 4, true);
-    if (view.getUint16(entry + 2, true) !== 0x0204 || !length || start + length > bytes.length) invalid();
-    const titleId = decoder.decode(bytes.subarray(start, start + length)).replace(/\0.*$/s, '');
-    if (!/^(CUSA|PPSA)\d{5}$/.test(titleId))
-      throw new Error('param.sfo TITLE_ID must be CUSAxxxxx (PS4) or PPSAxxxxx (PS5)');
-    return {titleId, isPS4: titleId.startsWith('CUSA')};
+    const keyName = decoder.decode(bytes.subarray(keyStart, keyEnd));
+    const dStart = dataOffset + view.getUint32(entry + 12, true);
+    const dLen = view.getUint32(entry + 4, true);
+    if (keyName === 'TITLE_ID') {
+      if (view.getUint16(entry + 2, true) !== 0x0204 || !dLen || dStart + dLen > bytes.length) invalid();
+      fields.titleId = decoder.decode(bytes.subarray(dStart, dStart + dLen)).replace(/\0.*$/s, '');
+    } else if (keyName === 'SAVEDATA_BLOCKS') {
+      if (dStart + 4 <= bytes.length) fields.blocks = view.getUint32(dStart, true);
+    }
   }
-  throw new Error('param.sfo is missing TITLE_ID');
+  if (!fields.titleId) throw new Error('param.sfo is missing TITLE_ID');
+  if (!/^(CUSA|PPSA)\d{5}$/.test(fields.titleId))
+    throw new Error('param.sfo TITLE_ID must be CUSAxxxxx (PS4) or PPSAxxxxx (PS5)');
+  return {titleId: fields.titleId, isPS4: fields.titleId.startsWith('CUSA'), blocks: fields.blocks || 0};
 }
 
 async function encDrop(files, folderName, entries) {
@@ -2140,8 +2145,8 @@ async function encDrop(files, folderName, entries) {
 }
 
 async function encDropOne(files, folderName, aidv) {
-  const {titleId, isPS4} = await detectEncryptPlatform(files);
-  log('Detected ' + (isPS4 ? 'PS4' : 'PS5') + ' save: ' + titleId, 'ok');
+  const {titleId, isPS4, blocks} = await detectEncryptPlatform(files);
+  log('Detected ' + (isPS4 ? 'PS4' : 'PS5') + ' save: ' + titleId + (blocks ? ' (' + blocks + ' blocks)' : ''), 'ok');
   /* Calculate total size for PFS image sizing */
   let totalSize = 0;
   for (const f of files) totalSize += f.size;
@@ -2149,7 +2154,9 @@ async function encDropOne(files, folderName, aidv) {
   /* Step 1: create fresh PFS image and mount it */
   log('Creating ' + (isPS4 ? 'PS4' : 'PS5') + ' PFS image (' + fmtB(totalSize) + ' of files)...');
   $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + t('status.creating_pfs', 'Creating PFS image...') + '</div></div>';
-  let r = await fetch('/api/create_pfs?size=' + totalSize + (isPS4 ? '&ps4=1' : ''));
+  let pfsUrl = '/api/create_pfs?size=' + totalSize + (isPS4 ? '&ps4=1' : '');
+  if (blocks > 0) pfsUrl += '&blocks=' + blocks;
+  let r = await fetch(pfsUrl);
   let d = await r.json();
   if (d.error) throw new Error(d.error);
   log('PFS image created and mounted', 'ok');
@@ -2537,15 +2544,9 @@ async function importDrop(files, folderName, entries) {
 }
 
 async function importDropOne(files, folderName, isPS4 = false) {
-  /* Check for sce_sys/param.sfo in the dropped files */
-  let hasSfo = false;
-  for (const f of files) {
-    const p = f._path || f.webkitRelativePath || f.name;
-    if (p.match(/sce_sys\/param\.sfo$/i)) { hasSfo = true; break; }
-  }
-  if (!hasSfo) {
-    throw new Error('Folder must contain sce_sys/param.sfo');
-  }
+  const detected = await detectEncryptPlatform(files);
+  isPS4 = detected.isPS4;
+  const blocks = detected.blocks;
 
   /* Calculate total size */
   let totalSize = 0;
@@ -2554,7 +2555,9 @@ async function importDropOne(files, folderName, isPS4 = false) {
   /* Step 1: create PFS image */
   log('Creating PFS image for import (' + fmtB(totalSize) + ' of files)...');
   renderImportStage(t('status.creating_pfs', 'Creating PFS image...'), 'Preparing the save for your console.');
-  let r = await fetch('/api/create_pfs?size=' + totalSize + (isPS4 ? '&ps4=1' : ''));
+  let pfsUrl = '/api/create_pfs?size=' + totalSize + (isPS4 ? '&ps4=1' : '');
+  if (blocks > 0) pfsUrl += '&blocks=' + blocks;
+  let r = await fetch(pfsUrl);
   let d = await r.json();
   if (d.error) throw new Error(d.error);
   log('PFS image created and mounted', 'ok');
