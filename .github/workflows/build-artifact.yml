@@ -46,6 +46,7 @@ jobs:
         with:
           name: garlic-savemgr
           path: garlic-savemgr.elf
+        continue-on-error: true
 
       - name: Create release (on tag push only)
         if: ${{ startsWith(github.ref, 'refs/tags/') }}
