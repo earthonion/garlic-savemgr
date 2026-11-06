@@ -45,6 +45,8 @@
  /* sceFsCreatePprPfsSaveDataImage - loaded via dlsym at runtime */
  typedef int (*PprCreateFn)(CreateOpt *opt, const char *path, int x, uint64_t size, uint8_t *key);
  static PprCreateFn g_pprCreate = NULL;
+ int sceFsTransactionSaveDataReadParam(const char *path, void *buf, uint32_t size);
+ int sceFsTransactionSaveDataWriteParam(const char *path, const void *buf, uint32_t size);
  int sceFsUfsAllocateSaveData(int fd, uint64_t size, uint64_t flags, int ext);
  
  int sceUserServiceInitialize(void*);
@@ -133,6 +135,7 @@
      return &g_saves[g_save_count++];
  }
  static char g_mounted_path[MAX_PATH_LEN] = {0};
+ static char g_decrypt_image_path[MAX_PATH_LEN] = {0};
  static char g_mount_point[MAX_PATH_LEN] = {0};
  static int g_mounted = 0;
  static int g_mounted_idx = -1;
@@ -1569,22 +1572,11 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
   * PS5 (ppr) saves keep the real param.sfo in an encrypted 0x8000-byte blob
   * in the image header at 0xC00; the in-PFS sce_sys/param.sfo is only a
   * 3072-byte zero placeholder.  The kernel exposes the blob through
-  * /dev/pfsctl (pfs_param_read_nm / pfs_param_write_nm), which decrypts it
+  * sceFsTransactionSaveDataReadParam/WriteParam, which decrypts/encrypts it
   * with the save's sealed key via SBL and verifies/regenerates the ICV.
   * Blob layout: 'PS5PARAM' u64 | u32 ver=0 | u32 sfo_size | u32 sfo_off=20 | SFO
   */
- #define PFSCTL_PARAM_READ    0xC0189111u
- #define PFSCTL_PARAM_WRITE   0x80189112u
- #define PFSCTL_PARAM_READ2   0xC0209116u   /* newer pair (uses *out) */
- #define PFSCTL_PARAM_WRITE2  0x80209118u
 
- typedef struct {
-     const char *path;
-     void *buf;
-     uint32_t size;
-     uint32_t pad;
-     uint64_t *out;
- } pfs_param_arg_t;
 
  static void ps5param_elevate(void) {
      kernel_set_ucred_authid(getpid(), 0x4800000000000010ULL);
@@ -1595,119 +1587,7 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      setuid(0);
  }
 
- /* Which /dev node serves the param ioctls is not certain on every firmware,
-  * so probe a list of candidates and cache the first one that answers a read
-  * with a valid PS5PARAM blob (or accepts a write).  Every open() errno and
-  * ioctl result is logged once, and /dev entries containing "pfs" are listed
-  * once so the real node can be identified from the console log. */
- static const char *g_param_devs[] = {
-     "/dev/pfsctl", "/dev/pfsmgr", "/dev/devpfs.ctl", "/dev/pfs", "/dev/pfsctldev", NULL
- };
- static int g_param_dev_idx = -1;                 /* cached winner */
- static unsigned g_param_cmd_cached = 0;          /* cached winning read cmd */
- static unsigned g_param_wcmd_cached = 0;         /* cached winning write cmd */
- static int g_param_logged_open[8];
- static int g_param_scanned = 0;
 
- static void ps5param_scan_dev(void) {
-     if (g_param_scanned) return;
-     g_param_scanned = 1;
-     DIR *d = opendir("/dev");
-     if (!d) { logprintf("[GarlicMgr] PS5PARAM: opendir(/dev) failed errno=%d\n", errno); return; }
-     struct dirent *e;
-     char line[768]; line[0] = 0;
-     size_t len = 0;
-     while ((e = readdir(d)) != NULL) {
-         if (!strstr(e->d_name, "pfs") && !strstr(e->d_name, "PFS")) continue;
-         int n = snprintf(line + len, sizeof(line) - len, " %s", e->d_name);
-         if (n < 0 || (size_t)n >= sizeof(line) - len) break;
-         len += (size_t)n;
-     }
-     closedir(d);
-     logprintf("[GarlicMgr] PS5PARAM: /dev nodes matching 'pfs':%s\n", len ? line : " (none)");
- }
-
- static int ps5param_blob_magic_ok(const uint8_t *blob) {
-     uint64_t m;
-     memcpy(&m, blob, 8);
-     return m == 0x4D41524150355350ULL;
- }
-
- /* /dev param ioctl.  wr=0 reads the decrypted blob, wr=1 writes it.
-  * Returns 0 on success (for reads: ioctl succeeded; caller checks magic),
-  * or -errno.  Reads only "win" (cache the device) on a valid PS5PARAM magic;
-  * a node that answers with an empty buffer is remembered as a soft success
-  * and returned only if no other node/command produces a real blob. */
- static int ps5param_ioctl(const char *img, uint8_t *blob, uint32_t size, int wr) {
-     ps5param_scan_dev();
-     unsigned cmds[2];
-     if (wr) { cmds[0] = PFSCTL_PARAM_WRITE;  cmds[1] = PFSCTL_PARAM_WRITE2; }
-     else    { cmds[0] = PFSCTL_PARAM_READ;   cmds[1] = PFSCTL_PARAM_READ2; }
-
-     int soft_ok = 0;                 /* read ioctl succeeded but blob empty */
-     int last_errno = 0, any_open = 0;
-     int ndev = 0;
-     while (g_param_devs[ndev]) ndev++;
-
-     for (int k = 0; k < ndev; k++) {
-         int di = (g_param_dev_idx >= 0) ? ((g_param_dev_idx + k) % ndev) : k;
-         /* /dev/pfsctldev is created with mode 0400 (S_IRUSR): O_RDWR hits
-          * EACCES even as uid 0 on PS5's prison-restricted kernel.  Try
-          * O_RDONLY first — ioctl() works regardless of open mode — then
-          * fall back to O_RDWR in case another node needs it. */
-         int fd = open(g_param_devs[di], O_RDONLY);
-         if (fd < 0 && errno == EACCES)
-             fd = open(g_param_devs[di], O_RDWR);
-         if (fd < 0) {
-             int oe = errno;
-             if (!g_param_logged_open[di]) {
-                 g_param_logged_open[di] = 1;
-                 logprintf("[GarlicMgr] PS5PARAM: open(%s) failed errno=%d\n", g_param_devs[di], oe);
-             }
-             if (!last_errno) last_errno = oe;
-             continue;
-         }
-         any_open = 1;
-         if (!g_param_logged_open[di]) {
-             g_param_logged_open[di] = 1;
-             logprintf("[GarlicMgr] PS5PARAM: open(%s) OK\n", g_param_devs[di]);
-         }
-         for (int ci = 0; ci < 2; ci++) {
-             unsigned cmd = cmds[ci];
-             uint64_t out = 0;
-             pfs_param_arg_t a;
-             memset(&a, 0, sizeof(a));
-             a.path = img; a.buf = blob; a.size = size; a.out = &out;
-             if (!wr) memset(blob, 0, size);
-             errno = 0;
-             int r = ioctl(fd, cmd, &a);
-             int ie = errno;
-             logprintf("[GarlicMgr] PS5PARAM: %s %s cmd=%08x ret=%d errno=%d\n",
-                       g_param_devs[di], wr ? "write" : "read", cmd, r, r < 0 ? ie : 0);
-             if (r < 0) { last_errno = ie ? ie : EIO; continue; }
-             if (wr) {
-                 close(fd);
-                 g_param_dev_idx = di; g_param_wcmd_cached = cmd;
-                 return 0;
-             }
-             if (ps5param_blob_magic_ok(blob)) {
-                 close(fd);
-                 g_param_dev_idx = di; g_param_cmd_cached = cmd;
-                 return 0;
-             }
-             logprintf("[GarlicMgr] PS5PARAM: %s accepted read but no PS5PARAM magic "
-                       "(first 16: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x)\n",
-                       g_param_devs[di],
-                       blob[0],blob[1],blob[2],blob[3],blob[4],blob[5],blob[6],blob[7],
-                       blob[8],blob[9],blob[10],blob[11],blob[12],blob[13],blob[14],blob[15]);
-             soft_ok = 1;
-         }
-         close(fd);
-     }
-     if (soft_ok) { memset(blob, 0, size); return 0; }   /* "no blob" */
-     if (!any_open) logprintf("[GarlicMgr] PS5PARAM: no candidate /dev node could be opened\n");
-     return -(last_errno ? last_errno : EIO);
- }
 
  /* Fresh PprCreate images may leave the blob-mode field at 0, which makes the
   * kernel param ioctls return ENOTSUP.  Set it to 0x60 (PS5 blob present) so
@@ -1749,7 +1629,7 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      static uint8_t blob[0x8000];
      memset(blob, 0, sizeof(blob));
      ps5param_elevate();
-     int r = ps5param_ioctl(img, blob, sizeof(blob), 0);
+     int r = sceFsTransactionSaveDataReadParam(img, blob, sizeof(blob));
      if (r < 0) return r;
 
      uint64_t magic;
@@ -1796,46 +1676,73 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
 
      ps5param_elevate();
      uint64_t saved_mode = 0;
-     int r = ps5param_ioctl(img, blob, sizeof(blob), 1);
+     int r = sceFsTransactionSaveDataWriteParam(img, blob, sizeof(blob));
      if (r < 0) {
          int en = ps5param_enable_blob_mode(img, &saved_mode);
          if (en == 1) {
              logprintf("[GarlicMgr] PS5PARAM: retrying blob write after enabling mode\n");
-             r = ps5param_ioctl(img, blob, sizeof(blob), 1);
-         }
-     }
-     if (r < 0) {
-         /* pwrite blob to disk, then retry ioctl to regenerate ICV */
-         logprintf("[GarlicMgr] PS5PARAM: writing blob to file, retrying ioctl for ICV\n");
-         int fd = open(img, O_RDWR);
-         if (fd >= 0) {
-             pwrite(fd, blob, sizeof(blob), 0xC00);
-             fsync(fd);
-             close(fd);
-             r = ps5param_ioctl(img, blob, sizeof(blob), 1);
-         }
-         if (r < 0) {
-             logprintf("[GarlicMgr] PS5PARAM: ioctl still fails (%d), rolling back header\n", r);
-             fd = open(img, O_RDWR);
-             if (fd >= 0) {
-                 pwrite(fd, &saved_mode, 8, 0x368);
-                 static uint8_t zbuf[0x8000];
-                 memset(zbuf, 0, sizeof(zbuf));
-                 pwrite(fd, zbuf, sizeof(zbuf), 0xC00);
-                 fsync(fd);
-                 close(fd);
+             r = sceFsTransactionSaveDataWriteParam(img, blob, sizeof(blob));
+             if (r < 0) {
+                 int fd = open(img, O_RDWR);
+                 if (fd >= 0) {
+                     pwrite(fd, &saved_mode, 8, 0x368);
+                     close(fd);
+                 }
              }
          }
      }
-     if (r == 0) {
-         int fd = open(img, O_RDWR);
-         if (fd >= 0) {
-             pwrite(fd, blob, sizeof(blob), 0xC00);
-             fsync(fd);
-             close(fd);
-         }
-     }
      return r;
+ }
+
+ static int sfo_all_zero_file(const char *path) {
+     int fd = open(path, O_RDONLY);
+     if (fd < 0) return 0;
+     uint8_t buf[4096];
+     ssize_t nr;
+     int zero = 1;
+     while ((nr = read(fd, buf, sizeof(buf))) > 0) {
+         for (ssize_t i = 0; i < nr; i++) {
+             if (buf[i]) { zero = 0; break; }
+         }
+         if (!zero) break;
+     }
+     close(fd);
+     return zero;
+ }
+
+ static int ps5param_export_blob(const char *img, const char *dest) {
+     static uint8_t blob[0x8000];
+     int sfd = open(img, O_RDONLY);
+     if (sfd < 0) return -1;
+     ssize_t nr = pread(sfd, blob, sizeof(blob), 0xC00);
+     close(sfd);
+     if (nr != (ssize_t)sizeof(blob)) return -1;
+     int nonzero = 0;
+     for (size_t i = 0; i < sizeof(blob); i++) {
+         if (blob[i]) { nonzero = 1; break; }
+     }
+     if (!nonzero) return -2;
+     int dfd = open(dest, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+     if (dfd < 0) return -1;
+     ssize_t nw = write(dfd, blob, sizeof(blob));
+     fsync(dfd);
+     close(dfd);
+     return nw == (ssize_t)sizeof(blob) ? 0 : -1;
+ }
+
+ static int ps5param_restore_blob(const char *img, const char *sidecar) {
+     static uint8_t blob[0x8000];
+     int sfd = open(sidecar, O_RDONLY);
+     if (sfd < 0) return -1;
+     ssize_t nr = read(sfd, blob, sizeof(blob));
+     close(sfd);
+     if (nr != (ssize_t)sizeof(blob)) return -1;
+     int dfd = open(img, O_RDWR);
+     if (dfd < 0) return -1;
+     ssize_t nw = pwrite(dfd, blob, sizeof(blob), 0xC00);
+     fsync(dfd);
+     close(dfd);
+     return nw == (ssize_t)sizeof(blob) ? 0 : -1;
  }
 
  /* Read the blob before mounting: avoids racing the active PFS mount and
@@ -2940,23 +2847,13 @@ static void compute_params_hmac(const uint8_t open_psid[16]) {
  
          char fullpath[MAX_PATH_LEN];
          snprintf(fullpath, sizeof(fullpath), "%s/%s", base, e->name);
-         int fd = -1;
+         int fd = open(fullpath, O_RDONLY);
          uint8_t *fdata = NULL;
-         /* Replace the zeroed in-PFS placeholder with the real metadata from
-          * the PS5PARAM blob so downloads are usable. */
-         if (strcmp(e->name, "sce_sys/param.sfo") == 0 &&
-             sfo_bytes_valid(g_mount_real_sfo, g_mount_real_sfo_len)) {
-             e->size = g_mount_real_sfo_len;
+         if (fd >= 0 && e->size > 0) {
              fdata = malloc(e->size);
-             if (fdata) memcpy(fdata, g_mount_real_sfo, e->size);
-         } else {
-             fd = open(fullpath, O_RDONLY);
-             if (fd >= 0 && e->size > 0) {
-                 fdata = malloc(e->size);
-                 if (fdata) { ssize_t r = read(fd, fdata, e->size); (void)r; }
-                 close(fd);
-             } else if (fd >= 0) { close(fd); }
-         }
+             if (fdata) { ssize_t r = read(fd, fdata, e->size); (void)r; }
+             close(fd);
+         } else if (fd >= 0) { close(fd); }
          e->crc = fdata ? calc_crc(fdata, e->size) : 0;
  
          uint8_t lh[30]; memset(lh, 0, 30);
@@ -4019,6 +3916,58 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
      return 0;
  }
  
+ static int zip_ps5_key(const uint8_t *data, size_t len, uint8_t key[0x60]) {
+     size_t off = 0;
+     while (off + 30 <= len) {
+         if (data[off] != 0x50 || data[off+1] != 0x4b ||
+             data[off+2] != 0x03 || data[off+3] != 0x04) break;
+         uint16_t compression = 0, name_len = 0, extra_len = 0;
+         uint32_t comp_size = 0, uncomp_size = 0;
+         memcpy(&compression, data + off + 8, 2);
+         memcpy(&comp_size, data + off + 18, 4);
+         memcpy(&uncomp_size, data + off + 22, 4);
+         memcpy(&name_len, data + off + 26, 2);
+         memcpy(&extra_len, data + off + 28, 2);
+         char name[MAX_PATH_LEN] = {0};
+         uint16_t copy_len = name_len < MAX_PATH_LEN - 1 ? name_len : (uint16_t)(MAX_PATH_LEN - 1);
+         memcpy(name, data + off + 30, copy_len);
+         off += 30 + name_len + extra_len;
+         if (strcmp(name, "PS5KEY") == 0 && compression == 0 && uncomp_size == 0x20) {
+             memcpy(key, data + off, 0x20);
+             return 1;
+         }
+         off += comp_size;
+     }
+     return 0;
+ }
+
+ static uint64_t zip_original_image_size(const uint8_t *data, size_t len) {
+     size_t off = 0;
+     while (off + 30 <= len) {
+         if (data[off] != 0x50 || data[off+1] != 0x4b ||
+             data[off+2] != 0x03 || data[off+3] != 0x04) break;
+         uint16_t compression = 0, name_len = 0, extra_len = 0;
+         uint32_t comp_size = 0, uncomp_size = 0;
+         memcpy(&compression, data + off + 8, 2);
+         memcpy(&comp_size, data + off + 18, 4);
+         memcpy(&uncomp_size, data + off + 22, 4);
+         memcpy(&name_len, data + off + 26, 2);
+         memcpy(&extra_len, data + off + 28, 2);
+         char name[MAX_PATH_LEN] = {0};
+         uint16_t copy_len = name_len < MAX_PATH_LEN - 1 ? name_len : (uint16_t)(MAX_PATH_LEN - 1);
+         memcpy(name, data + off + 30, copy_len);
+         off += 30 + name_len + extra_len;
+         if (strcmp(name, "PS5PARAM_SIZE") == 0 && compression == 0 && uncomp_size < 32) {
+             char text[32] = {0};
+             memcpy(text, data + off, uncomp_size);
+             uint64_t size = strtoull(text, NULL, 10);
+             return size >= 0x10000 && size <= (1ULL << 40) ? size : 0;
+         }
+         off += comp_size;
+     }
+     return 0;
+ }
+
  /* ── Zip extraction (upload) ────────────────────────────────────── */
  static int extract_zip(const char *dest, const uint8_t *data, size_t len) {
      size_t off = 0;
@@ -4047,7 +3996,31 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              continue;
          }
  
-         if (name[0] && name[strlen(name)-1] == '/') {
+         if (strcmp(name, "PS5PARAM") == 0) {
+            int fd = open("/data/save_files/_ps5param_sidecar", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+            if (fd >= 0) {
+                size_t to_write = uncomp_size;
+                if (off + to_write > len) to_write = len - off;
+                write(fd, data + off, to_write);
+                close(fd);
+            }
+        } else if (strcmp(name, "PS5PARAM_SIZE") == 0) {
+            int fd = open("/data/save_files/_ps5param_size", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+            if (fd >= 0) {
+                size_t to_write = uncomp_size;
+                if (off + to_write > len) to_write = len - off;
+                write(fd, data + off, to_write);
+                close(fd);
+            }
+        } else if (strcmp(name, "PS5KEY") == 0) {
+            int fd = open("/data/save_files/_ps5key", O_CREAT | O_WRONLY | O_TRUNC, 0600);
+            if (fd >= 0) {
+                size_t to_write = uncomp_size;
+                if (off + to_write > len) to_write = len - off;
+                write(fd, data + off, to_write);
+                close(fd);
+            }
+        } else if (name[0] && name[strlen(name)-1] == '/') {
              char dirpath[MAX_PATH_LEN];
              snprintf(dirpath, sizeof(dirpath), "%s/%s", dest, name);
              mkdir(dirpath, 0777);
@@ -5760,7 +5733,57 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              "Connection: close\r\n"
              "\r\n");
          send(sock, hdr, hlen, 0);
-         zip_send(sock, g_mount_point);
+         char sidecar[MAX_PATH_LEN];
+        snprintf(sidecar, sizeof(sidecar), "%s/PS5PARAM", g_mount_point);
+        int preserve = 0;
+        char mounted_sfo[MAX_PATH_LEN];
+        snprintf(mounted_sfo, sizeof(mounted_sfo), "%s/sce_sys/param.sfo", g_mount_point);
+        if (ps5param_export_blob(g_mounted_path, sidecar) == 0) {
+            preserve = 1;
+            struct stat image_st;
+            if (stat(g_mounted_path, &image_st) == 0) {
+                char size_path[MAX_PATH_LEN];
+                snprintf(size_path, sizeof(size_path), "%s/PS5PARAM_SIZE", g_mount_point);
+                int sfd = open(size_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+                if (sfd >= 0) {
+                    char size_text[32];
+                    int size_len = snprintf(size_text, sizeof(size_text), "%llu",
+                                            (unsigned long long)image_st.st_size);
+                    write(sfd, size_text, size_len);
+                    close(sfd);
+                }
+            }
+        }
+        if (preserve) {
+            uint8_t key_data[0x60];
+            int kfd = open(g_mounted_path, O_RDONLY);
+            if (kfd >= 0 && pread(kfd, key_data, sizeof(key_data), 0x800) == sizeof(key_data)) {
+                int pfsmgr = open("/dev/pfsmgr", O_RDWR);
+                if (pfsmgr >= 0) {
+                    if (ioctl(pfsmgr, 0xc0845302, key_data) >= 0) {
+                        char key_path[MAX_PATH_LEN];
+                        snprintf(key_path, sizeof(key_path), "%s/PS5KEY", g_mount_point);
+                        int out = open(key_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+                        if (out >= 0) {
+                            write(out, key_data + 0x60, 0x20);
+                            close(out);
+                        }
+                    }
+                    close(pfsmgr);
+                }
+            }
+            if (kfd >= 0) close(kfd);
+        }
+        zip_send(sock, g_mount_point);
+        if (preserve) {
+            unlink(sidecar);
+            char size_path[MAX_PATH_LEN];
+            snprintf(size_path, sizeof(size_path), "%s/PS5PARAM_SIZE", g_mount_point);
+            unlink(size_path);
+            char key_path[MAX_PATH_LEN];
+            snprintf(key_path, sizeof(key_path), "%s/PS5KEY", g_mount_point);
+            unlink(key_path);
+        }
          return;
      }
  
@@ -6236,6 +6259,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          mkdir("/data/save_files", 0777);
          int is_ps4_dec = (strstr(url, "ps4=1") != NULL);
          const char *tmp = is_ps4_dec ? "/data/save_files/sdimg__tmp_dec" : "/data/save_files/_tmp_dec";
+         snprintf(g_decrypt_image_path, sizeof(g_decrypt_image_path), "%s", tmp);
          int fd = open(tmp, O_CREAT | O_WRONLY | O_TRUNC, 0755);
          if (fd < 0) { http_json(sock, "{\"error\":\"Cannot create temp file\"}"); return; }
          if (body_in_buf > clen) body_in_buf = clen;
@@ -6269,13 +6293,15 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          char sfo_path[MAX_PATH_LEN], json[256];
          sfo_info_t sfo;
          snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
-         /* PS5: restore real metadata from the header blob (in-PFS is zeroed) */
+         /* System-save promotion requires the zeroed in-PFS SFO. Use PS5PARAM
+          * for display without modifying the mounted image. */
          if (!is_ps4_dec && g_mount_real_sfo_len &&
              sfo_bytes_valid(g_mount_real_sfo, g_mount_real_sfo_len)) {
-             if (install_sfo_file(sfo_path, g_mount_real_sfo, g_mount_real_sfo_len) == 0)
-                 cache_params_hmac_mem(g_mount_real_sfo, g_mount_real_sfo_len);
+             parse_sfo_mem(g_mount_real_sfo, g_mount_real_sfo_len, &sfo);
+             cache_params_hmac_mem(g_mount_real_sfo, g_mount_real_sfo_len);
+         } else {
+             parse_sfo(sfo_path, &sfo);
          }
-         parse_sfo(sfo_path, &sfo);
          /* Only include a safe title ID; missing/zeroed SFOs can still be downloaded. */
          if (strlen(sfo.title_id) != 9 ||
              (strncmp(sfo.title_id, "CUSA", 4) != 0 && strncmp(sfo.title_id, "PPSA", 4) != 0) ||
@@ -6445,6 +6471,42 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          if (img_size < 32 * 1024 * 1024)
              img_size = 32 * 1024 * 1024;
          img_size = ((img_size + 32767) / 32768) * 32768;
+         uint64_t preserved_size = zip_original_image_size(tar_data, received);
+         if (preserved_size) img_size = preserved_size;
+
+         int ret = 0;
+        uint8_t ckey[0x20] = {0};
+        int has_ps5_key = zip_ps5_key(tar_data, received, ckey);
+        if (preserved_size && !has_ps5_key) {
+            free(tar_data); unlink(tmp);
+            http_json(sock, "{\"error\":\"PS5PARAM preservation requires the original PS5KEY\"}");
+            return;
+        }
+        struct stat original_st;
+         int use_original = preserved_size &&
+             stat(g_decrypt_image_path, &original_st) == 0 &&
+             original_st.st_size == preserved_size;
+         if (use_original) {
+             if (g_mounted) unmount_save();
+             logprintf("[GarlicMgr] original PFS source=%s destination=%s\n", g_decrypt_image_path, tmp);
+            if (strcmp(g_decrypt_image_path, tmp) != 0 && copy_file(g_decrypt_image_path, tmp) < 0) {
+                 free(tar_data); unlink(tmp);
+                 http_json(sock, "{\"error\":\"Cannot copy original PFS image\"}");
+                 return;
+             }
+             ret = mount_by_path(tmp);
+             if (ret < 0) {
+                 free(tar_data); unlink(tmp);
+                 char json[128];
+                 snprintf(json, sizeof(json), "{\"error\":\"Mount original failed: 0x%x\"}", ret);
+                 http_json(sock, json);
+                 return;
+             }
+             snprintf(g_mounted_path, sizeof(g_mounted_path), "%s", tmp);
+             g_local_copy[0] = 0;
+             g_mounted = 1;
+             goto mount_ready;
+         }
  
          /* Step 1: Create file and allocate space (same as mkpfs) */
          int imgfd = open(tmp, O_CREAT | O_TRUNC | O_RDWR, 0777);
@@ -6452,7 +6514,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              free(tar_data);
              http_json(sock, "{\"error\":\"Cannot create temp file\"}"); return;
          }
-         int ret = sceFsUfsAllocateSaveData(imgfd, img_size, 0, 0);
+         ret = sceFsUfsAllocateSaveData(imgfd, img_size, 0, 0);
          if (ret < 0) {
              printf("[GarlicMgr] UfsAllocate failed (0x%x), using ftruncate\n", ret);
              if (ftruncate(imgfd, img_size) < 0) {
@@ -6467,8 +6529,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          CreateOpt copt;
          memset(&copt, 0, sizeof(copt));
          sceFsInitCreatePfsSaveDataOpt(&copt);
-         copt.flags[1] = 0x02;
-         uint8_t ckey[0x20] = {0};
+         copt.flags[1] = 0;
          if (!g_pprCreate) {
              free(tar_data); unlink(tmp);
              http_json(sock, "{\"error\":\"PprCreate not available\"}"); return;
@@ -6505,15 +6566,34 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          g_mounted = 1;
          printf("[GarlicMgr] Mounted new PFS (handle=%d)\n", ret);
  
-         /* Step 4: Extract zip into mounted PFS */
-         int files = extract_zip(g_mount_point, tar_data, received);
-         free(tar_data);
+         mount_ready:
+        /* Step 4: Extract zip into mounted PFS */
+         unlink("/data/save_files/_ps5param_sidecar");
+        int files = extract_zip(g_mount_point, tar_data, received);
+        free(tar_data);
+        int preserve_sidecar = 0;
+        int upload_zero_sfo = 0;
+        {
+            char root_sfo[MAX_PATH_LEN];
+            snprintf(root_sfo, sizeof(root_sfo), "%s/sce_sys/param.sfo", g_mount_point);
+            upload_zero_sfo = sfo_all_zero_file(root_sfo);
+            struct stat pst;
+            if (stat("/data/save_files/_ps5param_sidecar", &pst) == 0 &&
+                pst.st_size == 0x8000 && preserved_size) {
+                preserve_sidecar = 1;
+            }
+            if (upload_zero_sfo && !preserve_sidecar) {
+                unmount_save();
+                unlink(tmp);
+                http_json(sock, "{\"error\":\"Zeroed param.sfo requires its original PS5PARAM blob\"}");
+                return;
+            }
+        }
          sync();
          printf("[GarlicMgr] Extracted %d files for encrypt\n", files);
  
-         /* A decrypted save downloaded from a PS5 console carries the real
-          * param.sfo (recovered from the PS5PARAM blob).  Make sure it lands at
-          * the PFS root even if the zip is rooted at <title_id>/<save_name>/. */
+         /* If the upload contains a real SFO below a title/save directory,
+          * move it to the PFS root. Zeroed system-save SFOs stay untouched. */
          {
              char found_sfo[MAX_PATH_LEN];
              char root_sfo[MAX_PATH_LEN];
@@ -6543,6 +6623,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          /* Optional: patch account ID in param.sfo */
          char *ap = strstr(url, "aid=");
          if (ap) {
+            if (!upload_zero_sfo) preserve_sidecar = 0;
              char aid_hex[64] = {0};
              strncpy(aid_hex, ap + 4, sizeof(aid_hex) - 1);
              char *rp2 = aid_hex, *wp2 = aid_hex;
@@ -6591,7 +6672,15 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
           * fresh PprCreate image the kernel may return ENOTSUP (mode @0x368 is
           * still 0); in that case the real SFO just written into the PFS is
           * used as the fallback. */
-         if (enc_blob_sfo_len) {
+         if (preserve_sidecar) {
+            int wr = ps5param_restore_blob(tmp, "/data/save_files/_ps5param_sidecar");
+            if (wr < 0) {
+                unlink("/data/save_files/_ps5param_sidecar");
+                http_json(sock, "{\"error\":\"Failed to restore original PS5PARAM blob\"}");
+                return;
+            }
+            logprintf("[GarlicMgr] PS5PARAM: restored original encrypted blob for zeroed param.sfo\n");
+        } else if (enc_blob_sfo_len) {
              int wr = ps5param_write_sfo(tmp, enc_blob_sfo, enc_blob_sfo_len);
              if (wr < 0)
                  logprintf("[GarlicMgr] WARNING: PS5PARAM blob write failed (%d); "
@@ -6940,7 +7029,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              ret = sceFsCreatePfsSaveDataImage(&copt, tmp, 0, img_size, ckey);
          } else {
              /* PS5: use PprCreate with zeroed key + compression flag */
-             copt.flags[1] = 0x02;
+             copt.flags[1] = 0;
              if (!g_pprCreate) {
                  unlink(tmp);
                  http_json(sock, "{\"error\":\"PprCreate not available\"}"); return;
@@ -7868,7 +7957,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              CreateOpt copt;
              memset(&copt, 0, sizeof(copt));
              sceFsInitCreatePfsSaveDataOpt(&copt);
-             copt.flags[1] = 0x02;
+             copt.flags[1] = 0;
              if (!g_pprCreate) {
                  unlink(tmp);
                  http_json(sock, "{\"error\":\"PprCreate not available\"}"); return;
