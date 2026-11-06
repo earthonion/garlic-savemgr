@@ -6618,10 +6618,10 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                 has_ps5param_sidecar = 1;
                 preserve_sidecar = upload_zero_sfo;
             }
-            if (upload_zero_sfo && !preserve_sidecar) {
+            if (upload_zero_sfo && (!preserve_sidecar || !use_original)) {
                 unmount_save();
                 unlink(tmp);
-                http_json(sock, "{\"error\":\"Zeroed param.sfo requires its original PS5PARAM blob\"}");
+                http_json(sock, "{\"error\":\"Zeroed param.sfo requires a compatible original image, PS5PARAM blob and PS5KEY\"}");
                 return;
             }
         }

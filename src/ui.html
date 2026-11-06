@@ -2108,6 +2108,8 @@ async function detectEncryptPlatform(files) {
   });
   if (sfos.length !== 1) throw new Error('Folder must contain one sce_sys/param.sfo');
   const bytes = new Uint8Array(await sfos[0].arrayBuffer());
+  if (bytes.length > 0 && bytes.every(value => value === 0))
+    return {titleId: '', isPS4: false, blocks: 0, zeroed: true};
   const view = new DataView(bytes.buffer);
   const invalid = () => { throw new Error('Invalid param.sfo'); };
   if (bytes.length < 20 || view.getUint32(0, true) !== 0x46535000) invalid();
@@ -2144,8 +2146,66 @@ async function encDrop(files, folderName, entries) {
     (all, name) => encDropOne(all, name, aidv));
 }
 
+async function createStoredZip(files) {
+  const parts = [], central = [];
+  const encoder = new TextEncoder();
+  let offset = 0, centralSize = 0;
+  for (const file of files) {
+    const fullPath = (file._path || file.webkitRelativePath || file.name).replace(/\\/g, '/');
+    const pieces = fullPath.split('/');
+    const relativePath = pieces.length > 1 ? pieces.slice(1).join('/') : pieces[0];
+    const name = encoder.encode(relativePath);
+    const data = new Uint8Array(await file.arrayBuffer());
+    const crc = onlineCRC(data);
+    const local = new DataView(new ArrayBuffer(30));
+    local.setUint32(0, 0x04034b50, true);
+    local.setUint16(4, 20, true);
+    local.setUint16(6, 0x800, true);
+    local.setUint32(14, crc, true);
+    local.setUint32(18, data.length, true);
+    local.setUint32(22, data.length, true);
+    local.setUint16(26, name.length, true);
+    parts.push(local.buffer, name, data);
+
+    const entry = new DataView(new ArrayBuffer(46));
+    entry.setUint32(0, 0x02014b50, true);
+    entry.setUint16(4, 20, true);
+    entry.setUint16(6, 20, true);
+    entry.setUint16(8, 0x800, true);
+    entry.setUint32(16, crc, true);
+    entry.setUint32(20, data.length, true);
+    entry.setUint32(24, data.length, true);
+    entry.setUint16(28, name.length, true);
+    entry.setUint32(42, offset, true);
+    central.push(entry.buffer, name);
+    centralSize += 46 + name.length;
+    offset += 30 + name.length + data.length;
+  }
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true);
+  end.setUint16(8, files.length, true);
+  end.setUint16(10, files.length, true);
+  end.setUint32(12, centralSize, true);
+  end.setUint32(16, offset, true);
+  return new Blob([...parts, ...central, end.buffer], {type: 'application/zip'});
+}
+
+async function encDropZeroSfo(files, folderName) {
+  log('Detected PS5 zeroed param.sfo; preserving original PS5PARAM metadata', 'ok');
+  const zip = await createStoredZip(files);
+  const xhr = await upload('/api/encrypt_upload', zip, (loaded, total) => {
+    showProgress(Math.round(loaded * 100 / total), loaded, total);
+  });
+  const result = JSON.parse(xhr.responseText);
+  if (xhr.status !== 200 || !result.ok) throw new Error(result.error || 'Zero-SFO encryption failed');
+  const name = (folderName || 'encrypted_save') + '_enc';
+  await downloadSaveResult('/api/encrypt_download?name=' + encodeURIComponent(name), name);
+  log('Encrypted save download started', 'ok');
+}
+
 async function encDropOne(files, folderName, aidv) {
-  const {titleId, isPS4, blocks} = await detectEncryptPlatform(files);
+  const {titleId, isPS4, blocks, zeroed} = await detectEncryptPlatform(files);
+  if (zeroed) return encDropZeroSfo(files, folderName);
   log('Detected ' + (isPS4 ? 'PS4' : 'PS5') + ' save: ' + titleId + (blocks ? ' (' + blocks + ' blocks)' : ''), 'ok');
   /* Calculate total size for PFS image sizing */
   let totalSize = 0;
