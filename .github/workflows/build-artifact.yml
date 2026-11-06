@@ -25,8 +25,10 @@ jobs:
         # the unversioned `clang` meta-package isn't in the default apt
         # sources of catthehacker/ubuntu:act-latest.
         run: |
-          apt-get update -qq
-          apt-get install -y --no-install-recommends \
+          APT=apt-get
+          if [ "$(id -u)" -ne 0 ]; then APT="sudo apt-get"; fi
+          $APT update -qq
+          $APT install -y --no-install-recommends \
               xxd unzip ca-certificates curl \
               clang-18 llvm-18 lld-18
 
