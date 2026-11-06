@@ -1795,102 +1795,44 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      }
 
      ps5param_elevate();
+     uint64_t saved_mode = 0;
      int r = ps5param_ioctl(img, blob, sizeof(blob), 1);
      if (r < 0) {
-         uint64_t saved = 0;
-         int en = ps5param_enable_blob_mode(img, &saved);
+         int en = ps5param_enable_blob_mode(img, &saved_mode);
          if (en == 1) {
              logprintf("[GarlicMgr] PS5PARAM: retrying blob write after enabling mode\n");
              r = ps5param_ioctl(img, blob, sizeof(blob), 1);
-             if (r < 0) {
-                 /* Don't leave a half-configured image behind. */
-                 int fd = open(img, O_RDWR);
-                 if (fd >= 0) { pwrite(fd, &saved, 8, 0x368); close(fd); }
-             }
          }
      }
-     /* Even when ioctl succeeded, the kernel writes to its own buffer and
-      * may not flush to disk before our copy_file reads the image.
-      * Mirror the blob to offset 0xC00 with pwrite so the on-disk file
-      * is always up-to-date for any subsequent file copy. */
-     if (r == 0) {
-         logprintf("[GarlicMgr] PS5PARAM: ioctl OK, mirroring blob to file (magic=%02x%02x%02x%02x%02x%02x%02x%02x)\n",
-                   blob[0],blob[1],blob[2],blob[3],blob[4],blob[5],blob[6],blob[7]);
-         int fd = open(img, O_RDWR);
-         if (fd >= 0) {
-             ssize_t wr2 = pwrite(fd, blob, sizeof(blob), 0xC00);
-             fsync(fd);
-             close(fd);
-             if (wr2 == (ssize_t)sizeof(blob))
-                 logprintf("[GarlicMgr] PS5PARAM: mirrored blob to file at 0xC00 (0x%x bytes)\n",
-                           (unsigned)sizeof(blob));
-             else
-                 logprintf("[GarlicMgr] PS5PARAM: mirror pwrite failed (wrote %zd, errno=%d)\n",
-                           wr2, errno);
-         } else {
-             logprintf("[GarlicMgr] PS5PARAM: mirror open(%s) failed errno=%d\n", img, errno);
-         }
-     } else {
-         logprintf("[GarlicMgr] PS5PARAM: r=%d after ioctl block, skipping mirror\n", r);
-     }
-     /* Fallback: if the kernel ioctl failed, try writing the blob directly
-      * to offset 0xC00 and retrying the ioctl so the kernel updates the ICV.
-      * If the ioctl STILL fails after the direct write, roll everything back
-      * — a blob without a matching ICV makes the PS5 reject the save as
-      * corrupted.  In that case the SFO lives only inside the PFS (which is
-      * correct) and the save will load, though the list may show 0 KB. */
      if (r < 0) {
-         logprintf("[GarlicMgr] PS5PARAM: ioctl write failed (%d), trying direct file write at 0xC00\n", r);
+         /* pwrite blob to disk, then retry ioctl to regenerate ICV */
+         logprintf("[GarlicMgr] PS5PARAM: writing blob to file, retrying ioctl for ICV\n");
          int fd = open(img, O_RDWR);
          if (fd >= 0) {
-             /* Save the original 8 bytes at 0x368 and 0x8000 bytes at 0xC00
-              * so we can roll back if the ioctl still won't accept. */
-             uint8_t saved_mode[8];
-             pread(fd, saved_mode, 8, 0x368);
-             /* We don't save the whole 0x8000 blob area — instead we just
-              * won't claim success if ioctl doesn't follow. */
-
-             uint32_t mode32 = 0x60;
-             pwrite(fd, &mode32, 4, 0x368);
-             ssize_t wr = pwrite(fd, blob, sizeof(blob), 0xC00);
+             pwrite(fd, blob, sizeof(blob), 0xC00);
              fsync(fd);
              close(fd);
-             if (wr == (ssize_t)sizeof(blob)) {
-                 logprintf("[GarlicMgr] PS5PARAM: direct write OK (0x%x bytes at 0xC00)\n",
-                           (unsigned)sizeof(blob));
-                 /* Try ioctl once more — now that mode is 0x60 and fsynced,
-                  * the kernel may accept and also update the ICV. */
-                 int r2 = ps5param_ioctl(img, blob, sizeof(blob), 1);
-                 if (r2 == 0) {
-                     logprintf("[GarlicMgr] PS5PARAM: ioctl write succeeded after direct mode fix\n");
-                     r = 0;
-                 } else {
-                     logprintf("[GarlicMgr] PS5PARAM: ioctl still fails after direct write (%d), "
-                               "rolling back header to avoid ICV mismatch\n", r2);
-                     /* Roll back: restore original mode so we don't leave an
-                      * inconsistent blob+mode without a valid ICV. */
-                     fd = open(img, O_RDWR);
-                     if (fd >= 0) {
-                         pwrite(fd, saved_mode, 8, 0x368);
-                         /* Zero the blob area we wrote — the original was
-                          * likely empty/zeroed anyway for images where the
-                          * ioctl never works. */
-                         static uint8_t zbuf[0x8000];
-                         memset(zbuf, 0, sizeof(zbuf));
-                         pwrite(fd, zbuf, sizeof(zbuf), 0xC00);
-                         fsync(fd);
-                         close(fd);
-                         logprintf("[GarlicMgr] PS5PARAM: header rolled back (mode restored, blob zeroed)\n");
-                     }
-                     /* r stays negative — caller knows blob write failed */
-                 }
-             } else {
-                 logprintf("[GarlicMgr] PS5PARAM: direct write failed (wrote %zd, errno=%d)\n",
-                           wr, errno);
+             r = ps5param_ioctl(img, blob, sizeof(blob), 1);
+         }
+         if (r < 0) {
+             logprintf("[GarlicMgr] PS5PARAM: ioctl still fails (%d), rolling back header\n", r);
+             fd = open(img, O_RDWR);
+             if (fd >= 0) {
+                 pwrite(fd, &saved_mode, 8, 0x368);
+                 static uint8_t zbuf[0x8000];
+                 memset(zbuf, 0, sizeof(zbuf));
+                 pwrite(fd, zbuf, sizeof(zbuf), 0xC00);
+                 fsync(fd);
+                 close(fd);
              }
-         } else {
-             logprintf("[GarlicMgr] PS5PARAM: cannot open %s for direct write (errno=%d)\n",
-                       img, errno);
+         }
+     }
+     if (r == 0) {
+         int fd = open(img, O_RDWR);
+         if (fd >= 0) {
+             pwrite(fd, blob, sizeof(blob), 0xC00);
+             fsync(fd);
+             close(fd);
          }
      }
      return r;
