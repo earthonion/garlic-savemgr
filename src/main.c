@@ -2837,6 +2837,27 @@ static void compute_params_hmac(const uint8_t open_psid[16]) {
      closedir(d);
  }
  
+ static uint64_t zip_content_length(const char *base) {
+     zip_entry_t *entries = malloc(MAX_ZIP_ENTRIES * sizeof(zip_entry_t));
+     if (!entries) return 0;
+     int count = 0;
+     collect_files(base, "", entries, &count);
+     if (g_zip_extra_image && count < MAX_ZIP_ENTRIES) {
+         struct stat st;
+         if (stat(g_zip_extra_image, &st) == 0) {
+             zip_entry_t *e = &entries[count++];
+             snprintf(e->name, sizeof(e->name), "PS5IMAGE");
+             e->size = (uint32_t)st.st_size;
+         }
+     }
+     uint64_t total = 22;
+     for (int i = 0; i < count; i++)
+         total += 30 + strlen(entries[i].name) + entries[i].size +
+                  46 + strlen(entries[i].name);
+     free(entries);
+     return total;
+ }
+
  static void zip_send(int sock, const char *base) {
      zip_entry_t *entries = malloc(MAX_ZIP_ENTRIES * sizeof(zip_entry_t));
      if (!entries) return;
@@ -5809,14 +5830,6 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
      /* GET /api/download -> tar stream */
      if (strcmp(method, "GET") == 0 && strcmp(url, "/api/download") == 0) {
          if (!g_mounted) { http_json(sock, "{\"error\":\"No save mounted\"}"); return; }
-         char hdr[512];
-         int hlen = snprintf(hdr, sizeof(hdr),
-             "HTTP/1.1 200 OK\r\n"
-             "Content-Type: application/zip\r\n"
-             "Access-Control-Allow-Origin: *\r\n"
-             "Connection: close\r\n"
-             "\r\n");
-         send(sock, hdr, hlen, 0);
         char mounted_sfo[MAX_PATH_LEN];
         snprintf(mounted_sfo, sizeof(mounted_sfo), "%s/sce_sys/param.sfo", g_mount_point);
         int preserve = sfo_all_zero_file(mounted_sfo);
@@ -5857,6 +5870,16 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
             if (kfd >= 0) close(kfd);
             g_zip_extra_image = "/data/save_files/_ps5image_archive";
         }
+        uint64_t content_length = zip_content_length(g_mount_point);
+        char hdr[512];
+        int hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/zip\r\n"
+            "Content-Length: %llu\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n"
+            "\r\n", (unsigned long long)content_length);
+        send(sock, hdr, hlen, 0);
         zip_send(sock, g_mount_point);
         g_zip_extra_image = NULL;
         unlink("/data/save_files/_ps5image_archive");
