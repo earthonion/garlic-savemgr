@@ -3968,6 +3968,35 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
      return 0;
  }
 
+ static uint32_t zip_savedata_blocks(const uint8_t *data, size_t len) {
+     const char suffix[] = "sce_sys/param.sfo";
+     size_t suffix_len = sizeof(suffix) - 1;
+     size_t off = 0;
+     while (off + 30 <= len) {
+         if (data[off] != 0x50 || data[off+1] != 0x4b ||
+             data[off+2] != 0x03 || data[off+3] != 0x04) break;
+         uint16_t compression = 0, name_len = 0, extra_len = 0;
+         uint32_t comp_size = 0, uncomp_size = 0;
+         memcpy(&compression, data + off + 8, 2);
+         memcpy(&comp_size, data + off + 18, 4);
+         memcpy(&uncomp_size, data + off + 22, 4);
+         memcpy(&name_len, data + off + 26, 2);
+         memcpy(&extra_len, data + off + 28, 2);
+         char name[MAX_PATH_LEN] = {0};
+         uint16_t copy_len = name_len < MAX_PATH_LEN - 1 ? name_len : (uint16_t)(MAX_PATH_LEN - 1);
+         memcpy(name, data + off + 30, copy_len);
+         off += 30 + name_len + extra_len;
+         if (compression == 0 && name_len >= suffix_len &&
+             strcmp(name + name_len - suffix_len, suffix) == 0) {
+             sfo_info_t info;
+             if (parse_sfo_mem(data + off, uncomp_size, &info) == 0)
+                 return info.blocks;
+         }
+         off += comp_size;
+     }
+     return 0;
+ }
+
  /* ── Zip extraction (upload) ────────────────────────────────────── */
  static int extract_zip(const char *dest, const uint8_t *data, size_t len) {
      size_t off = 0;
@@ -6472,7 +6501,12 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              img_size = 32 * 1024 * 1024;
          img_size = ((img_size + 32767) / 32768) * 32768;
          uint64_t preserved_size = zip_original_image_size(tar_data, received);
-         if (preserved_size) img_size = preserved_size;
+         if (preserved_size) {
+             img_size = preserved_size;
+         } else {
+             uint32_t blocks = zip_savedata_blocks(tar_data, received);
+             if (blocks) img_size = (uint64_t)blocks * 65536;
+         }
 
          int ret = 0;
         uint8_t ckey[0x20] = {0};
