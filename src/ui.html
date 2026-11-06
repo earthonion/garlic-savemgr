@@ -2141,6 +2141,12 @@ async function detectEncryptPlatform(files) {
 
 async function encDrop(files, folderName, entries) {
   if (bsy) return;
+  if (!entries && files.length === 1 && /\.zip$/i.test(files[0].name)) {
+    const archive = files[0];
+    files = await extractOnlineZip(archive);
+    folderName = folderName || archive.name.replace(/\.zip$/i, '');
+    for (const file of files) file._path = folderName + '/' + file._path;
+  }
   const aidv = document.getElementById('eaid') ? document.getElementById('eaid').value.trim() : '';
   return runFolderSaves(files, folderName, entries, 'Encrypt',
     (all, name) => encDropOne(all, name, aidv));
