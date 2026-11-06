@@ -5733,13 +5733,13 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              "Connection: close\r\n"
              "\r\n");
          send(sock, hdr, hlen, 0);
-         char sidecar[MAX_PATH_LEN];
-        snprintf(sidecar, sizeof(sidecar), "%s/PS5PARAM", g_mount_point);
-        int preserve = 0;
         char mounted_sfo[MAX_PATH_LEN];
         snprintf(mounted_sfo, sizeof(mounted_sfo), "%s/sce_sys/param.sfo", g_mount_point);
-        if (ps5param_export_blob(g_mounted_path, sidecar) == 0) {
-            preserve = 1;
+        int preserve = sfo_all_zero_file(mounted_sfo);
+        if (preserve) {
+            char sidecar[MAX_PATH_LEN];
+            snprintf(sidecar, sizeof(sidecar), "%s/PS5PARAM", g_mount_point);
+            ps5param_export_blob(g_mounted_path, sidecar);
             struct stat image_st;
             if (stat(g_mounted_path, &image_st) == 0) {
                 char size_path[MAX_PATH_LEN];
@@ -5753,11 +5753,9 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                     close(sfd);
                 }
             }
-        }
-        if (preserve) {
-            uint8_t key_data[0x60];
+            uint8_t key_data[0x100] = {0};
             int kfd = open(g_mounted_path, O_RDONLY);
-            if (kfd >= 0 && pread(kfd, key_data, sizeof(key_data), 0x800) == sizeof(key_data)) {
+            if (kfd >= 0 && pread(kfd, key_data, 0x60, 0x800) == 0x60) {
                 int pfsmgr = open("/dev/pfsmgr", O_RDWR);
                 if (pfsmgr >= 0) {
                     if (ioctl(pfsmgr, 0xc0845302, key_data) >= 0) {
@@ -5776,6 +5774,8 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
         }
         zip_send(sock, g_mount_point);
         if (preserve) {
+            char sidecar[MAX_PATH_LEN];
+            snprintf(sidecar, sizeof(sidecar), "%s/PS5PARAM", g_mount_point);
             unlink(sidecar);
             char size_path[MAX_PATH_LEN];
             snprintf(size_path, sizeof(size_path), "%s/PS5PARAM_SIZE", g_mount_point);
@@ -6572,6 +6572,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
         int files = extract_zip(g_mount_point, tar_data, received);
         free(tar_data);
         int preserve_sidecar = 0;
+        int has_ps5param_sidecar = 0;
         int upload_zero_sfo = 0;
         {
             char root_sfo[MAX_PATH_LEN];
@@ -6580,7 +6581,8 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
             struct stat pst;
             if (stat("/data/save_files/_ps5param_sidecar", &pst) == 0 &&
                 pst.st_size == 0x8000 && preserved_size) {
-                preserve_sidecar = 1;
+                has_ps5param_sidecar = 1;
+                preserve_sidecar = upload_zero_sfo;
             }
             if (upload_zero_sfo && !preserve_sidecar) {
                 unmount_save();
@@ -6668,10 +6670,8 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
  
          unmount_save();
  
-         /* PS5: store the real param.sfo in the encrypted header blob.  On a
-          * fresh PprCreate image the kernel may return ENOTSUP (mode @0x368 is
-          * still 0); in that case the real SFO just written into the PFS is
-          * used as the fallback. */
+         /* Restore or update PS5PARAM only when the original save had one.
+          * Regular saves keep their metadata solely in the mounted PFS. */
          if (preserve_sidecar) {
             int wr = ps5param_restore_blob(tmp, "/data/save_files/_ps5param_sidecar");
             if (wr < 0) {
@@ -6680,7 +6680,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                 return;
             }
             logprintf("[GarlicMgr] PS5PARAM: restored original encrypted blob for zeroed param.sfo\n");
-        } else if (enc_blob_sfo_len) {
+        } else if (has_ps5param_sidecar && enc_blob_sfo_len) {
              int wr = ps5param_write_sfo(tmp, enc_blob_sfo, enc_blob_sfo_len);
              if (wr < 0)
                  logprintf("[GarlicMgr] WARNING: PS5PARAM blob write failed (%d); "
