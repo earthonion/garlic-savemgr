@@ -150,6 +150,7 @@
   * blob is the only copy of the real metadata. */
  static uint8_t g_mount_real_sfo[0x8000];
  static uint32_t g_mount_real_sfo_len = 0;
+ static const char *g_zip_extra_image = NULL;
  
  /* ── Server-side editor buffer ─────────────────────────────────── */
  static char  g_ed_name[512] = {0};   /* file path relative to mount */
@@ -2113,7 +2114,10 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      mopt.budgetid = "system";
  
      /* PS5: recover the real param.sfo from the header blob before mounting */
-     if (!is_ps4) ps5param_capture_for_image(path);
+     if (!is_ps4) {
+         ps5param_capture_for_image(path);
+         copy_file(path, "/data/save_files/_ps5image_archive");
+     }
 
      signal(SIGPIPE, SIG_DFL);
      int ret = sceFsMountSaveData(&mopt, path, mount_point, decrypted_key);
@@ -2838,6 +2842,16 @@ static void compute_params_hmac(const uint8_t open_psid[16]) {
      if (!entries) return;
      int count = 0;
      collect_files(base, "", entries, &count);
+     if (g_zip_extra_image && count < MAX_ZIP_ENTRIES) {
+         struct stat st;
+         if (stat(g_zip_extra_image, &st) == 0) {
+             zip_entry_t *e = &entries[count++];
+             snprintf(e->name, sizeof(e->name), "PS5IMAGE");
+             e->size = (uint32_t)st.st_size;
+             e->crc = 0;
+             e->offset = 0;
+         }
+     }
  
      uint32_t offset = 0;
      for (int i = 0; i < count; i++) {
@@ -2846,7 +2860,10 @@ static void compute_params_hmac(const uint8_t open_psid[16]) {
          uint16_t nlen = strlen(e->name);
  
          char fullpath[MAX_PATH_LEN];
-         snprintf(fullpath, sizeof(fullpath), "%s/%s", base, e->name);
+         if (strcmp(e->name, "PS5IMAGE") == 0 && g_zip_extra_image)
+             snprintf(fullpath, sizeof(fullpath), "%s", g_zip_extra_image);
+         else
+             snprintf(fullpath, sizeof(fullpath), "%s/%s", base, e->name);
          int fd = open(fullpath, O_RDONLY);
          uint8_t *fdata = NULL;
          if (fd >= 0 && e->size > 0) {
@@ -3968,6 +3985,36 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
      return 0;
  }
 
+ static int zip_ps5_image(const uint8_t *data, size_t len, const char *dest) {
+     size_t off = 0;
+     while (off + 30 <= len) {
+         if (data[off] != 0x50 || data[off+1] != 0x4b ||
+             data[off+2] != 0x03 || data[off+3] != 0x04) break;
+         uint16_t compression = 0, name_len = 0, extra_len = 0;
+         uint32_t comp_size = 0, uncomp_size = 0;
+         memcpy(&compression, data + off + 8, 2);
+         memcpy(&comp_size, data + off + 18, 4);
+         memcpy(&uncomp_size, data + off + 22, 4);
+         memcpy(&name_len, data + off + 26, 2);
+         memcpy(&extra_len, data + off + 28, 2);
+         char name[MAX_PATH_LEN] = {0};
+         uint16_t copy_len = name_len < MAX_PATH_LEN - 1 ? name_len : (uint16_t)(MAX_PATH_LEN - 1);
+         memcpy(name, data + off + 30, copy_len);
+         off += 30 + name_len + extra_len;
+         if (strcmp(name, "PS5IMAGE") == 0 && compression == 0 && uncomp_size > 0) {
+             int fd = open(dest, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+             if (fd < 0) return -1;
+             size_t to_write = uncomp_size;
+             if (off + to_write > len) to_write = len - off;
+             ssize_t written = write(fd, data + off, to_write);
+             close(fd);
+             return written == (ssize_t)to_write ? 1 : -1;
+         }
+         off += comp_size;
+     }
+     return 0;
+ }
+
  static uint32_t zip_savedata_blocks(const uint8_t *data, size_t len) {
      const char suffix[] = "sce_sys/param.sfo";
      size_t suffix_len = sizeof(suffix) - 1;
@@ -4043,6 +4090,14 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
             }
         } else if (strcmp(name, "PS5KEY") == 0) {
             int fd = open("/data/save_files/_ps5key", O_CREAT | O_WRONLY | O_TRUNC, 0600);
+            if (fd >= 0) {
+                size_t to_write = uncomp_size;
+                if (off + to_write > len) to_write = len - off;
+                write(fd, data + off, to_write);
+                close(fd);
+            }
+        } else if (strcmp(name, "PS5IMAGE") == 0) {
+            int fd = open("/data/save_files/_ps5image_sidecar", O_CREAT | O_WRONLY | O_TRUNC, 0644);
             if (fd >= 0) {
                 size_t to_write = uncomp_size;
                 if (off + to_write > len) to_write = len - off;
@@ -5800,8 +5855,11 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                 }
             }
             if (kfd >= 0) close(kfd);
+            g_zip_extra_image = "/data/save_files/_ps5image_archive";
         }
         zip_send(sock, g_mount_point);
+        g_zip_extra_image = NULL;
+        unlink("/data/save_files/_ps5image_archive");
         if (preserve) {
             char sidecar[MAX_PATH_LEN];
             snprintf(sidecar, sizeof(sidecar), "%s/PS5PARAM", g_mount_point);
@@ -6516,14 +6574,19 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
             http_json(sock, "{\"error\":\"PS5PARAM preservation requires the original PS5KEY\"}");
             return;
         }
+        const char *original_path = g_decrypt_image_path;
+        const char *uploaded_path = "/data/save_files/_ps5image_sidecar";
+        unlink(uploaded_path);
+        if (zip_ps5_image(tar_data, received, uploaded_path) == 1)
+            original_path = uploaded_path;
         struct stat original_st;
          int use_original = preserved_size &&
-             stat(g_decrypt_image_path, &original_st) == 0 &&
+             stat(original_path, &original_st) == 0 &&
              original_st.st_size == preserved_size;
          if (use_original) {
              if (g_mounted) unmount_save();
-             logprintf("[GarlicMgr] original PFS source=%s destination=%s\n", g_decrypt_image_path, tmp);
-            if (strcmp(g_decrypt_image_path, tmp) != 0 && copy_file(g_decrypt_image_path, tmp) < 0) {
+             logprintf("[GarlicMgr] original PFS source=%s destination=%s\n", original_path, tmp);
+            if (strcmp(original_path, tmp) != 0 && copy_file(original_path, tmp) < 0) {
                  free(tar_data); unlink(tmp);
                  http_json(sock, "{\"error\":\"Cannot copy original PFS image\"}");
                  return;
