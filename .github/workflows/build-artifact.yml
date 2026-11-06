@@ -55,6 +55,9 @@ jobs:
           set -eu
           TAG="${GITHUB_REF#refs/tags/}"
           API="${GITHUB_SERVER_URL}/api/v1/repos/${GITHUB_REPOSITORY}"
+          if [ "$GITHUB_SERVER_URL" = "https://github.com" ]; then
+              API="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          fi
 
           # Re-use existing release for the tag if present, else create one.
           REL_ID=$(curl -fsS -H "Authorization: token $TOKEN" \
@@ -76,6 +79,13 @@ jobs:
                   [ -n "$aid" ] && curl -fsS -X DELETE -H "Authorization: token $TOKEN" \
                       "$API/releases/$REL_ID/assets/$aid"
                 done
-          curl -fsS -X POST -H "Authorization: token $TOKEN" \
-              -F "attachment=@garlic-savemgr.elf" \
-              "$API/releases/$REL_ID/assets?name=garlic-savemgr.elf"
+          if [ "$GITHUB_SERVER_URL" = "https://github.com" ]; then
+              curl -fsS -X POST -H "Authorization: token $TOKEN" \
+                  -H "Content-Type: application/octet-stream" \
+                  --data-binary @garlic-savemgr.elf \
+                  "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/$REL_ID/assets?name=garlic-savemgr.elf"
+          else
+              curl -fsS -X POST -H "Authorization: token $TOKEN" \
+                  -F "attachment=@garlic-savemgr.elf" \
+                  "$API/releases/$REL_ID/assets?name=garlic-savemgr.elf"
+          fi
