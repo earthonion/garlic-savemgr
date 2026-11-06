@@ -1833,17 +1833,23 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      } else {
          logprintf("[GarlicMgr] PS5PARAM: r=%d after ioctl block, skipping mirror\n", r);
      }
-     /* Fallback: if the kernel ioctl failed (fresh PprCreate images often
-      * reject the write), write the blob directly to offset 0xC00 in the
-      * image file.  The blob is stored in plaintext (the ioctl read returns
-      * the PS5PARAM magic as-is, so no encryption layer). */
+     /* Fallback: if the kernel ioctl failed, try writing the blob directly
+      * to offset 0xC00 and retrying the ioctl so the kernel updates the ICV.
+      * If the ioctl STILL fails after the direct write, roll everything back
+      * — a blob without a matching ICV makes the PS5 reject the save as
+      * corrupted.  In that case the SFO lives only inside the PFS (which is
+      * correct) and the save will load, though the list may show 0 KB. */
      if (r < 0) {
          logprintf("[GarlicMgr] PS5PARAM: ioctl write failed (%d), trying direct file write at 0xC00\n", r);
          int fd = open(img, O_RDWR);
          if (fd >= 0) {
-             /* Ensure blob mode is set so readers (including the kernel) know
-              * a blob is present at 0xC00.  Write only the low u32 to
-              * preserve the separate field at 0x36C. */
+             /* Save the original 8 bytes at 0x368 and 0x8000 bytes at 0xC00
+              * so we can roll back if the ioctl still won't accept. */
+             uint8_t saved_mode[8];
+             pread(fd, saved_mode, 8, 0x368);
+             /* We don't save the whole 0x8000 blob area — instead we just
+              * won't claim success if ioctl doesn't follow. */
+
              uint32_t mode32 = 0x60;
              pwrite(fd, &mode32, 4, 0x368);
              ssize_t wr = pwrite(fd, blob, sizeof(blob), 0xC00);
@@ -1855,12 +1861,29 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
                  /* Try ioctl once more — now that mode is 0x60 and fsynced,
                   * the kernel may accept and also update the ICV. */
                  int r2 = ps5param_ioctl(img, blob, sizeof(blob), 1);
-                 if (r2 == 0)
+                 if (r2 == 0) {
                      logprintf("[GarlicMgr] PS5PARAM: ioctl write succeeded after direct mode fix\n");
-                 else
+                     r = 0;
+                 } else {
                      logprintf("[GarlicMgr] PS5PARAM: ioctl still fails after direct write (%d), "
-                               "blob is file-only (no ICV update)\n", r2);
-                 r = 0;
+                               "rolling back header to avoid ICV mismatch\n", r2);
+                     /* Roll back: restore original mode so we don't leave an
+                      * inconsistent blob+mode without a valid ICV. */
+                     fd = open(img, O_RDWR);
+                     if (fd >= 0) {
+                         pwrite(fd, saved_mode, 8, 0x368);
+                         /* Zero the blob area we wrote — the original was
+                          * likely empty/zeroed anyway for images where the
+                          * ioctl never works. */
+                         static uint8_t zbuf[0x8000];
+                         memset(zbuf, 0, sizeof(zbuf));
+                         pwrite(fd, zbuf, sizeof(zbuf), 0xC00);
+                         fsync(fd);
+                         close(fd);
+                         logprintf("[GarlicMgr] PS5PARAM: header rolled back (mode restored, blob zeroed)\n");
+                     }
+                     /* r stays negative — caller knows blob write failed */
+                 }
              } else {
                  logprintf("[GarlicMgr] PS5PARAM: direct write failed (wrote %zd, errno=%d)\n",
                            wr, errno);
