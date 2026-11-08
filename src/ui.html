@@ -610,6 +610,10 @@
   </div>
   <div class="right">
     <div class="tb" id="tb"></div>
+    <div id="saveTransferControls" style="display:none;align-items:center;gap:12px;padding:12px 18px;border-bottom:1px solid var(--bd)">
+      <span id="saveTransferStatus" role="status" aria-live="polite" style="flex:1;font-size:12px"></span>
+      <button class="btn red" id="saveTransferCancel" onclick="cancelSaveTransfer()">Cancel</button>
+    </div>
     <div class="ct" id="ct"></div>
   </div>
 </div>
@@ -700,10 +704,12 @@ function languageOptionsHtml() {
 /* ── State ─────────────────────────────────────────── */
 let S = [], si = -1, tab = 'browse';
 let mt = false, bsy = false;
+let activeSaveTransfer = null;
 let cf = [], ex = new Set();
 let aid = '', stitle = '', mtid = '', mpt = '';
 let cloudPoll = null, cloudAwaiting = false, cloudBusy = false, lastCloudProgress = '';
 let bulkSel = new Set(), bulkRunning = false;
+let encryptTargetAccountId = '', encryptPendingSelection = null, encryptResignDialog = null;
 
 /* ── Utilities ─────────────────────────────────────── */
 function $(id) { return document.getElementById(id) }
@@ -726,20 +732,98 @@ function fmtB(b) {
   return (b / 1048576).toFixed(1) + 'M';
 }
 
+/* Encrypt/Decrypt jobs have no automatic elapsed-time cutoff. Cancellation
+ * closes active browser I/O and asks the payload to discard its scratch save.
+ * Controls stay busy until the payload confirms cleanup. */
+function transferCancelled() { return new Error('Cancelled by user'); }
+function checkSaveTransfer(job = activeSaveTransfer) {
+  if (job && job.cancelled) throw transferCancelled();
+}
+function transferControls(text) {
+  const job = activeSaveTransfer, box = $('saveTransferControls');
+  box.style.display = job ? 'flex' : 'none';
+  if (!job) return;
+  if (text) job.status = text;
+  $('saveTransferStatus').textContent = job.status || (job.label + ' in progress');
+  const button = $('saveTransferCancel');
+  button.textContent = job.retry ? 'Retry cleanup' : job.cancelled ? 'Cancelling...' : 'Cancel';
+  button.disabled = job.completing || (job.cancelled && !job.retry);
+}
+function transferHeaders(job = activeSaveTransfer) {
+  return job && job.id ? {'X-Garlic-Transfer': job.id} : {};
+}
+function transferFetch(url, options = {}) {
+  const job = activeSaveTransfer;
+  checkSaveTransfer(job);
+  if (!job) return fetch(url, options);
+  const controller = new AbortController();
+  /* Keep the controller through response-body consumption, not only headers. */
+  job.controllers.add(controller);
+  return fetch(url, {...options, headers: {...options.headers, ...transferHeaders(job)}, signal: controller.signal});
+}
+function requestTransferCleanup(job) {
+  if (!job.id || job.cleanup) return;
+  job.cleanup = fetch('/api/transfer_cancel', {method: 'POST', headers: transferHeaders(job)})
+    .then(async r => {
+      const d = await r.json();
+      if (!r.ok || !d.ok) throw new Error(d.error || 'Cleanup was not confirmed');
+      return {ok: true};
+    }).catch(e => ({ok: false, error: e.message}));
+}
+function cancelSaveTransfer() {
+  const job = activeSaveTransfer;
+  if (!job || job.completing) return;
+  if (job.retry) {
+    const retry = job.retry; job.retry = null; transferControls('Retrying cleanup...'); retry(); return;
+  }
+  if (job.cancelled) return;
+  job.cancelled = true; job.userCancelled = true;
+  transferControls('Cancelling — waiting for the PS5 to finish cleanup...');
+  log(job.label + ': Cancel requested; stopping transfer and discarding temporary output');
+  for (const xhr of job.xhrs) xhr.abort();
+  for (const controller of job.controllers) controller.abort();
+  requestTransferCleanup(job);
+}
+async function cleanSaveTransfer(job) {
+  /* Cleanup must not use an aborted controller. Failure retains the busy state
+   * and exposes Retry cleanup rather than claiming the PS5 was cleaned. */
+  for (;;) {
+    requestTransferCleanup(job);
+    const result = await job.cleanup;
+    if (result && result.ok) return;
+    log('Cancel cleanup not confirmed: ' + (result ? result.error : 'No transfer ID'), 'err');
+    await new Promise(resolve => {
+      job.completing = false; job.retry = resolve;
+      transferControls('Cleanup not confirmed. Check the connection, then Retry cleanup.');
+    });
+    job.cleanup = null;
+  }
+}
+
 /* ── XHR upload with progress ──────────────────────── */
 function upload(url, file, onProgress, respType) {
+  const job = activeSaveTransfer;
   return new Promise((resolve, reject) => {
+    checkSaveTransfer(job);
     const xhr = new XMLHttpRequest();
     xhr.open('POST', url);
     xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    if (job) xhr.setRequestHeader('X-Garlic-Transfer', job.id);
     if (respType) xhr.responseType = respType;
-    xhr.timeout = 300000; /* 5 min timeout for large saves */
+    xhr.timeout = job ? 0 : 300000;
+    if (job) job.xhrs.add(xhr);
+    const done = () => { if (job) job.xhrs.delete(xhr); };
     xhr.upload.onprogress = e => {
-      if (e.lengthComputable && onProgress) onProgress(e.loaded, e.total);
+      if (job && job.cancelled) return;
+      if (e.lengthComputable) {
+        if (job) transferControls(e.loaded === e.total ? 'Upload sent — waiting for the PS5...' : 'Uploading ' + fmtB(e.loaded) + ' / ' + fmtB(e.total));
+        if (onProgress) onProgress(e.loaded, e.total);
+      }
     };
-    xhr.onload = () => resolve(xhr);
-    xhr.onerror = () => reject(new Error('Network error'));
-    xhr.ontimeout = () => reject(new Error('Timeout'));
+    xhr.onload = () => { done(); if (job && job.cancelled) reject(transferCancelled()); else resolve(xhr); };
+    xhr.onerror = () => { done(); reject(new Error('Network error')); };
+    xhr.onabort = () => { done(); reject(transferCancelled()); };
+    xhr.ontimeout = () => { done(); reject(new Error('Timeout')); };
     xhr.send(file);
   });
 }
@@ -918,6 +1002,7 @@ function toggleUserDD() {
 }
 
 function selectUser(uid) {
+  if (activeSaveTransfer) return;
   if (onlineImporting) return;
   curUid = uid;
   const u = users.find(x => x.id === uid);
@@ -934,7 +1019,8 @@ document.addEventListener('click', e => {
 
 /* ── Tab switching ─────────────────────────────────── */
 function switchTab(t) {
-  if (onlineImporting) return;
+  if (onlineImporting || activeSaveTransfer) return;
+  if (encryptResignDialog) closeEncryptResignDialog();
   tab = t;
   document.querySelectorAll('nav .tab, .mob-menu .tab').forEach(b => {
     b.className = 'tab' + (b.dataset.tab === t ? ' active' : '');
@@ -971,6 +1057,7 @@ let usbDrawerOpen = false;
 let platform = 'ps5';
 
 function setPlatform(p) {
+  if (activeSaveTransfer) return;
   platform = p;
   $('ptab5').className = 'ptab' + (p === 'ps5' ? ' active' : '');
   $('ptab4').className = 'ptab' + (p === 'ps4' ? ' active' : '');
@@ -1118,6 +1205,7 @@ function togG(tid, e) {
 
 /* ── Render content area ───────────────────────────── */
 function renderCt() {
+  if (activeSaveTransfer) return;
   const c = $('ct');
 
   if (tab === 'decrypt') {
@@ -1132,14 +1220,20 @@ function renderCt() {
   } else if (tab === 'encrypt') {
     c.className = 'ct ctr';
     c.innerHTML =
-      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">'
-      + '<label style="font-size:12px;color:var(--dm);font-weight:600;text-transform:uppercase;letter-spacing:.5px">Account ID:</label>'
-      + '<input id="eaid" type="text" maxlength="16" placeholder="' + esc(t('encrypt.optional', 'optional')) + '" '
-      + 'style="background:var(--bg);border:1px solid var(--bd);color:var(--tx);padding:6px 10px;border-radius:8px;font-family:monospace;font-size:13px;width:170px">'
-      + '</div>'
+      '<div style="display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">'
+      + '<label for="eaid" style="font-size:12px;color:var(--dm);font-weight:600">Target Account ID:</label>'
+      + '<input id="eaid" type="text" maxlength="18" placeholder="Keep original" value="' + esc(encryptTargetAccountId) + '" '
+      + 'oninput="encryptTargetAccountId=this.value" '
+      + 'style="background:var(--bg);border:1px solid var(--bd);color:var(--tx);padding:6px 10px;border-radius:8px;font-family:monospace;font-size:13px;width:180px">'
+      + '<button class="bbtn" onclick="openEncryptResign()">Resign...</button></div>'
+      + '<div style="font-size:11px;color:var(--dm);margin-bottom:16px">Blank keeps the original Account ID. Resign reads the user currently active on the PS5.</div>'
       + '<div class="drop" id="dz">'
-      + '<div class="dlbl">' + t('drop.encrypt', 'Drag & drop a folder to encrypt into a save') + '</div>'
-      + '<button class="bbtn">' + t('drop.browse_folder', 'Browse Folder') + '</button></div>';
+      + '<div class="dlbl">Choose or drop save folders, then press Encrypt.</div>'
+      + '<button class="bbtn">' + t('drop.browse_folder', 'Browse Folder') + '</button></div>'
+      + '<div style="margin-top:16px" id="encryptSelection">'
+      + (encryptPendingSelection ? '<div class="dlbl">' + esc(encryptSelectionLabel(encryptPendingSelection)) + '</div>' : '<div class="dlbl">No save folder selected</div>')
+      + '<button class="bbtn" style="margin:8px" onclick="startEncryptSelection()" ' + (encryptPendingSelection ? '' : 'disabled') + '>Encrypt</button>'
+      + (encryptPendingSelection ? '<button class="bbtn" onclick="clearEncryptSelection()">Clear selection</button>' : '') + '</div>';
     setupFolderDZ('dz', encDrop);
 
   } else if (tab === 'resign') {
@@ -1884,29 +1978,34 @@ async function collectEncryptedSaves(files) {
 }
 
 /* Fetch the entire result before the next save overwrites the payload's temp files. */
-async function fetchSaveResult(url) {
-  const r = await fetch(url);
+async function fetchSaveResult(url, withMetadata = false) {
+  const r = await transferFetch(url);
   if (!r.ok) throw new Error('Download failed: HTTP ' + r.status);
   if ((r.headers.get('Content-Type') || '').includes('application/json')) {
     const d = await r.json();
     throw new Error(d.error || 'Download failed');
   }
-  return r.blob();
+  const blob = await r.blob();
+  checkSaveTransfer();
+  const warning = (r.headers.get('X-Garlic-Warning') || '').trim().slice(0, 1024);
+  if (warning) log('Download warning: ' + warning, 'warn');
+  return withMetadata ? {blob, warning} : blob;
 }
 
 async function downloadSaveResult(url, name) {
-  const blob = await fetchSaveResult(url);
+  const {blob, warning} = await fetchSaveResult(url, true);
   const objectUrl = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = objectUrl; a.download = name;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
+  return {warning};
 }
 
 async function unmountUploadedSave() {
-  const r = await fetch('/api/unmount');
+  const r = await transferFetch('/api/unmount');
   const d = await r.json();
-  if (!r.ok || d.error || d.ok === false) throw new Error(d.error || 'Unmount failed');
+  if (!r.ok || d.error || d.ok !== true) throw new Error(d.error || 'Unmount was not confirmed');
 }
 
 async function uploadSaveKey(binFile) {
@@ -1918,6 +2017,95 @@ async function uploadSaveKey(binFile) {
 }
 
 async function runSaveBatch(files, label, process, prepare = collectEncryptedSaves, finish) {
+  if (label !== 'Encrypt' && label !== 'Decrypt') return runSaveBatchLegacy(files, label, process, prepare, finish);
+  if (bsy || !files || !files.length) return;
+  bsy = true;
+  const job = {label, id: '', cancelled: false, completing: false, cleanup: null, retry: null,
+    status: label + ' — preparing...', xhrs: new Set(), controllers: new Set()};
+  activeSaveTransfer = job; transferControls(); renderTB();
+  let saves = [], succeeded = 0, failed = 0, skipped = 0, stopped = null;
+  const warnings = [];
+  try {
+    /* Do not abort begin: a Cancel pressed here waits for its ID, then sends
+     * cancellation before any save request is started. */
+    const begin = await fetch('/api/transfer_begin', {method: 'POST'});
+    const opened = await begin.json();
+    if (!begin.ok || !opened.ok || !/^[0-9a-f]{16}$/.test(opened.id || '')) throw new Error(opened.error || 'Could not begin transfer');
+    job.id = opened.id; checkSaveTransfer(job);
+    saves = await prepare(files); checkSaveTransfer(job);
+    if (!saves.length) throw new Error('No save image found');
+    for (let i = 0; i < saves.length; i++) {
+      checkSaveTransfer(job);
+      const save = saves[i];
+      transferControls(label + ' (' + (i + 1) + '/' + saves.length + '): ' + save.imgFile.name);
+      log(label + ' (' + (i + 1) + '/' + saves.length + '): ' + save.imgFile.name);
+      if (save.error) { failed++; log(save.imgFile.name + ': ' + save.error, 'err'); continue; }
+      try {
+        const result = await process(save, saves.length > 1); checkSaveTransfer(job);
+        if (result === false) skipped++;
+        else { succeeded++; if (result && result.warning) warnings.push(save.imgFile.name + ': ' + result.warning); }
+      } catch (e) {
+        if (job.cancelled) throw transferCancelled();
+        failed++; log(save.imgFile.name + ': ' + e.message, 'err');
+        try {
+          /* Finalization may already have unmounted before a later metadata
+           * error. The server acknowledges that no-op as successful cleanup. */
+          await unmountUploadedSave();
+        } catch (cleanupError) {
+          if (job.cancelled) throw transferCancelled();
+          const detail = cleanupError && cleanupError.message ? cleanupError.message : 'Cleanup was not confirmed';
+          log('Cleanup after ' + save.imgFile.name + ' failed: ' + detail, 'err');
+          /* Preserve the first error and stop the batch before another save
+           * can reuse uncertain native mount/temp state. */
+          throw new Error(e.message + '; cleanup failed: ' + detail);
+        }
+      }
+    }
+    checkSaveTransfer(job);
+    if (finish) await finish();
+    checkSaveTransfer(job);
+  } catch (e) { stopped = e; }
+  /* Native cleanup is a serialization barrier: no next batch can replace the
+   * temporary paths until all old tagged requests have finished or been denied. */
+  if (job.id) {
+    if (job.cancelled || stopped) {
+      job.cancelled = true;
+      for (const xhr of job.xhrs) xhr.abort();
+      for (const controller of job.controllers) controller.abort();
+      transferControls('Stopping — waiting for the PS5 to clean temporary output...');
+      await cleanSaveTransfer(job);
+      mt = false; cf = []; aid = ''; stitle = ''; mtid = ''; mpt = '';
+    } else {
+      job.completing = true; transferControls('Finishing...');
+      try {
+        const r = await fetch('/api/transfer_end', {method: 'POST', headers: transferHeaders(job)});
+        const d = await r.json(); if (!r.ok || !d.ok) throw new Error(d.error || 'Transfer finish was not confirmed');
+      } catch (e) {
+        stopped = e; job.cancelled = true; job.completing = false;
+        transferControls('Finishing cleanup...'); await cleanSaveTransfer(job);
+      }
+    }
+  }
+  activeSaveTransfer = null; bsy = false; transferControls(); renderTB();
+  if (stopped || job.cancelled) {
+    const cancelledByUser = job.userCancelled;
+    if (cancelledByUser) {
+      skipped += Math.max(0, saves.length - succeeded - failed - skipped);
+      const message = label + ' cancelled: ' + succeeded + ' succeeded, ' + failed + ' failed, ' + skipped + ' skipped. Temporary output discarded.';
+      log(message, 'warn');
+      $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + esc(message) + '</div><button class="bbtn" onclick="renderCt()">Done</button></div>';
+    } else { log(label + ' stopped: ' + (stopped ? stopped.message : 'Cancelled'), 'err'); renderCt(); }
+  } else if (saves.length > 1 || failed || skipped || warnings.length) {
+    const message = label + ': ' + succeeded + ' succeeded, ' + failed + ' failed, ' + skipped + ' skipped'
+      + (warnings.length ? ', ' + warnings.length + ' with warnings' : '');
+    log(message, failed ? 'err' : warnings.length ? 'warn' : 'ok');
+    $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + esc(message) + '</div>'
+      + warnings.map(w => '<div style="color:#c89b00;margin:8px">' + esc(w) + '</div>').join('')
+      + '<button class="bbtn" onclick="renderCt()">Done</button></div>';
+  }
+}
+
+async function runSaveBatchLegacy(files, label, process, prepare = collectEncryptedSaves, finish) {
   if (bsy || !files || !files.length) return;
   bsy = true;
   let succeeded = 0, failed = 0, skipped = 0;
@@ -2108,8 +2296,6 @@ async function detectEncryptPlatform(files) {
   });
   if (sfos.length !== 1) throw new Error('Folder must contain one sce_sys/param.sfo');
   const bytes = new Uint8Array(await sfos[0].arrayBuffer());
-  if (bytes.length > 0 && bytes.every(value => value === 0))
-    return {titleId: '', isPS4: false, blocks: 0, zeroed: true};
   const view = new DataView(bytes.buffer);
   const invalid = () => { throw new Error('Invalid param.sfo'); };
   if (bytes.length < 20 || view.getUint32(0, true) !== 0x46535000) invalid();
@@ -2117,102 +2303,239 @@ async function detectEncryptPlatform(files) {
   const count = view.getUint32(16, true);
   if (20 + count * 16 > keyOffset || keyOffset > dataOffset || dataOffset > bytes.length) invalid();
   const decoder = new TextDecoder();
-  const fields = {};
   for (let i = 0; i < count; i++) {
     const entry = 20 + i * 16;
     const keyStart = keyOffset + view.getUint16(entry, true);
     const keyEnd = bytes.indexOf(0, keyStart);
     if (keyStart >= dataOffset || keyEnd < keyStart || keyEnd >= dataOffset) invalid();
-    const keyName = decoder.decode(bytes.subarray(keyStart, keyEnd));
-    const dStart = dataOffset + view.getUint32(entry + 12, true);
-    const dLen = view.getUint32(entry + 4, true);
-    if (keyName === 'TITLE_ID') {
-      if (view.getUint16(entry + 2, true) !== 0x0204 || !dLen || dStart + dLen > bytes.length) invalid();
-      fields.titleId = decoder.decode(bytes.subarray(dStart, dStart + dLen)).replace(/\0.*$/s, '');
-    } else if (keyName === 'SAVEDATA_BLOCKS') {
-      if (dStart + 4 <= bytes.length) fields.blocks = view.getUint32(dStart, true);
-    }
+    if (decoder.decode(bytes.subarray(keyStart, keyEnd)) !== 'TITLE_ID') continue;
+    const start = dataOffset + view.getUint32(entry + 12, true);
+    const length = view.getUint32(entry + 4, true);
+    if (view.getUint16(entry + 2, true) !== 0x0204 || !length || start + length > bytes.length) invalid();
+    const titleId = decoder.decode(bytes.subarray(start, start + length)).replace(/\0.*$/s, '');
+    if (!/^(CUSA|PPSA)\d{5}$/.test(titleId))
+      throw new Error('param.sfo TITLE_ID must be CUSAxxxxx (PS4) or PPSAxxxxx (PS5)');
+    return {titleId, isPS4: titleId.startsWith('CUSA')};
   }
-  if (!fields.titleId) throw new Error('param.sfo is missing TITLE_ID');
-  if (!/^(CUSA|PPSA)\d{5}$/.test(fields.titleId))
-    throw new Error('param.sfo TITLE_ID must be CUSAxxxxx (PS4) or PPSAxxxxx (PS5)');
-  return {titleId: fields.titleId, isPS4: fields.titleId.startsWith('CUSA'), blocks: fields.blocks || 0};
+  throw new Error('param.sfo is missing TITLE_ID');
 }
 
+function normalizeEncryptAccountId(value) {
+  if (typeof value !== 'string') throw new Error('Account ID must contain exactly 16 hexadecimal digits');
+  const text = value.trim();
+  if (!text) return '';
+  const hex = text.replace(/^0x/i, '');
+  if (!/^[0-9a-f]{16}$/i.test(hex)) throw new Error('Account ID must contain exactly 16 hexadecimal digits');
+  return hex.toUpperCase();
+}
+
+function rememberEncryptAccountId() {
+  const input = $('eaid');
+  if (input) encryptTargetAccountId = input.value;
+  return encryptTargetAccountId;
+}
+
+function encryptSelectionLabel(selection) {
+  if (selection.entries) return selection.entries.length + ' save folder(s): ' + selection.entries.map(e => e.name).join(', ');
+  return (selection.folderName || 'Save folder') + ' — ' + selection.files.length + ' file(s)';
+}
+
+/* Choosing files is read-only. The explicit Encrypt button starts the job. */
 async function encDrop(files, folderName, entries) {
-  if (bsy) return;
-  if (!entries && files.length === 1 && /\.zip$/i.test(files[0].name)) {
-    const archive = files[0];
-    files = await extractOnlineZip(archive);
-    folderName = folderName || archive.name.replace(/\.zip$/i, '');
-    for (const file of files) file._path = folderName + '/' + file._path;
-  }
-  const aidv = document.getElementById('eaid') ? document.getElementById('eaid').value.trim() : '';
-  return runFolderSaves(files, folderName, entries, 'Encrypt',
-    (all, name) => encDropOne(all, name, aidv));
+  if (bsy || activeSaveTransfer || encryptResignDialog) return;
+  const selectedFiles = Array.from(files || []);
+  const selectedEntries = entries && entries.length ? Array.from(entries) : null;
+  if (!selectedFiles.length && !selectedEntries) { log('Choose a save folder first', 'err'); return; }
+  rememberEncryptAccountId();
+  encryptPendingSelection = {files: selectedFiles, folderName: folderName || '', entries: selectedEntries};
+  renderCt();
 }
 
-async function createStoredZip(files) {
-  const parts = [], central = [];
-  const encoder = new TextEncoder();
-  let offset = 0, centralSize = 0;
-  for (const file of files) {
-    const fullPath = (file._path || file.webkitRelativePath || file.name).replace(/\\/g, '/');
-    const pieces = fullPath.split('/');
-    const relativePath = pieces.length > 1 ? pieces.slice(1).join('/') : pieces[0];
-    const name = encoder.encode(relativePath);
-    const data = new Uint8Array(await file.arrayBuffer());
-    const crc = onlineCRC(data);
-    const local = new DataView(new ArrayBuffer(30));
-    local.setUint32(0, 0x04034b50, true);
-    local.setUint16(4, 20, true);
-    local.setUint16(6, 0x800, true);
-    local.setUint32(14, crc, true);
-    local.setUint32(18, data.length, true);
-    local.setUint32(22, data.length, true);
-    local.setUint16(26, name.length, true);
-    parts.push(local.buffer, name, data);
-
-    const entry = new DataView(new ArrayBuffer(46));
-    entry.setUint32(0, 0x02014b50, true);
-    entry.setUint16(4, 20, true);
-    entry.setUint16(6, 20, true);
-    entry.setUint16(8, 0x800, true);
-    entry.setUint32(16, crc, true);
-    entry.setUint32(20, data.length, true);
-    entry.setUint32(24, data.length, true);
-    entry.setUint16(28, name.length, true);
-    entry.setUint32(42, offset, true);
-    central.push(entry.buffer, name);
-    centralSize += 46 + name.length;
-    offset += 30 + name.length + data.length;
-  }
-  const end = new DataView(new ArrayBuffer(22));
-  end.setUint32(0, 0x06054b50, true);
-  end.setUint16(8, files.length, true);
-  end.setUint16(10, files.length, true);
-  end.setUint32(12, centralSize, true);
-  end.setUint32(16, offset, true);
-  return new Blob([...parts, ...central, end.buffer], {type: 'application/zip'});
+function clearEncryptSelection() {
+  if (bsy || activeSaveTransfer || encryptResignDialog) return;
+  rememberEncryptAccountId();
+  encryptPendingSelection = null;
+  renderCt();
 }
 
-async function encDropZeroSfo(files, folderName) {
-  log('Detected PS5 zeroed param.sfo; preserving original PS5PARAM metadata', 'ok');
-  const zip = await createStoredZip(files);
-  const xhr = await upload('/api/encrypt_upload', zip, (loaded, total) => {
-    showProgress(Math.round(loaded * 100 / total), loaded, total);
+async function startEncryptSelection() {
+  if (bsy || activeSaveTransfer || encryptResignDialog || !encryptPendingSelection) return;
+  let target;
+  try { target = normalizeEncryptAccountId(rememberEncryptAccountId()); }
+  catch (e) { log(e.message, 'err'); return; }
+  const selection = encryptPendingSelection;
+  encryptTargetAccountId = target;
+  encryptPendingSelection = null;
+  /* One reviewed target is captured for the entire batch. */
+  return runFolderSaves(selection.files, selection.folderName, selection.entries, 'Encrypt',
+    (all, name) => encDropOne(all, name, target));
+}
+
+function closeEncryptResignDialog() {
+  const dialog = encryptResignDialog;
+  if (!dialog) return;
+  encryptResignDialog = null;
+  dialog.controller.abort();
+  document.removeEventListener('keydown', dialog.keydown);
+  dialog.element.remove();
+}
+
+async function openEncryptResign() {
+  if (bsy || activeSaveTransfer || tab !== 'encrypt' || encryptResignDialog) return;
+  const initialTarget = rememberEncryptAccountId();
+  const m = document.createElement('div');
+  m.className = 'modal-bg';
+  m.innerHTML = '<div class="modal" role="dialog" aria-modal="true" aria-labelledby="encryptResignTitle" style="max-width:440px;width:calc(100% - 32px)">'
+    + '<h3 id="encryptResignTitle">Resign during Encrypt</h3>'
+    + '<p>The current user is the profile active on the PS5.</p>'
+    + '<div id="encryptResignCurrent" role="status" style="font-size:12px;margin-bottom:14px;white-space:pre-wrap;word-break:break-word">Reading current PS5 account...</div>'
+    + '<label for="encryptResignTarget" style="font-size:12px">Target PSN Account ID</label>'
+    + '<input id="encryptResignTarget" maxlength="18" type="text" spellcheck="false" autocomplete="off" '
+    + 'style="box-sizing:border-box;width:100%;margin:6px 0 12px;padding:8px;background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:8px;font-family:monospace">'
+    + '<div id="encryptResignError" role="alert" style="color:var(--er);font-size:12px;margin-bottom:12px"></div>'
+    + '<div class="btns" style="flex-wrap:wrap">'
+    + '<button class="mbtn-s" id="encryptResignCancel">Cancel</button>'
+    + '<button class="mbtn-s" id="encryptResignKeep">Keep original</button>'
+    + '<button class="btn grn" id="encryptResignUse">Use this ID</button></div></div>';
+  document.body.appendChild(m);
+  const input = m.querySelector('#encryptResignTarget');
+  const current = m.querySelector('#encryptResignCurrent');
+  const error = m.querySelector('#encryptResignError');
+  input.value = initialTarget;
+  const dialog = {element: m, controller: new AbortController(), edited: false, keydown: null};
+  encryptResignDialog = dialog;
+  const live = () => encryptResignDialog === dialog && tab === 'encrypt';
+  input.oninput = () => { dialog.edited = true; error.textContent = ''; };
+  const apply = target => {
+    if (!live() || bsy || activeSaveTransfer) return;
+    encryptTargetAccountId = target;
+    closeEncryptResignDialog();
+    renderCt();
+  };
+  m.querySelector('#encryptResignCancel').onclick = () => { if (live()) closeEncryptResignDialog(); };
+  m.querySelector('#encryptResignKeep').onclick = () => apply('');
+  m.querySelector('#encryptResignUse').onclick = () => {
+    if (!live() || bsy || activeSaveTransfer) return;
+    try {
+      const target = normalizeEncryptAccountId(input.value);
+      if (!target) throw new Error('Enter an Account ID or choose Keep original');
+      apply(target);
+    } catch (e) { error.textContent = e.message; }
+  };
+  dialog.keydown = e => { if (e.key === 'Escape' && live()) { e.preventDefault(); closeEncryptResignDialog(); } };
+  document.addEventListener('keydown', dialog.keydown);
+  input.focus();
+  try {
+    const r = await fetch('/api/account_current', {signal: dialog.controller.signal, cache: 'no-store'});
+    const d = await r.json();
+    if (!live()) return;
+    if (!r.ok || !d || d.ok !== true) throw new Error('Cannot read the current PS5 account. Enter an Account ID manually or cancel.');
+    if (typeof d.user_id !== 'string' || !/^[0-9a-f]{8}$/i.test(d.user_id)
+        || typeof d.user_name !== 'string' || !d.user_name || d.user_name.length > 128
+        || typeof d.account_id !== 'string' || !/^[0-9a-f]{16}$/i.test(d.account_id))
+      throw new Error('The PS5 returned invalid account information. Enter an Account ID manually or cancel.');
+    const account = d.account_id.toUpperCase();
+    current.textContent = d.user_name + ' (User ' + d.user_id.toUpperCase() + ')\nCurrent PSN Account ID: ' + account;
+    if (!dialog.edited && !initialTarget) input.value = account;
+  } catch (e) {
+    if (!live()) return;
+    current.textContent = e.name === 'AbortError' ? 'Account lookup cancelled.' : 'Current PS5 account unavailable.';
+    error.textContent = e.name === 'AbortError' ? 'Enter an Account ID manually or cancel.'
+      : (e.message === 'Cannot read the current PS5 account. Enter an Account ID manually or cancel.'
+         || e.message === 'The PS5 returned invalid account information. Enter an Account ID manually or cancel.'
+        ? e.message : 'Could not read the current PS5 account. Enter an Account ID manually or cancel.');
+  }
+}
+
+function saveRelativePath(file) {
+  const path = (file._path || file.webkitRelativePath || file.name).replace(/\\/g, '/');
+  const parts = path.split('/');
+  return parts.length > 1 ? parts.slice(1).join('/') : parts[0];
+}
+
+/* Source geometry is metadata, never a game file. PS5IMAGE supplies exact
+ * fs_ext for older exports which predate this chives.json field. */
+async function preparePfsFiles(files, titleId, isPS4) {
+  const name = f => saveRelativePath(f).toLowerCase();
+  /* An explicit zero is a legacy non-CoW layout, not missing metadata.
+   * Only the known native shape is accepted here; final SFO consistency is
+   * checked by the backend after the actual save files have been uploaded. */
+  const supportedLegacyGeometry = (pfs, size) => pfs.version === 2
+    && pfs.block_size_bytes === 65536 && Number.isInteger(pfs.block_count)
+    && pfs.block_count >= 2 && pfs.block_count <= 1048576
+    && pfs.mode_raw === 13 && pfs.backup_header_count === 1
+    && Number.isSafeInteger(size) && size === pfs.block_count * pfs.block_size_bytes;
+  const sidecars = files.filter(f => name(f) === 'chives.json');
+  if (sidecars.length > 1) throw new Error('Save folder contains more than one chives.json');
+  let info = null;
+  if (sidecars.length) {
+    if (isPS4) throw new Error('chives.json geometry restore is supported for PS5 saves only');
+    if (!sidecars[0].size || sidecars[0].size > 8192)
+      throw new Error('chives.json must contain at most 8192 bytes');
+    try { info = JSON.parse(await sidecars[0].text()); }
+    catch (_) { throw new Error('Invalid chives.json'); }
+    if (!info || Array.isArray(info) || info.schema_version !== 1 || info.platform !== 'PS5')
+      throw new Error('chives.json schema or platform does not match this save');
+    if (info.title_id && info.title_id !== titleId)
+      throw new Error('chives.json title_id does not match param.sfo');
+  }
+  const images = isPS4 ? [] : files.filter(f => name(f) === 'ps5image');
+  if (images.length > 1) throw new Error('Save folder contains more than one PS5IMAGE');
+  if (images.length) {
+    const image = images[0];
+    const prefix = await image.slice(0, 0x370).arrayBuffer();
+    if (prefix.byteLength !== 0x370) throw new Error('PS5IMAGE header is truncated');
+    const v = new DataView(prefix);
+    const u64 = off => { const n = v.getBigUint64(off, true);
+      if (n > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('PS5IMAGE geometry exceeds supported range');
+      return Number(n); };
+    const pfs = {version: u64(0), block_size_bytes: v.getUint32(0x20,true),
+      block_count: u64(0x38), mode_raw: v.getUint16(0x1c,true),
+      backup_header_count: v.getUint32(0x24,true), fs_ext: v.getUint32(0x368,true)};
+    if (u64(8) !== 20130315 || pfs.version !== 2 || pfs.block_size_bytes !== 65536 ||
+        pfs.fs_ext >= pfs.block_count ||
+        (pfs.fs_ext === 0 && !supportedLegacyGeometry(pfs, image.size)) ||
+        image.size !== pfs.block_count * pfs.block_size_bytes)
+      throw new Error('PS5IMAGE does not have supported native geometry');
+    if (info) {
+      if (!info.pfs || ['version','block_size_bytes','block_count','backup_header_count'].some(k => info.pfs[k] !== pfs[k]) ||
+          (info.pfs.fs_ext !== undefined && info.pfs.fs_ext !== pfs.fs_ext) ||
+          (pfs.fs_ext === 0 && (info.pfs.mode_raw !== pfs.mode_raw ||
+            info.original_image_size_bytes !== image.size)))
+        throw new Error('PS5IMAGE and chives.json geometry do not match');
+      info.pfs.fs_ext = pfs.fs_ext;
+    } else info = {schema_version:1, platform:'PS5', title_id:titleId,
+      original_image_size_bytes:image.size, pfs};
+  }
+  if (!isPS4 && info && info.pfs && info.pfs.block_size_bytes === 65536 &&
+      (!Number.isInteger(info.pfs.fs_ext) || info.pfs.fs_ext < 0 || info.pfs.fs_ext >= info.pfs.block_count))
+    throw new Error('Original fs_ext is missing: include PS5IMAGE or re-export chives.json with this build');
+  if (!isPS4 && info && info.pfs && info.pfs.fs_ext === 0 &&
+      !supportedLegacyGeometry(info.pfs, info.original_image_size_bytes))
+    throw new Error('Explicit fs_ext=0 requires supported legacy geometry (version 2, 64 KiB blocks, mode 13, one backup header, full image size)');
+  const reserved = new Set(['chives.json', 'ps5image', 'ps5key', 'ps5param', 'ps5param_size']);
+  return {files: files.filter(f => isPS4 ? !sidecars.includes(f) : !reserved.has(name(f))),
+    metadata: info === null ? null : JSON.stringify(info)};
+}
+
+async function createPfsForFiles(totalSize, isPS4, metadata) {
+  const url = '/api/create_pfs?size=' + totalSize + (isPS4 ? '&ps4=1' : '');
+  const r = await transferFetch(url, metadata === null ? undefined : {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: metadata
   });
-  const result = JSON.parse(xhr.responseText);
-  if (xhr.status !== 200 || !result.ok) throw new Error(result.error || 'Zero-SFO encryption failed');
-  const name = (folderName || 'encrypted_save') + '_enc';
-  await downloadSaveResult('/api/encrypt_download?name=' + encodeURIComponent(name), name);
-  log('Encrypted save download started', 'ok');
+  const d = await r.json();
+  if (!r.ok || d.error) throw new Error(d.error || 'Unable to create PFS image');
+  if (metadata !== null) log('Using original PFS geometry and stored system-block count', 'ok');
+  if (d.key_recovered) log('Generated PS5 image key recovered for mounting', 'ok');
+  if (d.native_allocation) log('Native PS5 backing-file allocation enabled (flags 0x80)', 'ok');
+  return d;
 }
 
 async function encDropOne(files, folderName, aidv) {
-  const {titleId, isPS4, blocks, zeroed} = await detectEncryptPlatform(files);
-  if (zeroed) return encDropZeroSfo(files, folderName);
-  log('Detected ' + (isPS4 ? 'PS4' : 'PS5') + ' save: ' + titleId + (blocks ? ' (' + blocks + ' blocks)' : ''), 'ok');
+  const {titleId, isPS4} = await detectEncryptPlatform(files);
+  const prepared = await preparePfsFiles(files, titleId, isPS4);
+  files = prepared.files;
+  log('Detected ' + (isPS4 ? 'PS4' : 'PS5') + ' save: ' + titleId, 'ok');
   /* Calculate total size for PFS image sizing */
   let totalSize = 0;
   for (const f of files) totalSize += f.size;
@@ -2220,20 +2543,13 @@ async function encDropOne(files, folderName, aidv) {
   /* Step 1: create fresh PFS image and mount it */
   log('Creating ' + (isPS4 ? 'PS4' : 'PS5') + ' PFS image (' + fmtB(totalSize) + ' of files)...');
   $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + t('status.creating_pfs', 'Creating PFS image...') + '</div></div>';
-  let pfsUrl = '/api/create_pfs?size=' + totalSize + (isPS4 ? '&ps4=1' : '');
-  if (blocks > 0) pfsUrl += '&blocks=' + blocks;
-  let r = await fetch(pfsUrl);
-  let d = await r.json();
-  if (d.error) throw new Error(d.error);
+  await createPfsForFiles(totalSize, isPS4, prepared.metadata);
   log('PFS image created and mounted', 'ok');
 
   /* Step 2: upload each file */
   for (let i = 0; i < files.length; i++) {
     const f = files[i];
-    const path = f._path || f.webkitRelativePath || f.name;
-    /* Strip leading folder name */
-    const parts = path.split('/');
-    const relPath = parts.length > 1 ? parts.slice(1).join('/') : parts[0];
+    const relPath = saveRelativePath(f);
 
     log('Uploading (' + (i + 1) + '/' + files.length + ') ' + relPath + ' (' + fmtB(f.size) + ')...');
     $('ct').innerHTML = '<div class="drop" id="dz"><div class="dlbl">' + t('status.uploading_file', 'Uploading {name}', {name: esc(relPath)})
@@ -2245,6 +2561,7 @@ async function encDropOne(files, folderName, aidv) {
     });
     const rd = JSON.parse(xhr.responseText);
     if (!rd.ok) throw new Error(rd.error || 'Upload failed for ' + relPath);
+    if (rd.sync_fallback_errno) log('Per-file flush unavailable (errno=' + rd.sync_fallback_errno + '); upload length and CRC verified', 'ok');
   }
   log('All ' + files.length + ' files uploaded', 'ok');
 
@@ -2254,19 +2571,23 @@ async function encDropOne(files, folderName, aidv) {
   const name = (folderName || 'encrypted_save') + '_enc';
   let dlUrl = '/api/download_new?name=' + encodeURIComponent(name);
   if (aidv) dlUrl += '&aid=' + encodeURIComponent(aidv);
-  await downloadSaveResult(dlUrl, isPS4 ? (name + '_ps4.zip') : name);
-  log('Encrypted save download started', 'ok');
+  const downloaded = await downloadSaveResult(dlUrl, isPS4 ? (name + '_ps4.zip') : name);
+  log(downloaded.warning ? 'Encrypted save downloaded with a metadata compatibility warning' : 'Encrypted save download started',
+    downloaded.warning ? 'warn' : 'ok');
+  const warningHtml = downloaded.warning
+    ? '<div style="color:#c89b00;margin:8px">' + esc(downloaded.warning) + '</div>' : '';
 
   if (isPS4) {
     $('ct').innerHTML =
       '<div class="drop"><div class="dlbl">' + t('status.ps4_save', 'PS4 Save') + ': <b>sdimg_' + esc(name) + '</b> + <b>' + esc(name) + '.bin</b></div>'
-      + '<div style="color:#0f0">' + t('status.download_started_zip', 'Download started (.zip)') + '</div>'
+      + '<div style="color:#0f0">' + t('status.download_started_zip', 'Download started (.zip)') + '</div>' + warningHtml
       + '<div style="font-size:11px;color:var(--dm);margin-top:8px">' + t('status.ps4_extract_hint', 'Extract and place both files in the same directory on PS5') + '</div></div>';
   } else {
     $('ct').innerHTML =
       '<div class="drop"><div class="dlbl">' + esc(name) + '</div>'
-      + '<div style="color:#0f0">' + t('status.download_started', 'Download started') + '</div></div>';
+      + '<div style="color:#0f0">' + t('status.download_started', 'Download started') + '</div>' + warningHtml + '</div>';
   }
+  return downloaded;
 }
 
 /* ── Resign drop ───────────────────────────────────── */
@@ -2610,9 +2931,20 @@ async function importDrop(files, folderName, entries) {
 }
 
 async function importDropOne(files, folderName, isPS4 = false) {
-  const detected = await detectEncryptPlatform(files);
-  isPS4 = detected.isPS4;
-  const blocks = detected.blocks;
+  /* Check for sce_sys/param.sfo in the dropped files */
+  let hasSfo = false;
+  for (const f of files) {
+    const p = f._path || f.webkitRelativePath || f.name;
+    if (p.match(/sce_sys\/param\.sfo$/i)) { hasSfo = true; break; }
+  }
+  if (!hasSfo) {
+    throw new Error('Folder must contain sce_sys/param.sfo');
+  }
+
+  const platform = await detectEncryptPlatform(files);
+  isPS4 = platform.isPS4;
+  const prepared = await preparePfsFiles(files, platform.titleId, isPS4);
+  files = prepared.files;
 
   /* Calculate total size */
   let totalSize = 0;
@@ -2621,19 +2953,13 @@ async function importDropOne(files, folderName, isPS4 = false) {
   /* Step 1: create PFS image */
   log('Creating PFS image for import (' + fmtB(totalSize) + ' of files)...');
   renderImportStage(t('status.creating_pfs', 'Creating PFS image...'), 'Preparing the save for your console.');
-  let pfsUrl = '/api/create_pfs?size=' + totalSize + (isPS4 ? '&ps4=1' : '');
-  if (blocks > 0) pfsUrl += '&blocks=' + blocks;
-  let r = await fetch(pfsUrl);
-  let d = await r.json();
-  if (d.error) throw new Error(d.error);
+  await createPfsForFiles(totalSize, isPS4, prepared.metadata);
   log('PFS image created and mounted', 'ok');
 
   /* Step 2: upload each file */
   for (let i = 0; i < files.length; i++) {
     const f = files[i];
-    const path = f._path || f.webkitRelativePath || f.name;
-    const parts = path.split('/');
-    const relPath = parts.length > 1 ? parts.slice(1).join('/') : parts[0];
+    const relPath = saveRelativePath(f);
 
     log('Uploading (' + (i + 1) + '/' + files.length + ') ' + relPath + ' (' + fmtB(f.size) + ')...');
     renderImportStage('Uploading save files', '<strong>' + esc(relPath) + '</strong><br>File ' + (i + 1) + ' of ' + files.length);
@@ -2644,12 +2970,13 @@ async function importDropOne(files, folderName, isPS4 = false) {
     });
     const rd = JSON.parse(xhr.responseText);
     if (!rd.ok) throw new Error(rd.error || 'Upload failed for ' + relPath);
+    if (rd.sync_fallback_errno) log('Per-file flush unavailable (errno=' + rd.sync_fallback_errno + '); upload length and CRC verified', 'ok');
   }
   log('All ' + files.length + ' files uploaded', 'ok');
 
   /* Check if save already exists */
-  r = await fetch('/api/import_check?uid=' + encodeURIComponent(curUid));
-  d = await r.json();
+  const r = await fetch('/api/import_check?uid=' + encodeURIComponent(curUid));
+  const d = await r.json();
   if (d.exists) {
     const ok = await showConfirmModal(t('confirm.overwrite_save', 'This will overwrite an existing save. Are you sure?'));
     if (!ok) {
@@ -4515,19 +4842,87 @@ function dl(b, n) {
 
 /* ── Shutdown ──────────────────────────────────────── */
 async function shutdown() {
-  if (!confirm(t('confirm.kill', 'Kill GarlicMgr?'))) return;
-  log('Killing GarlicMgr...');
-  try { await fetch('/api/shutdown') } catch (e) {}
-  log('GarlicMgr killed', 'ok');
-  const bg = document.createElement('div');
-  bg.className = 'modal-bg';
-  bg.innerHTML =
-    '<div class="modal" style="text-align:center">'
-    + '<h3 style="font-size:18px;margin-bottom:16px">' + t('shutdown.thanks', 'Thank you for using Garlic SaveMgr!') + '</h3>'
-    + '<p style="color:var(--dm);margin-bottom:12px">by earthonion</p>'
-    + '<iframe src="https://github.com/sponsors/earthonion/button" title="Sponsor earthonion" height="32" width="114" style="border:0;border-radius:6px"></iframe>'
-    + '</div>';
-  document.body.appendChild(bg);
+  if (shutdown.pending || !confirm(t('confirm.kill', 'Kill GarlicMgr?'))) return;
+  shutdown.pending = true;
+  const buttons = Array.from(document.querySelectorAll('.shut'));
+  const disabled = buttons.map(button => button.disabled);
+  buttons.forEach(button => { button.disabled = true; });
+  let accepted = false;
+  function serverError(message) {
+    const error = new Error(message); error.shutdownServerError = true; return error;
+  }
+  async function request(url, timeout = 5000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    try {
+      const response = await fetch(url, {cache: 'no-store', signal: controller.signal});
+      const result = await response.json();
+      if (!response.ok || result.error && !result.state)
+        throw serverError(result.error || 'The shutdown request was rejected');
+      return result;
+    } finally { clearTimeout(timer); }
+  }
+  function checkStatus(status) {
+    if (!status || !['running', 'draining', 'failed'].includes(status.state)
+        || !Number.isSafeInteger(status.pid) || status.pid <= 0)
+      throw serverError('Invalid shutdown status received');
+    return status;
+  }
+  function showResult(title, message) {
+    const bg = document.createElement('div');
+    bg.className = 'modal-bg';
+    bg.innerHTML = '<div class="modal" style="text-align:center">'
+      + '<h3 style="font-size:18px;margin-bottom:16px">' + esc(title) + '</h3>'
+      + '<p style="color:var(--dm);margin-bottom:12px">' + esc(message) + '</p>'
+      + '<button class="mbtn">Refresh page</button>'
+      + '<button class="mbtn-s" style="margin-left:8px">Close</button>'
+      + '<p style="color:var(--dm);margin:16px 0 12px">by earthonion</p>'
+      + '<iframe src="https://github.com/sponsors/earthonion/button" title="Sponsor earthonion" height="32" width="114" style="border:0;border-radius:6px"></iframe>'
+      + '</div>';
+    bg.querySelector('.mbtn').onclick = () => window.location.reload();
+    bg.querySelector('.mbtn-s').onclick = () => bg.remove();
+    document.body.appendChild(bg);
+  }
+  try {
+    const before = checkStatus(await request('/api/shutdown/status'));
+    if (before.state !== 'draining') {
+      const result = await request('/api/shutdown');
+      if (!result.ok || result.shutdown !== 'pending')
+        throw serverError(result.error || 'Shutdown was not acknowledged');
+    }
+    accepted = true;
+    log('Shutdown requested — waiting for transfers and native save cleanup...', 'warn');
+    const deadline = Date.now() + 120000;
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      const status = checkStatus(await request('/api/shutdown/status', Math.min(5000, remaining)));
+      if (status.state === 'failed') {
+        log('Shutdown cleanup failed: ' + (status.error || 'Cleanup could not be confirmed')
+          + '. Use Kill GarlicMgr again to retry.', 'err');
+        return;
+      }
+      if (status.state === 'running' && status.pid !== before.pid) {
+        log('GarlicMgr restarted with a new process. Refresh the page to use the new instance.', 'warn');
+        showResult('GarlicMgr restarted', 'A new instance is running. Refresh the page before continuing.');
+        return;
+      }
+    }
+    log('Still waiting for shutdown cleanup. Completion has not been confirmed; use Kill GarlicMgr again to check or retry.', 'warn');
+  } catch (error) {
+    if (error && error.shutdownServerError) {
+      log('Shutdown failed: ' + error.message + '. Use Kill GarlicMgr again to retry.', 'err');
+    } else if (accepted) {
+      log('Disconnected while waiting for shutdown. This does not confirm a clean exit; refresh the page to check the console.', 'warn');
+      showResult('GarlicMgr disconnected', 'The connection closed while waiting. A clean exit has not been confirmed. Refresh the page to check.');
+    } else {
+      log('Could not contact GarlicMgr to request shutdown. Refresh the page and retry.', 'err');
+    }
+  } finally {
+    shutdown.pending = false;
+    buttons.forEach((button, index) => { button.disabled = disabled[index]; });
+  }
 }
 
 /* ── Init ──────────────────────────────────────────── */

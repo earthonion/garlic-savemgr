@@ -1,5 +1,5 @@
 PS5_PAYLOAD_SDK ?= /opt/ps5-payload-sdk
-VERSION ?= 1.15-beta15
+VERSION ?= 1.15-beta16
 
 PS5_CC := $(PS5_PAYLOAD_SDK)/bin/prospero-clang
 PS5_INCDIR := $(PS5_PAYLOAD_SDK)/target/include
@@ -10,6 +10,7 @@ SQLITE_FLAGS := -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT
 LDFLAGS := -L$(PS5_LIBDIR)
 LIBS := -lkernel_sys -lkernel -lSceSystemService -lSceUserService -lSceFsInternalForVsh -lSceRegMgr -lSceNet
 I18N_FILES := $(wildcard src/i18n/*.js)
+CMP_SRCS := $(wildcard src/CMP/*.c)
 PREVIEW_DIR ?= /tmp/garlic-savemgr-ui-preview
 PREVIEW_PORT ?= 8082
 
@@ -32,8 +33,8 @@ src/sqlite3.o: src/sqlite3.c
 src/miniz_tinfl.o: src/miniz_tinfl.c
 	$(PS5_CC) -O2 -D_BSD_SOURCE -std=gnu11 -Isrc -I$(PS5_INCDIR) -w -c -o $@ $<
 
-garlic-savemgr.elf: src/main.c src/sfo_account.h src/ui.h src/sqlite3.o src/miniz_tinfl.o
-	$(PS5_CC) $(CFLAGS) $(LDFLAGS) -o $@ src/main.c src/miniz_tinfl.o src/sqlite3.o $(LIBS)
+garlic-savemgr.elf: src/main.c src/sfo_account.h src/ui.h src/sqlite3.o src/miniz_tinfl.o $(CMP_SRCS)
+	$(PS5_CC) $(CFLAGS) $(LDFLAGS) -o $@ src/main.c src/miniz_tinfl.o src/sqlite3.o $(CMP_SRCS) $(LIBS)
 
 clean:
 	rm -f garlic-savemgr.elf src/ui.h src/sqlite3.o src/miniz_tinfl.o src/_ui_tmp.html
