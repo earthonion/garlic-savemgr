@@ -23,6 +23,8 @@
  #include <arpa/inet.h>
  #include <netdb.h>
  #include <sys/select.h>
+ #include <sys/sysctl.h>
+ #include <sys/syscall.h>
  #include <dlfcn.h>
  #include <pthread.h>
  
@@ -9427,8 +9429,44 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
      logprintf("[GarlicMgr] listener recovered (%s) on port %d\n", reason, PORT);
  }
 
+#define SAVEMGR_PROCESS_NAME "garlic-savemgr.elf"
+
+ static int terminate_previous_instances(void) {
+     int mib[4] = {1, 14, 8, 0};
+     size_t size;
+     if (sysctl(mib, 4, NULL, &size, NULL, 0)) return 0;
+     unsigned char *buf = malloc(size);
+     if (!buf) return 0;
+     if (sysctl(mib, 4, buf, &size, NULL, 0)) {
+         free(buf);
+         return 0;
+     }
+
+     int killed = 0;
+     pid_t self = getpid();
+     for (unsigned char *p = buf; p < buf + size;) {
+         int len = *(int *)p;
+         if (len <= 0) break;
+         pid_t pid = *(pid_t *)(p + 72);
+         if (pid != self && strcmp((char *)(p + 447), SAVEMGR_PROCESS_NAME) == 0 &&
+             kill(pid, SIGKILL) == 0) {
+             killed++;
+         }
+         p += len;
+     }
+     free(buf);
+     return killed;
+ }
+
 /* ── Main ───────────────────────────────────────────────────────── */
  int main(void) {
+     syscall(SYS_thr_set_name, -1, SAVEMGR_PROCESS_NAME);
+     int previous = terminate_previous_instances();
+     if (previous > 0) {
+         printf("[GarlicMgr] terminated %d previous instance(s)\n", previous);
+         usleep(100000);
+     }
+
      /* Zero the umask so open(..., 0777) really lands at 0777. Files inside
       * a mounted PFS need world-write to pass the game's save-verify at load;
       * default umask 022 quietly strips those bits — see garlic-worker
