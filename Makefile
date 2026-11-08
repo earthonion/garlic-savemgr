@@ -29,11 +29,14 @@ src/ui.h: src/ui.html src/i18n $(I18N_FILES) Makefile
 src/sqlite3.o: src/sqlite3.c
 	$(PS5_CC) -O2 -D_BSD_SOURCE -std=gnu11 -I$(PS5_INCDIR) $(SQLITE_FLAGS) -c -o $@ $<
 
-garlic-savemgr.elf: src/main.c src/sfo_account.h src/ui.h src/sqlite3.o
-	$(PS5_CC) $(CFLAGS) $(LDFLAGS) -o $@ src/main.c src/sqlite3.o $(LIBS)
+src/miniz_tinfl.o: src/miniz_tinfl.c
+	$(PS5_CC) -O2 -D_BSD_SOURCE -std=gnu11 -Isrc -I$(PS5_INCDIR) -w -c -o $@ $<
+
+garlic-savemgr.elf: src/main.c src/sfo_account.h src/ui.h src/sqlite3.o src/miniz_tinfl.o
+	$(PS5_CC) $(CFLAGS) $(LDFLAGS) -o $@ src/main.c src/miniz_tinfl.o src/sqlite3.o $(LIBS)
 
 clean:
-	rm -f garlic-savemgr.elf src/ui.h src/sqlite3.o src/_ui_tmp.html
+	rm -f garlic-savemgr.elf src/ui.h src/sqlite3.o src/miniz_tinfl.o src/_ui_tmp.html
 
 ui-preview: src/ui.html src/i18n $(I18N_FILES)
 	mkdir -p $(PREVIEW_DIR)

@@ -29,6 +29,7 @@
  #include <pthread.h>
  
  #include <ps5/kernel.h>
+ #include "miniz.h"
  #include "sqlite3.h"
  #include "sfo_account.h"
  
@@ -1501,6 +1502,53 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      if (result < 0) errno = saved_errno;
      return result;
  }
+
+ static int files_identical(const char *a, const char *b) {
+     int fa = open(a, O_RDONLY), fb = open(b, O_RDONLY);
+     if (fa < 0 || fb < 0) {
+         if (fa >= 0) close(fa);
+         if (fb >= 0) close(fb);
+         return -1;
+     }
+     struct stat sa, sb;
+     int result = -1;
+     if (fstat(fa, &sa) < 0 || fstat(fb, &sb) < 0 || sa.st_size != sb.st_size)
+         goto done;
+     unsigned char *ba = malloc(BUF_SIZE), *bb = malloc(BUF_SIZE);
+     if (!ba || !bb) {
+         free(ba);
+         free(bb);
+         goto done;
+     }
+     for (;;) {
+         ssize_t na = read(fa, ba, BUF_SIZE), nb = read(fb, bb, BUF_SIZE);
+         if (na < 0 && errno == EINTR) continue;
+         if (nb < 0 && errno == EINTR) continue;
+         if (na < 0 || nb < 0 || na != nb) break;
+         if (na == 0) {
+             result = 0;
+             break;
+         }
+         if (memcmp(ba, bb, (size_t)na) != 0) break;
+     }
+     free(ba);
+     free(bb);
+ done:
+     close(fa);
+     close(fb);
+     return result;
+ }
+
+ static int archive_original_ps5_image(const char *source) {
+     const char *archive = "/data/save_files/_ps5image_archive";
+     unlink(archive);
+     if (copy_file(source, archive) < 0 || files_identical(source, archive) < 0) {
+         unlink(archive);
+         logprintf("[GarlicMgr] PS5IMAGE: verified archive copy failed for %s\n", source);
+         return -1;
+     }
+     return 0;
+ }
  
  /* ── Recursive directory copy ───────────────────────────────────── */
  static int copy_dir_recursive(const char *src, const char *dst) {
@@ -1959,7 +2007,14 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      mopt.budgetid = "system";
  
      /* PS5: recover the real param.sfo from the header blob before mounting */
-     if (!is_ps4) ps5param_capture_for_image(mount_src);
+     if (!is_ps4) {
+         ps5param_capture_for_image(mount_src);
+         if (archive_original_ps5_image(mount_src) < 0) {
+             snprintf(g_mount_error, sizeof(g_mount_error),
+                      "Failed to preserve and verify the original PS5 image");
+             return -7;
+         }
+     }
 
      signal(SIGPIPE, SIG_DFL);
      int ret = sceFsMountSaveData(&mopt, mount_src, g_mount_point, decrypted_key);
@@ -2118,7 +2173,7 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      /* PS5: recover the real param.sfo from the header blob before mounting */
      if (!is_ps4) {
          ps5param_capture_for_image(path);
-         copy_file(path, "/data/save_files/_ps5image_archive");
+         if (archive_original_ps5_image(path) < 0) return -7;
      }
 
      signal(SIGPIPE, SIG_DFL);
@@ -2860,9 +2915,15 @@ static void compute_params_hmac(const uint8_t open_psid[16]) {
      return total;
  }
 
- static void zip_send(int sock, const char *base) {
+ static int zip_send(int sock, const char *base) {
      zip_entry_t *entries = malloc(MAX_ZIP_ENTRIES * sizeof(zip_entry_t));
-     if (!entries) return;
+     if (!entries) return -1;
+     uint8_t *buf = malloc(BUF_SIZE);
+     if (!buf) {
+         free(entries);
+         return -1;
+     }
+     int result = -1, fd = -1;
      int count = 0;
      collect_files(base, "", entries, &count);
      if (g_zip_extra_image && count < MAX_ZIP_ENTRIES) {
@@ -2881,21 +2942,27 @@ static void compute_params_hmac(const uint8_t open_psid[16]) {
          zip_entry_t *e = &entries[i];
          e->offset = offset;
          uint16_t nlen = strlen(e->name);
- 
          char fullpath[MAX_PATH_LEN];
          if (strcmp(e->name, "PS5IMAGE") == 0 && g_zip_extra_image)
              snprintf(fullpath, sizeof(fullpath), "%s", g_zip_extra_image);
          else
              snprintf(fullpath, sizeof(fullpath), "%s/%s", base, e->name);
-         int fd = open(fullpath, O_RDONLY);
-         uint8_t *fdata = NULL;
-         if (fd >= 0 && e->size > 0) {
-             fdata = malloc(e->size);
-             if (fdata) { ssize_t r = read(fd, fdata, e->size); (void)r; }
-             close(fd);
-         } else if (fd >= 0) { close(fd); }
-         e->crc = fdata ? calc_crc(fdata, e->size) : 0;
- 
+
+         fd = open(fullpath, O_RDONLY);
+         if (fd < 0) goto done;
+         uint32_t crc = 0xFFFFFFFF, remaining = e->size;
+         while (remaining) {
+             ssize_t nr = read(fd, buf, remaining < BUF_SIZE ? remaining : BUF_SIZE);
+             if (nr < 0 && errno == EINTR) continue;
+             if (nr <= 0) goto done;
+             for (ssize_t j = 0; j < nr; j++)
+                 crc = crc_tab[(crc ^ buf[j]) & 0xFF] ^ (crc >> 8);
+             remaining -= (uint32_t)nr;
+         }
+         if (close(fd) < 0) { fd = -1; goto done; }
+         fd = -1;
+         e->crc = crc ^ 0xFFFFFFFF;
+
          uint8_t lh[30]; memset(lh, 0, 30);
          lh[0]=0x50; lh[1]=0x4b; lh[2]=0x03; lh[3]=0x04;
          lh[4]=20;
@@ -2903,9 +2970,20 @@ static void compute_params_hmac(const uint8_t open_psid[16]) {
          memcpy(lh+18, &e->size, 4);
          memcpy(lh+22, &e->size, 4);
          memcpy(lh+26, &nlen, 2);
-         send(sock, lh, 30, 0);
-         send(sock, e->name, nlen, 0);
-         if (fdata) { send(sock, fdata, e->size, 0); free(fdata); }
+         if (send_all_fd(sock, lh, 30) < 0 || send_all_fd(sock, e->name, nlen) < 0)
+             goto done;
+
+         fd = open(fullpath, O_RDONLY);
+         if (fd < 0) goto done;
+         remaining = e->size;
+         while (remaining) {
+             ssize_t nr = read(fd, buf, remaining < BUF_SIZE ? remaining : BUF_SIZE);
+             if (nr < 0 && errno == EINTR) continue;
+             if (nr <= 0 || send_all_fd(sock, buf, (size_t)nr) < 0) goto done;
+             remaining -= (uint32_t)nr;
+         }
+         if (close(fd) < 0) { fd = -1; goto done; }
+         fd = -1;
          offset += 30 + nlen + e->size;
      }
  
@@ -2921,8 +2999,8 @@ static void compute_params_hmac(const uint8_t open_psid[16]) {
          memcpy(cd+24, &e->size, 4);
          memcpy(cd+28, &nlen, 2);
          memcpy(cd+42, &e->offset, 4);
-         send(sock, cd, 46, 0);
-         send(sock, e->name, nlen, 0);
+         if (send_all_fd(sock, cd, 46) < 0 || send_all_fd(sock, e->name, nlen) < 0)
+             goto done;
          offset += 46 + nlen;
      }
      uint32_t cd_size = offset - cd_offset;
@@ -2934,8 +3012,13 @@ static void compute_params_hmac(const uint8_t open_psid[16]) {
      memcpy(ecd+10, &cnt16, 2);
      memcpy(ecd+12, &cd_size, 4);
      memcpy(ecd+16, &cd_offset, 4);
-     send(sock, ecd, 22, 0);
+     if (send_all_fd(sock, ecd, 22) < 0) goto done;
+     result = 0;
+ done:
+     if (fd >= 0) close(fd);
+     free(buf);
      free(entries);
+     return result;
  }
  
  /* ── Zip streaming for specific files by path ──────────────────── */
@@ -3956,6 +4039,29 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
      return 0;
  }
  
+ static int inflate_zip_entry(const char *dest, const char *name,
+                              const uint8_t *data, size_t len,
+                              uint32_t comp_size, uint32_t uncomp_size);
+
+ static int inflate_small(const uint8_t *data, uint32_t comp_size,
+                          uint8_t *out, uint32_t uncomp_size) {
+     size_t written = tinfl_decompress_mem_to_mem(out, uncomp_size, data, comp_size, 0);
+     return written == uncomp_size ? 0 : -1;
+ }
+
+ static int normalize_zip_name(char *name) {
+     for (char *p = name; *p; p++) {
+         if (*p == '\\') *p = '/';
+     }
+     if (!name[0] || name[0] == '/' || (isalpha((unsigned char)name[0]) && name[1] == ':'))
+         return 0;
+     for (char *p = name; *p; p++) {
+         if (p[0] == '.' && p[1] == '.' && (p[2] == '/' || p[2] == 0) &&
+             (p == name || p[-1] == '/')) return 0;
+     }
+     return 1;
+ }
+
  static int zip_ps5_key(const uint8_t *data, size_t len, uint8_t key[0x60]) {
      size_t off = 0;
      while (off + 30 <= len) {
@@ -3972,9 +4078,17 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          uint16_t copy_len = name_len < MAX_PATH_LEN - 1 ? name_len : (uint16_t)(MAX_PATH_LEN - 1);
          memcpy(name, data + off + 30, copy_len);
          off += 30 + name_len + extra_len;
+        if (!normalize_zip_name(name)) {
+            off += comp_size;
+            continue;
+        }
          if (strcmp(name, "PS5KEY") == 0 && compression == 0 && uncomp_size == 0x20) {
              memcpy(key, data + off, 0x20);
              return 1;
+         } else if (strcmp(name, "PS5KEY") == 0 && compression == 8 && uncomp_size == 0x20) {
+             if (off + comp_size <= len && inflate_small(data + off, comp_size, key, uncomp_size) == 0)
+                 return 1;
+             return -1;
          }
          off += comp_size;
      }
@@ -3997,9 +4111,19 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          uint16_t copy_len = name_len < MAX_PATH_LEN - 1 ? name_len : (uint16_t)(MAX_PATH_LEN - 1);
          memcpy(name, data + off + 30, copy_len);
          off += 30 + name_len + extra_len;
+        if (!normalize_zip_name(name)) {
+            off += comp_size;
+            continue;
+        }
          if (strcmp(name, "PS5PARAM_SIZE") == 0 && compression == 0 && uncomp_size < 32) {
              char text[32] = {0};
              memcpy(text, data + off, uncomp_size);
+             uint64_t size = strtoull(text, NULL, 10);
+             return size >= 0x10000 && size <= (1ULL << 40) ? size : 0;
+         } else if (strcmp(name, "PS5PARAM_SIZE") == 0 && compression == 8 && uncomp_size < 32) {
+             char text[32] = {0};
+             if (off + comp_size > len || inflate_small(data + off, comp_size, (uint8_t *)text, uncomp_size) < 0)
+                 return 0;
              uint64_t size = strtoull(text, NULL, 10);
              return size >= 0x10000 && size <= (1ULL << 40) ? size : 0;
          }
@@ -4024,6 +4148,10 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          uint16_t copy_len = name_len < MAX_PATH_LEN - 1 ? name_len : (uint16_t)(MAX_PATH_LEN - 1);
          memcpy(name, data + off + 30, copy_len);
          off += 30 + name_len + extra_len;
+        if (!normalize_zip_name(name)) {
+            off += comp_size;
+            continue;
+        }
          if (strcmp(name, "PS5IMAGE") == 0 && compression == 0 && uncomp_size > 0) {
              int fd = open(dest, O_CREAT | O_WRONLY | O_TRUNC, 0644);
              if (fd < 0) return -1;
@@ -4032,6 +4160,8 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              ssize_t written = write(fd, data + off, to_write);
              close(fd);
              return written == (ssize_t)to_write ? 1 : -1;
+         } else if (strcmp(name, "PS5IMAGE") == 0 && compression == 8 && uncomp_size > 0) {
+             return inflate_zip_entry("", name, data + off, len - off, comp_size, uncomp_size) < 0 ? -1 : 1;
          }
          off += comp_size;
      }
@@ -4056,15 +4186,134 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          uint16_t copy_len = name_len < MAX_PATH_LEN - 1 ? name_len : (uint16_t)(MAX_PATH_LEN - 1);
          memcpy(name, data + off + 30, copy_len);
          off += 30 + name_len + extra_len;
+        if (!normalize_zip_name(name)) {
+            off += comp_size;
+            continue;
+        }
          if (compression == 0 && name_len >= suffix_len &&
              strcmp(name + name_len - suffix_len, suffix) == 0) {
              sfo_info_t info;
              if (parse_sfo_mem(data + off, uncomp_size, &info) == 0)
                  return info.blocks;
+         } else if (compression == 8 && name_len >= suffix_len && uncomp_size <= 0x8000 &&
+                    strcmp(name + name_len - suffix_len, suffix) == 0) {
+             uint8_t *sfo = malloc(uncomp_size);
+             if (!sfo) return 0;
+             sfo_info_t info;
+             int valid = off + comp_size <= len &&
+                         inflate_small(data + off, comp_size, sfo, uncomp_size) == 0 &&
+                         parse_sfo_mem(sfo, uncomp_size, &info) == 0;
+             free(sfo);
+             if (valid) return info.blocks;
          }
          off += comp_size;
      }
      return 0;
+ }
+
+ static int is_ps5_sidecar_name(const char *name) {
+     return strcmp(name, "PS5PARAM") == 0 || strcmp(name, "PS5PARAM_SIZE") == 0 ||
+            strcmp(name, "PS5KEY") == 0 || strcmp(name, "PS5IMAGE") == 0;
+ }
+
+ static int flatten_single_save_directory(const char *files_dir) {
+     for (;;) {
+         DIR *root = opendir(files_dir);
+         if (!root) return -1;
+         char only[MAX_PATH_LEN] = {0};
+         int entries = 0;
+         struct dirent *ent;
+         while ((ent = readdir(root))) {
+             if (ent->d_name[0] == '.' || is_ps5_sidecar_name(ent->d_name)) continue;
+             entries++;
+             snprintf(only, sizeof(only), "%s", ent->d_name);
+         }
+         closedir(root);
+         if (entries != 1) return 0;
+
+         char nested[MAX_PATH_LEN];
+         snprintf(nested, sizeof(nested), "%s/%s", files_dir, only);
+         struct stat st;
+         if (stat(nested, &st) < 0 || !S_ISDIR(st.st_mode)) return 0;
+
+         DIR *sub = opendir(nested);
+         if (!sub) return -1;
+         while ((ent = readdir(sub))) {
+             if (ent->d_name[0] == '.') continue;
+             char src[MAX_PATH_LEN], dst[MAX_PATH_LEN];
+             snprintf(src, sizeof(src), "%s/%s", nested, ent->d_name);
+             snprintf(dst, sizeof(dst), "%s/%s", files_dir, ent->d_name);
+             if (rename(src, dst) < 0) {
+                 closedir(sub);
+                 return -1;
+             }
+         }
+         closedir(sub);
+         if (rmdir(nested) < 0) return -1;
+     }
+ }
+
+ typedef struct {
+     int fd;
+     uint32_t remaining;
+ } zip_inflate_output_t;
+
+ static int zip_inflate_write(const void *buf, int len, void *user) {
+     zip_inflate_output_t *out = user;
+     if (len < 0 || (uint32_t)len > out->remaining) return 0;
+     const uint8_t *p = buf;
+     int written = 0;
+     while (written < len) {
+         ssize_t n = write(out->fd, p + written, (size_t)(len - written));
+         if (n < 0 && errno == EINTR) continue;
+         if (n <= 0) return 0;
+         written += (int)n;
+     }
+     out->remaining -= (uint32_t)len;
+     return 1;
+ }
+
+ static int inflate_zip_entry(const char *dest, const char *name,
+                              const uint8_t *data, size_t len,
+                              uint32_t comp_size, uint32_t uncomp_size) {
+     if (comp_size > len) return -1;
+     char filepath[MAX_PATH_LEN];
+     int payload = 1;
+     if (strcmp(name, "PS5PARAM") == 0)
+         snprintf(filepath, sizeof(filepath), "/data/save_files/_ps5param_sidecar");
+     else if (strcmp(name, "PS5PARAM_SIZE") == 0)
+         snprintf(filepath, sizeof(filepath), "/data/save_files/_ps5param_size");
+     else if (strcmp(name, "PS5KEY") == 0)
+         snprintf(filepath, sizeof(filepath), "/data/save_files/_ps5key");
+     else if (strcmp(name, "PS5IMAGE") == 0)
+         snprintf(filepath, sizeof(filepath), "/data/save_files/_ps5image_sidecar");
+     else if (name[0] && name[strlen(name) - 1] == '/') {
+         char dirpath[MAX_PATH_LEN];
+         snprintf(dirpath, sizeof(dirpath), "%s/%s", dest, name);
+         return mkdir(dirpath, 0777) < 0 && errno != EEXIST ? -1 : 0;
+     } else {
+         snprintf(filepath, sizeof(filepath), "%s/%s", dest, name);
+         char *slash = filepath;
+         while ((slash = strchr(slash + 1, '/')) != NULL) {
+             *slash = 0;
+             mkdir(filepath, 0777);
+             *slash = '/';
+         }
+     }
+     if (strcmp(name, "PS5PARAM") == 0 || strcmp(name, "PS5PARAM_SIZE") == 0 ||
+         strcmp(name, "PS5KEY") == 0 || strcmp(name, "PS5IMAGE") == 0) payload = 0;
+
+     int fd = open(filepath, O_CREAT | O_WRONLY | O_TRUNC, 0777);
+     if (fd < 0) return -1;
+     zip_inflate_output_t out = { .fd = fd, .remaining = uncomp_size };
+     size_t consumed = comp_size;
+     int ok = tinfl_decompress_mem_to_callback(data, &consumed, zip_inflate_write, &out, 0);
+     int close_result = close(fd);
+     if (!ok || consumed != comp_size || out.remaining != 0 || close_result < 0) {
+         unlink(filepath);
+         return -1;
+     }
+     return payload;
  }
 
  /* ── Zip extraction (upload) ────────────────────────────────────── */
@@ -4088,9 +4337,23 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          uint16_t copy_len = name_len < MAX_PATH_LEN - 1 ? name_len : (uint16_t)(MAX_PATH_LEN - 1);
          memcpy(name, data + off + 30, copy_len);
          off += 30 + name_len + extra_len;
+        if (!normalize_zip_name(name)) {
+            off += comp_size;
+            continue;
+        }
  
-         if (compression != 0) {
-             printf("[GarlicMgr] Skipping compressed entry: %s\n", name);
+         if (compression == 8) {
+             int inflated = inflate_zip_entry(dest, name, data + off, len - off,
+                                              comp_size, uncomp_size);
+             if (inflated < 0) {
+                 logprintf("[GarlicMgr] Failed to inflate ZIP entry: %s\n", name);
+                 return -1;
+             }
+             count += inflated;
+             off += comp_size;
+             continue;
+         } else if (compression != 0) {
+             printf("[GarlicMgr] Skipping unsupported compression entry: %s\n", name);
              off += comp_size;
              continue;
          }
@@ -5881,8 +6144,8 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
             "Access-Control-Allow-Origin: *\r\n"
             "Connection: close\r\n"
             "\r\n", (unsigned long long)content_length);
-        send(sock, hdr, hlen, 0);
-        zip_send(sock, g_mount_point);
+        if (send_all_fd(sock, hdr, (size_t)hlen) < 0 || zip_send(sock, g_mount_point) < 0)
+            logprintf("[GarlicMgr] ZIP download failed or truncated\n");
         g_zip_extra_image = NULL;
         unlink("/data/save_files/_ps5image_archive");
         if (preserve) {
@@ -6689,10 +6952,22 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          printf("[GarlicMgr] Mounted new PFS (handle=%d)\n", ret);
  
          mount_ready:
-        /* Step 4: Extract zip into mounted PFS */
+        /* Step 4: Extract, normalize, and copy the upload into the mounted PFS */
          unlink("/data/save_files/_ps5param_sidecar");
-        int files = extract_zip(g_mount_point, tar_data, received);
+        const char *extract_dir = "/data/save_files/_tmp_encrypt_extract";
+        delete_recursive(extract_dir);
+        mkdir(extract_dir, 0777);
+        int files = extract_zip(extract_dir, tar_data, received);
         free(tar_data);
+        if (files <= 0 || flatten_single_save_directory(extract_dir) < 0 ||
+            copy_dir_recursive(extract_dir, g_mount_point) < 0) {
+            delete_recursive(extract_dir);
+            unmount_save();
+            unlink(tmp);
+            http_json(sock, "{\"error\":\"Failed to extract or normalize uploaded save\"}");
+            return;
+        }
+        delete_recursive(extract_dir);
         int preserve_sidecar = 0;
         int has_ps5param_sidecar = 0;
         int upload_zero_sfo = 0;
