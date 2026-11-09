@@ -27,8 +27,7 @@ int chives_parse(const char *json, size_t len, chives_geometry_t *g);
 
 int chives_path_safe(const char *name);
 int chives_is_sidecar(const char *name);
-/* Existing Garlic ZIP uploads use uncompressed entries with known local
- * lengths. Reject other layouts rather than silently lose their files. */
+/* Supports stored and deflated entries with known local lengths. */
 int chives_zip_next(const uint8_t *data, size_t len, size_t *offset, char *name, size_t name_cap,
                     const uint8_t **payload, size_t *payload_len);
 #endif

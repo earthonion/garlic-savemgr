@@ -1,6 +1,7 @@
 /* CMP add-in implementation; declarations are in chives.h.
- * Extracted without algorithm changes from CMP Rebuild4. */
+ * Derived from CMP Rebuild4. */
 #include "chives.h"
+#include "miniz_tinfl.h"
 #include <string.h>
 #include <ctype.h>
 
@@ -349,6 +350,9 @@ int chives_is_sidecar(const char *name) {
 
 int chives_zip_next(const uint8_t *data, size_t len, size_t *offset, char *name, size_t name_cap,
                     const uint8_t **payload, size_t *payload_len) {
+    static uint8_t *inflated;
+    free(inflated);
+    inflated = NULL;
     size_t off = *offset;
     if (off > len || len - off < 4)
         return -1;
@@ -360,8 +364,8 @@ int chives_zip_next(const uint8_t *data, size_t len, size_t *offset, char *name,
     uint16_t flags = chives_le16(data + off + 6), method = chives_le16(data + off + 8);
     uint32_t packed = chives_le32(data + off + 18), plain = chives_le32(data + off + 22);
     size_t nlen = chives_le16(data + off + 26), extra = chives_le16(data + off + 28);
-    if (flags & 9 || method != 0 || packed != plain || !nlen || nlen >= name_cap ||
-        nlen + extra > len - off - 30)
+    if (flags & 9 || (method != 0 && method != 8) || !nlen || nlen >= name_cap ||
+        nlen + extra > len - off - 30 || plain > 0x80000000ULL)
         return -1;
     size_t start = off + 30 + nlen + extra;
     if (packed > len - start || memchr(data + off + 30, 0, nlen))
@@ -370,8 +374,22 @@ int chives_zip_next(const uint8_t *data, size_t len, size_t *offset, char *name,
     name[nlen] = 0;
     if (!chives_path_safe(name))
         return -1;
-    *payload = data + start;
-    *payload_len = plain;
+    if (method == 8 && plain) {
+        size_t actual = 0;
+        inflated = tinfl_decompress_mem_to_heap(data + start, packed, &actual, 0);
+        if (!inflated || actual != plain) {
+            free(inflated);
+            inflated = NULL;
+            return -1;
+        }
+        *payload = inflated;
+        *payload_len = actual;
+    } else {
+        if (packed != plain)
+            return -1;
+        *payload = data + start;
+        *payload_len = plain;
+    }
     *offset = start + packed;
     return 1;
 }

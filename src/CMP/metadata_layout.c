@@ -13,14 +13,9 @@ static int garlic_metadata_text(const uint8_t *value, size_t length, const char 
 
 static int garlic_metadata_blocks(const uint8_t *value, uint16_t format, uint32_t length,
                                   uint64_t *number) {
-    /* The observed native SFO uses 0x0004 with eight bytes. Also accept its
-     * four-byte form and the standard 0x0404 four-byte integer encoding. */
-    if (format == 0x0004 && (length == 4 || length == 8)) {
+    /* Accept both native-width encodings used for savedata block counts. */
+    if ((format == 0x0004 || format == 0x0404) && (length == 4 || length == 8)) {
         *number = length == 8 ? chives_le64(value) : chives_le32(value);
-        return 1;
-    }
-    if (format == 0x0404 && length == 4) {
-        *number = chives_le32(value);
         return 1;
     }
     return 0;

@@ -2449,7 +2449,11 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
          total += (size_t)n;
      }
      if (close(fd) < 0) ok = 0;
-     return ok && sfo_bytes_valid(buf, total) ? (int)total : -1;
+     int valid = ok && sfo_bytes_valid(buf, total);
+     if (!valid)
+         logprintf("[GarlicMgr] read_sfo_file failed: path=%s ok=%d bytes=%zu sfo_valid=%d\n",
+                   path, ok, total, total ? sfo_bytes_valid(buf, total) : 0);
+     return valid ? (int)total : -1;
  }
 
  /* A cached SFO belongs only to the currently tracked image and its canonical
@@ -3890,11 +3894,29 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
  }
 
  /* ── Zip extraction (upload) ────────────────────────────────────── */
+ static int chives_info_geometry(const sfo_info_t *info,chives_geometry_t *g) {
+     if (!info->blocks || info->system_blocks > UINT64_MAX-info->blocks) return -1;
+     memset(g,0,sizeof(*g));
+     g->version=2;
+     g->block_size_bytes=65536;
+     g->block_count=info->blocks+info->system_blocks;
+     g->original_image_size_bytes=g->block_count*(uint64_t)g->block_size_bytes;
+     g->backup_header_count=1;
+     g->mode_raw=0x000d;
+     g->has_fs_ext=1;
+     g->fs_ext=info->system_blocks;
+     return chives_geometry_valid(g) ? 0 : -1;
+ }
+ static int chives_sfo_geometry(const uint8_t *payload,size_t size,chives_geometry_t *g,
+                                sfo_info_t *info) {
+     return parse_sfo_mem(payload,size,info) < 0 ? -1 : chives_info_geometry(info,g);
+ }
  static int chives_zip_geometry(const uint8_t *data,size_t len,chives_geometry_t *g) {
      size_t off=0,sz;
-     int found=0,image_found=0,entries=0,ret;
+     int found=0,image_found=0,entries=0,ret,sfo_found=0;
      const uint8_t *payload;
      char name[MAX_PATH_LEN];
+     sfo_info_t sfo;
      while ((ret=chives_zip_next(data,len,&off,name,sizeof(name),&payload,&sz)) > 0) {
          entries++;
          const char *base = strrchr(name,'/');
@@ -3915,9 +3937,25 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                  image.has_fs_ext != g->has_fs_ext || image.fs_ext != g->fs_ext)) return -1;
              if (!found) *g = image;
              image_found=1;
+         } else if (!strcmp(base,"param.sfo")) {
+             sfo_info_t parsed;
+             if (parse_sfo_mem(payload,sz,&parsed) == 0 && parsed.blocks) {
+                 if (sfo_found) return -1;
+                 sfo=parsed;
+                 sfo_found=1;
+             }
          }
      }
      if (ret < 0 || !entries) return -1;
+     if (found && !image_found && sfo_found) {
+         chives_geometry_t from_sfo;
+         if (chives_info_geometry(&sfo,&from_sfo) < 0) return -1;
+         if (memcmp(g,&from_sfo,sizeof(*g))) {
+             logprintf("[GarlicMgr] Recovering inconsistent legacy geometry from param.sfo: data=%llu system=%llu\n",
+                 (unsigned long long)sfo.blocks,(unsigned long long)sfo.system_blocks);
+             *g=from_sfo;
+         }
+     }
      if (!found && !image_found) {
          off=0;
          while ((ret=chives_zip_next(data,len,&off,name,sizeof(name),&payload,&sz)) > 0) {
@@ -3925,17 +3963,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              base=base ? base+1 : name;
              if (strcmp(base,"param.sfo")) continue;
              sfo_info_t info;
-             if (parse_sfo_mem(payload,sz,&info) < 0 || !info.blocks) return -1;
-             memset(g,0,sizeof(*g));
-             g->version=2;
-             g->block_size_bytes=65536;
-             g->block_count=info.blocks+info.system_blocks;
-             g->original_image_size_bytes=g->block_count*(uint64_t)g->block_size_bytes;
-             g->backup_header_count=1;
-             g->mode_raw=0x000d;
-             g->has_fs_ext=1;
-             g->fs_ext=info.system_blocks;
-             return chives_geometry_valid(g) && garlic_legacy_sfo_matches(g,payload,sz) ? 1 : -1;
+             return chives_sfo_geometry(payload,sz,g,&info) == 0 ? 1 : -1;
          }
      }
      return found || image_found;
@@ -3979,16 +4007,37 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
      return 0;
  }
  static int extract_zip(const char *dest, const uint8_t *data, size_t len) {
-     size_t off=0,size;
+     static const char sfo_suffix[] = "sce_sys/param.sfo";
+     size_t off=0,size,prefix_len=0;
      const uint8_t *payload;
-     char name[MAX_PATH_LEN];
-     int count=0,ret;
+     char name[MAX_PATH_LEN],prefix[MAX_PATH_LEN];
+     int count=0,ret,sfo_entries=0;
+     while ((ret=chives_zip_next(data,len,&off,name,sizeof(name),&payload,&size)) > 0) {
+         size_t name_len=strlen(name),suffix_len=sizeof(sfo_suffix)-1;
+         if (name_len >= suffix_len && !strcmp(name+name_len-suffix_len,sfo_suffix) &&
+             (name_len == suffix_len || name[name_len-suffix_len-1] == '/')) {
+             if (sfo_entries++) return -1;
+             prefix_len=name_len-suffix_len;
+             memcpy(prefix,name,prefix_len);
+             prefix[prefix_len]=0;
+         }
+     }
+     if (ret < 0) return -1;
+     if (prefix_len)
+         logprintf("[GarlicMgr] Flattening uploaded save directory: %s\n",prefix);
+
+     off=0;
      while ((ret=chives_zip_next(data,len,&off,name,sizeof(name),&payload,&size)) > 0) {
          const char *base = strrchr(name,'/');
          base = base ? base + 1 : name;
          if (chives_is_sidecar(name) || !strcmp(base,"PS5PARAM") ||
              !strcmp(base,"PS5PARAM_SIZE") || !strcmp(base,"PS5KEY") ||
              !strcmp(base,"PS5IMAGE")) continue;
+         if (prefix_len) {
+             if (strncmp(name,prefix,prefix_len)) return -1;
+             memmove(name,name+prefix_len,strlen(name+prefix_len)+1);
+             if (!name[0]) continue;
+         }
          char path[MAX_PATH_LEN];
          if (snprintf(path,sizeof(path),"%s/%s",dest,name) >= (int)sizeof(path)) return -1;
          if (name[strlen(name)-1] == '/') {
@@ -6501,7 +6550,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          int preserve_geometry = chives_zip_geometry(tar_data,received,&original);
          if (received != clen || preserve_geometry < 0 || (preserve_geometry && original.is_ps4)) {
              free(tar_data);
-             http_json(sock,"{\"error\":\"Invalid ZIP or incompatible chives.json; use PS5 stored ZIP entries\"}"); return;
+             http_json(sock,"{\"error\":\"Invalid ZIP or incompatible PS5 save metadata\"}"); return;
          }
 
          if (g_mounted && unmount_save() < 0) {
@@ -6676,6 +6725,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              snprintf(root_sfo, sizeof(root_sfo), "%s/sce_sys/param.sfo", g_mount_point);
              int sn = read_sfo_file(root_sfo, enc_blob_sfo, sizeof(enc_blob_sfo) - 20);
              if (sn <= 0) {
+                 logprintf("[GarlicMgr] final SFO read failed: path=%s result=%d\n", root_sfo, sn);
                  http_json(sock, "{\"error\":\"Cannot read complete final PS5 param.sfo; output was not published or installed\"}"); return;
              }
              enc_blob_sfo_len = (uint32_t)sn;

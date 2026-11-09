@@ -901,6 +901,14 @@ function setupFolderDZ(id, fn) {
     };
     i.click();
   };
+  const zipButton = el.querySelector('.zipbtn');
+  if (zipButton) zipButton.onclick = e => {
+    e.stopPropagation();
+    const i = document.createElement('input');
+    i.type = 'file'; i.accept = '.zip,application/zip'; i.multiple = true;
+    i.onchange = () => { if (i.files.length) fn(Array.from(i.files)); };
+    i.click();
+  };
 }
 
 /* ── Recursively read folder entries ──────────────── */
@@ -1228,10 +1236,11 @@ function renderCt() {
       + '<button class="bbtn" onclick="openEncryptResign()">Resign...</button></div>'
       + '<div style="font-size:11px;color:var(--dm);margin-bottom:16px">Blank keeps the original Account ID. Resign reads the user currently active on the PS5.</div>'
       + '<div class="drop" id="dz">'
-      + '<div class="dlbl">Choose or drop save folders, then press Encrypt.</div>'
-      + '<button class="bbtn">' + t('drop.browse_folder', 'Browse Folder') + '</button></div>'
+      + '<div class="dlbl">Choose or drop save folders or ZIP archives, then press Encrypt.</div>'
+      + '<button class="bbtn">' + t('drop.browse_folder', 'Browse Folder') + '</button>'
+      + '<button class="bbtn zipbtn">Browse ZIP</button></div>'
       + '<div style="margin-top:16px" id="encryptSelection">'
-      + (encryptPendingSelection ? '<div class="dlbl">' + esc(encryptSelectionLabel(encryptPendingSelection)) + '</div>' : '<div class="dlbl">No save folder selected</div>')
+      + (encryptPendingSelection ? '<div class="dlbl">' + esc(encryptSelectionLabel(encryptPendingSelection)) + '</div>' : '<div class="dlbl">No save folder or ZIP selected</div>')
       + '<button class="bbtn" style="margin:8px" onclick="startEncryptSelection()" ' + (encryptPendingSelection ? '' : 'disabled') + '>Encrypt</button>'
       + (encryptPendingSelection ? '<button class="bbtn" onclick="clearEncryptSelection()">Clear selection</button>' : '') + '</div>';
     setupFolderDZ('dz', encDrop);
@@ -2303,21 +2312,34 @@ async function detectEncryptPlatform(files) {
   const count = view.getUint32(16, true);
   if (20 + count * 16 > keyOffset || keyOffset > dataOffset || dataOffset > bytes.length) invalid();
   const decoder = new TextDecoder();
+  let titleId = '', savedataBlocks = 0, systemBlocks = 0;
   for (let i = 0; i < count; i++) {
     const entry = 20 + i * 16;
     const keyStart = keyOffset + view.getUint16(entry, true);
     const keyEnd = bytes.indexOf(0, keyStart);
     if (keyStart >= dataOffset || keyEnd < keyStart || keyEnd >= dataOffset) invalid();
-    if (decoder.decode(bytes.subarray(keyStart, keyEnd)) !== 'TITLE_ID') continue;
+    const key = decoder.decode(bytes.subarray(keyStart, keyEnd));
     const start = dataOffset + view.getUint32(entry + 12, true);
     const length = view.getUint32(entry + 4, true);
-    if (view.getUint16(entry + 2, true) !== 0x0204 || !length || start + length > bytes.length) invalid();
-    const titleId = decoder.decode(bytes.subarray(start, start + length)).replace(/\0.*$/s, '');
-    if (!/^(CUSA|PPSA)\d{5}$/.test(titleId))
-      throw new Error('param.sfo TITLE_ID must be CUSAxxxxx (PS4) or PPSAxxxxx (PS5)');
-    return {titleId, isPS4: titleId.startsWith('CUSA')};
+    if (start + length > bytes.length) invalid();
+    if (key === 'SAVEDATA_BLOCKS' || key === 'SYSTEM_BLOCKS') {
+      const format = view.getUint16(entry + 2, true);
+      if ((format !== 0x0004 && format !== 0x0404) || (length !== 4 && length !== 8)) invalid();
+      const value = length === 8 ? view.getBigUint64(start, true) : BigInt(view.getUint32(start, true));
+      if (value > BigInt(Number.MAX_SAFE_INTEGER)) invalid();
+      if (key === 'SAVEDATA_BLOCKS') savedataBlocks = Number(value);
+      else systemBlocks = Number(value);
+    } else if (key === 'TITLE_ID') {
+      if (view.getUint16(entry + 2, true) !== 0x0204 || !length) invalid();
+      titleId = decoder.decode(bytes.subarray(start, start + length)).replace(/\0.*$/s, '');
+    }
   }
-  throw new Error('param.sfo is missing TITLE_ID');
+  if (!/^(CUSA|PPSA)\d{5}$/.test(titleId))
+    throw new Error('param.sfo TITLE_ID must be CUSAxxxxx (PS4) or PPSAxxxxx (PS5)');
+  const isPS4 = titleId.startsWith('CUSA');
+  if (!isPS4 && (!savedataBlocks || savedataBlocks + systemBlocks > Number.MAX_SAFE_INTEGER))
+    throw new Error('param.sfo has invalid save block counts');
+  return {titleId, isPS4, savedataBlocks, systemBlocks};
 }
 
 function normalizeEncryptAccountId(value) {
@@ -2336,6 +2358,7 @@ function rememberEncryptAccountId() {
 }
 
 function encryptSelectionLabel(selection) {
+  if (selection.zipFiles) return selection.zipFiles.length + ' ZIP archive(s): ' + selection.zipFiles.map(f => f.name).join(', ');
   if (selection.entries) return selection.entries.length + ' save folder(s): ' + selection.entries.map(e => e.name).join(', ');
   return (selection.folderName || 'Save folder') + ' — ' + selection.files.length + ' file(s)';
 }
@@ -2345,9 +2368,15 @@ async function encDrop(files, folderName, entries) {
   if (bsy || activeSaveTransfer || encryptResignDialog) return;
   const selectedFiles = Array.from(files || []);
   const selectedEntries = entries && entries.length ? Array.from(entries) : null;
-  if (!selectedFiles.length && !selectedEntries) { log('Choose a save folder first', 'err'); return; }
+  if (!selectedFiles.length && !selectedEntries) { log('Choose a save folder or ZIP first', 'err'); return; }
   rememberEncryptAccountId();
-  encryptPendingSelection = {files: selectedFiles, folderName: folderName || '', entries: selectedEntries};
+  if (!selectedEntries && !folderName && selectedFiles.length) {
+    const zips = selectedFiles.filter(f => /\.zip$/i.test(f.name));
+    if (zips.length !== selectedFiles.length) {
+      log('Drop ZIP archives separately from loose save files', 'err'); return;
+    }
+    encryptPendingSelection = {zipFiles: zips};
+  } else encryptPendingSelection = {files: selectedFiles, folderName: folderName || '', entries: selectedEntries};
   renderCt();
 }
 
@@ -2367,6 +2396,9 @@ async function startEncryptSelection() {
   encryptTargetAccountId = target;
   encryptPendingSelection = null;
   /* One reviewed target is captured for the entire batch. */
+  if (selection.zipFiles)
+    return runSaveBatch(selection.zipFiles, 'Encrypt', save => encZipDropOne(save, target),
+      async files => files.map(imgFile => ({imgFile})));
   return runFolderSaves(selection.files, selection.folderName, selection.entries, 'Encrypt',
     (all, name) => encDropOne(all, name, target));
 }
@@ -2455,7 +2487,7 @@ function saveRelativePath(file) {
 
 /* Source geometry is metadata, never a game file. PS5IMAGE supplies exact
  * fs_ext for older exports which predate this chives.json field. */
-async function preparePfsFiles(files, titleId, isPS4) {
+async function preparePfsFiles(files, titleId, isPS4, sfoGeometry) {
   const name = f => saveRelativePath(f).toLowerCase();
   /* An explicit zero is a legacy non-CoW layout, not missing metadata.
    * Only the known native shape is accepted here; final SFO consistency is
@@ -2507,6 +2539,21 @@ async function preparePfsFiles(files, titleId, isPS4) {
     } else info = {schema_version:1, platform:'PS5', title_id:titleId,
       original_image_size_bytes:image.size, pfs};
   }
+  if (!isPS4 && !images.length) {
+    const blockCount = sfoGeometry.savedataBlocks + sfoGeometry.systemBlocks;
+    const pfs = {version:2, block_size_bytes:65536, block_count:blockCount,
+      mode_raw:13, backup_header_count:1, fs_ext:sfoGeometry.systemBlocks};
+    const matches = info && info.pfs && supportedLegacyGeometry(pfs, blockCount * 65536)
+      && ['version','block_size_bytes','block_count','mode_raw','backup_header_count','fs_ext']
+        .every(k => info.pfs[k] === pfs[k])
+      && info.original_image_size_bytes === blockCount * 65536;
+    if (!matches) {
+      info = {schema_version:1, platform:'PS5', title_id:titleId,
+        original_image_size_bytes:blockCount * 65536, pfs,
+        sfo:{savedata_blocks:sfoGeometry.savedataBlocks, system_blocks:sfoGeometry.systemBlocks}};
+      log('Recovered PFS geometry from param.sfo', 'ok');
+    }
+  }
   if (!isPS4 && info && info.pfs && info.pfs.block_size_bytes === 65536 &&
       (!Number.isInteger(info.pfs.fs_ext) || info.pfs.fs_ext < 0 || info.pfs.fs_ext >= info.pfs.block_count))
     throw new Error('Original fs_ext is missing: include PS5IMAGE or re-export chives.json with this build');
@@ -2531,9 +2578,30 @@ async function createPfsForFiles(totalSize, isPS4, metadata) {
   return d;
 }
 
+async function encZipDropOne(save, aidv) {
+  const file = save.imgFile;
+  $('ct').innerHTML = '<div class="drop"><div class="dlbl">Uploading ' + esc(file.name) + ' for encryption...</div></div>';
+  let url = '/api/encrypt_upload';
+  if (aidv) url += '?aid=' + encodeURIComponent(aidv);
+  const xhr = await upload(url, file, (loaded, total) => {
+    showProgress(Math.round(loaded * 100 / total), loaded, total);
+  });
+  const d = JSON.parse(xhr.responseText);
+  if (xhr.status !== 200 || !d.ok) throw new Error(d.error || 'ZIP encryption failed');
+  const name = file.name.replace(/\.zip$/i, '') + '_enc';
+  const downloaded = await downloadSaveResult('/api/encrypt_download?name=' + encodeURIComponent(name), name);
+  log(downloaded.warning ? 'Encrypted save downloaded with a metadata compatibility warning' : 'Encrypted save download started',
+    downloaded.warning ? 'warn' : 'ok');
+  const warningHtml = downloaded.warning
+    ? '<div style="color:#c89b00;margin:8px">' + esc(downloaded.warning) + '</div>' : '';
+  $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + esc(name) + '</div>'
+    + '<div style="color:#0f0">' + t('status.download_started', 'Download started') + '</div>' + warningHtml + '</div>';
+  return downloaded;
+}
+
 async function encDropOne(files, folderName, aidv) {
-  const {titleId, isPS4} = await detectEncryptPlatform(files);
-  const prepared = await preparePfsFiles(files, titleId, isPS4);
+  const {titleId, isPS4, savedataBlocks, systemBlocks} = await detectEncryptPlatform(files);
+  const prepared = await preparePfsFiles(files, titleId, isPS4, {savedataBlocks, systemBlocks});
   files = prepared.files;
   log('Detected ' + (isPS4 ? 'PS4' : 'PS5') + ' save: ' + titleId, 'ok');
   /* Calculate total size for PFS image sizing */
