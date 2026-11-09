@@ -1,4 +1,8 @@
 *.elf
 src/ui.h
 src/sqlite3.o
+src/miniz_tinfl.o
 *.zip
+node_modules/
+test-results/
+playwright-report/

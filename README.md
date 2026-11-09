@@ -8,6 +8,18 @@ PS5 save decrypt/encrypt/browse with embedded web UI.
 2. Open `http://<ps5-ip>:8082` in your browser on your PC
 3. Drag and drop files into the browse tab to add/replace files
 
+## Local UI tests
+
+The Playwright suite mocks the native API and checks ZIP encryption, SFO geometry recovery, and import success/error reporting. Run it locally with Node.js 18 or newer:
+
+```sh
+npm install
+npx playwright install chromium
+npm run test:ui
+```
+
+Native PFS creation and save installation still require validation on a PS5.
+
 ## Cloud Backups
 
 Open the Settings tab in the web UI to edit `/data/garlic/cloud.json`.

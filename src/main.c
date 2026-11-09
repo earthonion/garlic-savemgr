@@ -2559,6 +2559,32 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      return found;
  }
 
+ static int mount_nested_save_image(const char *tmp,const char *mount) {
+     char nested[MAX_PATH_LEN];
+     snprintf(nested,sizeof(nested),"%s/save",mount);
+     int fd=open(nested,O_RDONLY);
+     if (fd < 0) return -1;
+     uint8_t header[0x370];
+     struct stat st;
+     ssize_t got=fstat(fd,&st) == 0 && st.st_size >= (off_t)sizeof(header) ?
+         read(fd,header,sizeof(header)) : -1;
+     close(fd);
+     chives_geometry_t geometry;
+     if (got != (ssize_t)sizeof(header) ||
+         chives_from_header(header,sizeof(header),(uint64_t)st.st_size,&geometry) < 0 ||
+         geometry.is_ps4 || geometry.block_count*geometry.block_size_bytes != (uint64_t)st.st_size)
+         return -1;
+     const char *copy="/data/save_files/_tmp_nested";
+     unlink(copy);
+     if (copy_file(nested,copy) < 0) { unlink(copy); return -1; }
+     sync();
+     if (unmount_save() < 0 || rename(copy,tmp) < 0) { unlink(copy); return -1; }
+     int ret=mount_by_path(tmp);
+     if (ret >= 0)
+         logprintf("[GarlicMgr] Imported nested PS5 save image from outer container\n");
+     return ret;
+ }
+
  /* ── Generate minimal param.sfo ────────────────────────────────── */
  static int generate_sfo(const char *path, const char *title_id, const char *dir_name,
                          const char *main_title, const char *sub_title,
@@ -6456,6 +6482,15 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          }
          sfo_info_t sfo;
          int sfo_ret = parse_sfo(sfo_path, &sfo);
+         if (sfo_ret == -1 && !is_ps4_imp && mount_nested_save_image(tmp,g_mount_point) >= 0) {
+             if (ps5param_cached_for_mount(g_mount_point)) {
+                 if (install_sfo_file(sfo_path,ps5param_cache_data(),ps5param_cache_size()) < 0) {
+                     http_json(sock,"{\"error\":\"Cannot restore real PS5 metadata\"}"); return;
+                 }
+                 cache_params_hmac_mem(ps5param_cache_data(),ps5param_cache_size());
+             }
+             sfo_ret=parse_sfo(sfo_path,&sfo);
+         }
          if (sfo_ret == -2) {
              /* Zeroed SFO — keep mounted, let UI handle via doImportFinish */
              printf("[GarlicMgr] import_encrypted: zeroed param.sfo, passing to UI\n");
@@ -6725,10 +6760,13 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              snprintf(root_sfo, sizeof(root_sfo), "%s/sce_sys/param.sfo", g_mount_point);
              int sn = read_sfo_file(root_sfo, enc_blob_sfo, sizeof(enc_blob_sfo) - 20);
              if (sn <= 0) {
-                 logprintf("[GarlicMgr] final SFO read failed: path=%s result=%d\n", root_sfo, sn);
-                 http_json(sock, "{\"error\":\"Cannot read complete final PS5 param.sfo; output was not published or installed\"}"); return;
-             }
-             enc_blob_sfo_len = (uint32_t)sn;
+                 if (preserve_geometry && original.has_fs_ext && !original.fs_ext) {
+                     logprintf("[GarlicMgr] Physical container has no param.sfo; preserving its original layout\n");
+                 } else {
+                     logprintf("[GarlicMgr] final SFO read failed: path=%s result=%d\n", root_sfo, sn);
+                     http_json(sock, "{\"error\":\"Cannot read complete final PS5 param.sfo; output was not published or installed\"}"); return;
+                 }
+             } else enc_blob_sfo_len = (uint32_t)sn;
          }
 
          if(unmount_save()<0){
