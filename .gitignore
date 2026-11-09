@@ -6,3 +6,4 @@ src/miniz_tinfl.o
 node_modules/
 test-results/
 playwright-report/
+tests/chives_zip_test

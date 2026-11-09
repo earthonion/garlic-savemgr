@@ -348,6 +348,29 @@ int chives_is_sidecar(const char *name) {
     return !*name && !*expected;
 }
 
+#define CHIVES_MAX_INFLATED UINT64_C(0x80000000)
+
+typedef struct {
+    uint8_t *data;
+    size_t size, expected;
+} chives_inflate_output_t;
+
+static int chives_inflate_write(const void *buffer, int length, void *user) {
+    chives_inflate_output_t *output = user;
+    if (length < 0 || output->size > output->expected ||
+        (size_t)length > output->expected - output->size)
+        return 0;
+    if (length) {
+        if (!output->data) {
+            output->data = malloc(output->expected);
+            if (!output->data) return 0;
+        }
+        memcpy(output->data + output->size, buffer, (size_t)length);
+        output->size += (size_t)length;
+    }
+    return 1;
+}
+
 int chives_zip_next(const uint8_t *data, size_t len, size_t *offset, char *name, size_t name_cap,
                     const uint8_t **payload, size_t *payload_len) {
     static uint8_t *inflated;
@@ -365,7 +388,7 @@ int chives_zip_next(const uint8_t *data, size_t len, size_t *offset, char *name,
     uint32_t packed = chives_le32(data + off + 18), plain = chives_le32(data + off + 22);
     size_t nlen = chives_le16(data + off + 26), extra = chives_le16(data + off + 28);
     if (flags & 9 || (method != 0 && method != 8) || !nlen || nlen >= name_cap ||
-        nlen + extra > len - off - 30 || plain > 0x80000000ULL)
+        nlen + extra > len - off - 30 || plain > CHIVES_MAX_INFLATED)
         return -1;
     size_t start = off + 30 + nlen + extra;
     if (packed > len - start || memchr(data + off + 30, 0, nlen))
@@ -374,16 +397,18 @@ int chives_zip_next(const uint8_t *data, size_t len, size_t *offset, char *name,
     name[nlen] = 0;
     if (!chives_path_safe(name))
         return -1;
-    if (method == 8 && plain) {
-        size_t actual = 0;
-        inflated = tinfl_decompress_mem_to_heap(data + start, packed, &actual, 0);
-        if (!inflated || actual != plain) {
-            free(inflated);
-            inflated = NULL;
+    if (method == 8) {
+        chives_inflate_output_t output = {.expected = plain};
+        size_t consumed = packed;
+        int ok = tinfl_decompress_mem_to_callback(data + start, &consumed,
+                                                  chives_inflate_write, &output, 0);
+        if (!ok || consumed != packed || output.size != plain) {
+            free(output.data);
             return -1;
         }
-        *payload = inflated;
-        *payload_len = actual;
+        inflated = output.data;
+        *payload = inflated ? inflated : data + start;
+        *payload_len = plain;
     } else {
         if (packed != plain)
             return -1;

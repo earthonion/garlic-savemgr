@@ -3943,6 +3943,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
      const uint8_t *payload;
      char name[MAX_PATH_LEN];
      sfo_info_t sfo;
+     chives_geometry_t image={0};
      while ((ret=chives_zip_next(data,len,&off,name,sizeof(name),&payload,&sz)) > 0) {
          entries++;
          const char *base = strrchr(name,'/');
@@ -3952,16 +3953,10 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              if (found || chives_parse((const char *)payload,sz,g) < 0) return -1;
              found=1;
          } else if (!strcmp(base,"PS5IMAGE")) {
-             chives_geometry_t image;
-             if (chives_from_header(payload,sz,sz,&image) < 0) return -1;
-             if (found && (image.version != g->version ||
-                 image.block_size_bytes != g->block_size_bytes ||
-                 image.block_count != g->block_count ||
-                 image.original_image_size_bytes != g->original_image_size_bytes ||
-                 image.mode_raw != g->mode_raw ||
-                 image.backup_header_count != g->backup_header_count ||
-                 image.has_fs_ext != g->has_fs_ext || image.fs_ext != g->fs_ext)) return -1;
-             if (!found) *g = image;
+             chives_geometry_t candidate;
+             if (chives_from_header(payload,sz,sz,&candidate) < 0) return -1;
+             if (image_found && memcmp(&image,&candidate,sizeof(image))) return -1;
+             image=candidate;
              image_found=1;
          } else if (!strcmp(base,"param.sfo")) {
              sfo_info_t parsed;
@@ -3973,6 +3968,8 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          }
      }
      if (ret < 0 || !entries) return -1;
+     if (found && image_found && memcmp(g,&image,sizeof(image))) return -1;
+     if (!found && image_found) *g=image;
      if (found && !image_found && sfo_found) {
          chives_geometry_t from_sfo;
          if (chives_info_geometry(&sfo,&from_sfo) < 0) return -1;
@@ -4059,7 +4056,8 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          if (chives_is_sidecar(name) || !strcmp(base,"PS5PARAM") ||
              !strcmp(base,"PS5PARAM_SIZE") || !strcmp(base,"PS5KEY") ||
              !strcmp(base,"PS5IMAGE")) continue;
-         if (prefix_len) {
+         if (!size) continue;
+        if (prefix_len) {
              if (strncmp(name,prefix,prefix_len)) return -1;
              memmove(name,name+prefix_len,strlen(name+prefix_len)+1);
              if (!name[0]) continue;
