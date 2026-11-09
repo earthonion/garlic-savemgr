@@ -3011,7 +3011,8 @@ async function importDropOne(files, folderName, isPS4 = false) {
 
   const platform = await detectEncryptPlatform(files);
   isPS4 = platform.isPS4;
-  const prepared = await preparePfsFiles(files, platform.titleId, isPS4);
+  const prepared = await preparePfsFiles(files, platform.titleId, isPS4,
+    {savedataBlocks: platform.savedataBlocks, systemBlocks: platform.systemBlocks});
   files = prepared.files;
 
   /* Calculate total size */

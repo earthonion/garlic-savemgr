@@ -202,3 +202,53 @@ for (const outcome of ['failure', 'success']) {
     }
   });
 }
+
+test('decrypted folder import passes SFO geometry into PFS creation', async ({ page }) => {
+  let geometry = null;
+  const uploads = [];
+  await openApp(page, {
+    '/api/create_pfs': async route => {
+      geometry = route.request().postDataJSON();
+      await json(route, { ok: true, key_recovered: true, native_allocation: true });
+    },
+    '/api/upload_file': async (route, url) => {
+      uploads.push(url.searchParams.get('name'));
+      await json(route, { ok: true });
+    },
+    '/api/import_check': route => json(route, { exists: false }),
+    '/api/import_finish': route => json(route, {
+      ok: true, title_id: 'PPSA25642', dir_name: 'AchievementsSaveData', exists: false, warning: '',
+    }),
+  });
+  await page.locator('nav .tab[data-tab="import"]').click();
+  await page.evaluate(async ({ sfo, chives, keystone, payload }) => {
+    const decode = value => Uint8Array.from(atob(value), char => char.charCodeAt(0));
+    const file = (name, data) => {
+      const result = new File([decode(data)], name.split('/').pop());
+      result._path = name;
+      return result;
+    };
+    await importDrop([
+      file('ff/chives.json', chives),
+      file('ff/sce_sys/param.sfo', sfo),
+      file('ff/sce_sys/keystone', keystone),
+      file('ff/ue4savegame.dpx.sav', payload),
+    ], 'ff', null);
+  }, {
+    sfo: makeSfo(0x0004, 8).toString('base64'),
+    chives: Buffer.from(JSON.stringify(oldChives)).toString('base64'),
+    keystone: Buffer.alloc(96).toString('base64'),
+    payload: Buffer.alloc(2233).toString('base64'),
+  });
+  expect(geometry.pfs).toEqual({
+    version: 2,
+    block_size_bytes: 65536,
+    block_count: 330,
+    mode_raw: 13,
+    backup_header_count: 1,
+    fs_ext: 165,
+  });
+  expect(geometry.original_image_size_bytes).toBe(21626880);
+  expect(uploads).toEqual(['sce_sys/param.sfo', 'sce_sys/keystone', 'ue4savegame.dpx.sav']);
+  await expect(page.locator('#log')).toContainText('Import complete: PPSA25642/AchievementsSaveData (new)');
+});
