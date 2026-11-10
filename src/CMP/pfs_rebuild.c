@@ -69,8 +69,8 @@ static int legacy_protected_region_empty(const char *image) {
         return 0;
     off_t offset = CMP_PS5PARAM_IMAGE_OFFSET;
     int ok = 1;
-    while (offset < CMP_LEGACY_BLANK_GUARD_END && ok) {
-        size_t length = (size_t)(CMP_LEGACY_BLANK_GUARD_END - offset);
+    while (offset < CMP_PS5PARAM_IMAGE_END && ok) {
+        size_t length = (size_t)(CMP_PS5PARAM_IMAGE_END - offset);
         if (length > sizeof(bytes))
             length = sizeof(bytes);
         ssize_t n = pread(fd, bytes, length, offset);
@@ -97,7 +97,8 @@ static int legacy_creation_record(const char *path, const chives_geometry_t *exp
     uint8_t key[CMP_PFS_SEALED_KEY_BYTES];
     if (!path || strlen(path) >= sizeof(g_legacy_creation.path) ||
         chives_read_image(path, &actual) < 0 || !garlic_legacy_geometry_matches(&actual) ||
-        !legacy_geometry_equal(expected, &actual) || !legacy_protected_region_empty(path) ||
+        !legacy_geometry_equal(expected, &actual) ||
+        (actual.block_size_bytes == CMP_PFS_NATIVE_BLOCK_BYTES && !legacy_protected_region_empty(path)) ||
         legacy_image_identity(path, &st, key) < 0)
         return -1;
     g_legacy_creation.geometry = actual;
@@ -123,13 +124,11 @@ static int legacy_creation_matches(const char *path, const chives_geometry_t *ac
  * The kernel creates CoW metadata, writes fs_ext, updates ICV/auth and signs.
  * Never pwrite a guessed value into the authenticated header. */
 int chives_ppr_create(CreateOpt *opt, const char *path, uint64_t size,
-                      const chives_geometry_t *expected) {
+                      const chives_geometry_t *expected, int physical_sfo) {
     legacy_creation_clear();
     if (!g_pprCreate)
         return -ENOSYS;
-    if (opt->blockSize != CMP_PFS_NATIVE_BLOCK_BYTES)
-        return g_pprCreate(opt, path, 0, size);
-    if (expected && garlic_legacy_geometry_matches(expected) &&
+    if (physical_sfo && expected && garlic_legacy_geometry_matches(expected) &&
         expected->original_image_size_bytes == size) {
         logprintf("[GarlicMgr] Physical-SFO create: data=%llu system=0; no CoW conversion\n",
                   (unsigned long long)expected->block_count);
@@ -138,10 +137,10 @@ int chives_ppr_create(CreateOpt *opt, const char *path, uint64_t size,
             return ret < 0 ? ret : -EIO;
         if (legacy_creation_record(path, expected) < 0)
             return -EIO;
-        /* The final uploaded SFO is checked only after all edits and native
-         * unmount. Formatting by itself never authorizes publication. */
         return 0;
     }
+    if (opt->blockSize != CMP_PFS_NATIVE_BLOCK_BYTES)
+        return g_pprCreate(opt, path, 0, size);
     if (!expected || !expected->has_fs_ext || !expected->fs_ext ||
         !chives_geometry_valid(expected) || expected->block_count > UINT32_MAX ||
         expected->block_count * (uint64_t)expected->block_size_bytes != size) {
@@ -210,7 +209,7 @@ static int legacy_verify_physical_sfo(const char *image, const uint8_t *sfo, uin
     }
     chives_geometry_t actual;
     if (!ok || chives_read_image(image, &actual) < 0 || !legacy_geometry_equal(&actual, expected) ||
-        !legacy_protected_region_empty(image)) {
+        (actual.block_size_bytes == CMP_PFS_NATIVE_BLOCK_BYTES && !legacy_protected_region_empty(image))) {
         ps5param_set_error(
             "Physical-SFO read-back or image-layout verification failed; output withheld");
         return -EIO;
@@ -232,7 +231,7 @@ int finalize_ps5_sfo(const char *image, const uint8_t *sfo, uint32_t size, int f
     } else if (actual.has_fs_ext && actual.fs_ext == 0) {
         if ((fresh && !legacy_creation_matches(image, &actual)) ||
             !garlic_legacy_sfo_matches(&actual, sfo, size) ||
-            !legacy_protected_region_empty(image)) {
+            (actual.block_size_bytes == CMP_PFS_NATIVE_BLOCK_BYTES && !legacy_protected_region_empty(image))) {
             ps5param_set_error(
                 "Zero fs_ext does not match the source-bound physical-SFO profile; output withheld");
         } else

@@ -3939,10 +3939,9 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
  }
  static int chives_zip_geometry(const uint8_t *data,size_t len,chives_geometry_t *g) {
      size_t off=0,sz;
-     int found=0,image_found=0,entries=0,ret,sfo_found=0;
+     int found=0,image_found=0,entries=0,ret;
      const uint8_t *payload;
      char name[MAX_PATH_LEN];
-     sfo_info_t sfo;
      chives_geometry_t image={0};
      while ((ret=chives_zip_next(data,len,&off,name,sizeof(name),&payload,&sz)) > 0) {
          entries++;
@@ -3958,27 +3957,11 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              if (image_found && memcmp(&image,&candidate,sizeof(image))) return -1;
              image=candidate;
              image_found=1;
-         } else if (!strcmp(base,"param.sfo")) {
-             sfo_info_t parsed;
-             if (parse_sfo_mem(payload,sz,&parsed) == 0 && parsed.blocks) {
-                 if (sfo_found) return -1;
-                 sfo=parsed;
-                 sfo_found=1;
-             }
          }
      }
      if (ret < 0 || !entries) return -1;
      if (found && image_found && memcmp(g,&image,sizeof(image))) return -1;
      if (!found && image_found) *g=image;
-     if (found && !image_found && sfo_found) {
-         chives_geometry_t from_sfo;
-         if (chives_info_geometry(&sfo,&from_sfo) < 0) return -1;
-         if (memcmp(g,&from_sfo,sizeof(*g))) {
-             logprintf("[GarlicMgr] Recovering inconsistent legacy geometry from param.sfo: data=%llu system=%llu\n",
-                 (unsigned long long)sfo.blocks,(unsigned long long)sfo.system_blocks);
-             *g=from_sfo;
-         }
-     }
      if (!found && !image_found) {
          off=0;
          while ((ret=chives_zip_next(data,len,&off,name,sizeof(name),&payload,&sz)) > 0) {
@@ -3991,6 +3974,28 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
      }
      return found || image_found;
  }
+ static int chives_zip_physical_sfo(const uint8_t *data, size_t len, const chives_geometry_t *geometry) {
+     size_t off = 0, size;
+     const uint8_t *payload;
+     char name[MAX_PATH_LEN];
+     int ret;
+     while ((ret = chives_zip_next(data, len, &off, name, sizeof(name), &payload, &size)) > 0) {
+         const char *base = strrchr(name, '/');
+         base = base ? base + 1 : name;
+         if (!strcmp(base, "param.sfo") && garlic_legacy_sfo_matches(geometry, payload, size))
+             return 1;
+     }
+     return 0;
+ }
+
+ static int chives_file_physical_sfo(const char *base, const chives_geometry_t *geometry) {
+     char path[MAX_PATH_LEN];
+     static uint8_t sfo[0x8000];
+     snprintf(path, sizeof(path), "%s/sce_sys/param.sfo", base);
+     int size = read_sfo_file(path, sfo, sizeof(sfo) - 20);
+     return size > 0 && garlic_legacy_sfo_matches(geometry, sfo, size);
+ }
+
  static int restore_legacy_sfo_from_zip(const uint8_t *data, size_t len, const char *mount) {
      char root_sfo[MAX_PATH_LEN];
      snprintf(root_sfo,sizeof(root_sfo),"%s/sce_sys/param.sfo",mount);
@@ -6603,7 +6608,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          if (preserve_geometry)
              img_size = original.block_count * (uint64_t)original.block_size_bytes;
 
-         int native_allocation = preserve_geometry && original.block_size_bytes == 65536;
+         int native_allocation = preserve_geometry && chives_zip_physical_sfo(tar_data,received,&original);
 
          /* Step 1: Create file and allocate space (same as mkpfs) */
          int imgfd = open(tmp, O_CREAT | O_TRUNC | O_RDWR, 0777);
@@ -6639,7 +6644,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              free(tar_data); unlink(tmp);
              http_json(sock, "{\"error\":\"PprCreate not available\"}"); return;
          }
-         ret = chives_ppr_create(&copt, tmp, img_size, preserve_geometry ? &original : NULL);
+         ret = chives_ppr_create(&copt, tmp, img_size, preserve_geometry ? &original : NULL, native_allocation);
          printf("[GarlicMgr] PprCreate returned 0x%x\n", ret);
          if (ret < 0) {
              free(tar_data); unlink(tmp);
@@ -7222,7 +7227,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                  unlink(tmp);
                  http_json(sock, "{\"error\":\"PprCreate not available\"}"); return;
              }
-             ret = chives_ppr_create(&copt, tmp, img_size, preserve_geometry ? &original : NULL);
+             ret = chives_ppr_create(&copt, tmp, img_size, preserve_geometry ? &original : NULL, native_allocation);
          }
          if (ret < 0) {
              unlink(tmp);
@@ -8117,7 +8122,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          if (g_mounted && unmount_save() < 0) {
              http_json(sock,"{\"error\":\"Cannot finalize the previous mount; new image was not created\"}"); return;
          }
-         int native_allocation = !is_ps4 && preserve_geometry && original.block_size_bytes == 65536;
+         int native_allocation = !is_ps4 && preserve_geometry && chives_file_physical_sfo(s->path,&original);
 
          mkdir("/data/save_files", 0777);
          const char *tmp = "/data/save_files/_tmp_usb_import";
@@ -8207,7 +8212,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                  unlink(tmp);
                  http_json(sock, "{\"error\":\"PprCreate not available\"}"); return;
              }
-             ret = chives_ppr_create(&copt, tmp, img_size, preserve_geometry ? &original : NULL);
+             ret = chives_ppr_create(&copt, tmp, img_size, preserve_geometry ? &original : NULL, native_allocation);
          }
          if (ret < 0) {
              unlink(tmp);

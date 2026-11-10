@@ -23,7 +23,8 @@ static int garlic_metadata_blocks(const uint8_t *value, uint16_t format, uint32_
 
 int garlic_legacy_geometry_matches(const chives_geometry_t *geometry) {
     return geometry && chives_geometry_valid(geometry) && !geometry->is_ps4 &&
-           geometry->version == 2 && geometry->block_size_bytes == CMP_PFS_NATIVE_BLOCK_BYTES &&
+           geometry->version == 2 &&
+           (geometry->block_size_bytes == 32768 || geometry->block_size_bytes == 65536) &&
            geometry->has_fs_ext == 1 && geometry->fs_ext == 0 &&
            geometry->backup_header_count == 1 && geometry->mode_raw == 0x000d &&
            geometry->original_image_size_bytes ==
