@@ -3325,6 +3325,9 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          snprintf(name, 512, "%s/%s", title_id, sub);
          (*zfiles)[*nfiles].path = copy;
          (*zfiles)[*nfiles].name = name;
+         /* As with the save names in cloud_collect_title_files(), name only goes in names:
+          * cloud_free_title_files() frees names[0..nfiles). The path copy is what needs a slot
+          * in allocs. */
          (*names)[*nfiles] = name;
          (*nfiles)++;
          (*allocs)[(*nallocs)++] = copy;
