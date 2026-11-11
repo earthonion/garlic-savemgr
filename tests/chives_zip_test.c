@@ -70,11 +70,38 @@ static void oversized_declaration(void) {
     assert(chives_zip_next(zip, length, &offset, name, sizeof(name), &payload, &payload_len) < 0);
 }
 
+static void encrypted_name_metadata(void) {
+    static const char json[] =
+        "{\"schema_version\":1,\"platform\":\"PS5\",%s"
+        "\"original_image_size_bytes\":67108864,\"pfs\":{\"version\":2,"
+        "\"block_size_bytes\":32768,\"block_count\":2048,\"mode_raw\":13,"
+        "\"backup_header_count\":1,\"fs_ext\":0}}";
+    char document[1024];
+    chives_geometry_t geometry;
+    int length = snprintf(document, sizeof(document), json,
+                          "\"encrypted_name\":\"sdimg_DATA\",");
+    assert(chives_parse(document, (size_t)length, &geometry) == 0);
+    assert(strcmp(geometry.encrypted_name, "sdimg_DATA") == 0);
+
+    length = snprintf(document, sizeof(document), json, "");
+    assert(chives_parse(document, (size_t)length, &geometry) == 0);
+    assert(geometry.encrypted_name[0] == 0);
+
+    length = snprintf(document, sizeof(document), json, "\"encrypted_name\":\"\",");
+    assert(chives_parse(document, (size_t)length, &geometry) == 0);
+    assert(geometry.encrypted_name[0] == 0);
+
+    length = snprintf(document, sizeof(document), json,
+                      "\"encrypted_name\":\"../escape\",");
+    assert(chives_parse(document, (size_t)length, &geometry) < 0);
+}
+
 int main(void) {
     empty_deflate();
     empty_stored();
     overflowing_deflate();
     oversized_declaration();
-    puts("chives ZIP boundary tests passed");
+    encrypted_name_metadata();
+    puts("chives ZIP and metadata tests passed");
     return 0;
 }

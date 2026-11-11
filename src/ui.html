@@ -2206,7 +2206,10 @@ function createDecryptArchive() {
         const path = new TextDecoder().decode(originalName);
         if (path.startsWith('/') || path.includes('\\') || path.split('/').some(p => p === '..' || p === '.'))
           throw new Error('Invalid decrypted ZIP path');
-        const name = new TextEncoder().encode(folder + '/' + path);
+        const sidecar = /^(?:chives\.json|PS5PARAM|PS5PARAM_SIZE|PS5KEY|PS5IMAGE)$/i.test(path);
+        const outputPath = sidecar ? (folder === base ? path : folder + '/' + path)
+          : path.startsWith(base + '/') ? folder + path.slice(base.length) : folder + '/' + path;
+        const name = new TextEncoder().encode(outputPath);
         const local = new DataView(await blob.slice(localOffset, localOffset + 30).arrayBuffer());
         if (local.byteLength !== 30 || local.getUint32(0, true) !== 0x04034b50)
           throw new Error('Invalid decrypted ZIP entry');
@@ -2274,7 +2277,8 @@ async function decDropOne(save, batch) {
     await uploadSaveKey(binFile);
   }
   log('Uploading ' + imgFile.name + ' (' + fmtB(imgFile.size) + ')...');
-  const xhr = await upload('/api/decrypt_upload' + (isPS4 ? '?ps4=1' : ''), imgFile, (loaded, total) => {
+  const decUrl = '/api/decrypt_upload?name=' + encodeURIComponent(imgFile.name) + (isPS4 ? '&ps4=1' : '');
+  const xhr = await upload(decUrl, imgFile, (loaded, total) => {
     const pct = Math.round(loaded * 100 / total);
     showProgress(pct, loaded, total);
   });
@@ -2511,6 +2515,10 @@ async function preparePfsFiles(files, titleId, isPS4, sfoGeometry) {
     if (info.title_id && info.title_id !== titleId)
       throw new Error('chives.json title_id does not match param.sfo');
   }
+  const encryptedName = info && info.encrypted_name !== undefined ? info.encrypted_name : '';
+  if (typeof encryptedName !== 'string' || encryptedName.length > 255 ||
+      (encryptedName && (!/^[^/\\:\x00-\x1f]+$/.test(encryptedName) || encryptedName === '.' || encryptedName === '..')))
+    throw new Error('chives.json encrypted_name must be a file basename');
   const images = isPS4 ? [] : files.filter(f => name(f) === 'ps5image');
   if (images.length > 1) throw new Error('Save folder contains more than one PS5IMAGE');
   if (images.length) {
@@ -2561,8 +2569,9 @@ async function preparePfsFiles(files, titleId, isPS4, sfoGeometry) {
       !supportedLegacyGeometry(info.pfs, info.original_image_size_bytes))
     throw new Error('Explicit fs_ext=0 requires supported legacy geometry (version 2, 64 KiB blocks, mode 13, one backup header, full image size)');
   const reserved = new Set(['chives.json', 'ps5image', 'ps5key', 'ps5param', 'ps5param_size']);
+  if (info && encryptedName) info.encrypted_name = encryptedName;
   return {files: files.filter(f => isPS4 ? !sidecars.includes(f) : !reserved.has(name(f))),
-    metadata: info === null ? null : JSON.stringify(info)};
+    metadata: info === null ? null : JSON.stringify(info), encryptedName};
 }
 
 async function createPfsForFiles(totalSize, isPS4, metadata) {
@@ -2588,8 +2597,8 @@ async function encZipDropOne(save, aidv) {
   });
   const d = JSON.parse(xhr.responseText);
   if (xhr.status !== 200 || !d.ok) throw new Error(d.error || 'ZIP encryption failed');
-  const name = file.name.replace(/\.zip$/i, '') + '_enc';
-  const downloaded = await downloadSaveResult('/api/encrypt_download?name=' + encodeURIComponent(name), name);
+  const name = d.encrypted_name || file.name.replace(/\.zip$/i, '') + '_enc';
+  const downloaded = await downloadSaveResult('/api/encrypt_download?name=' + encodeURIComponent(name), name + '.zip');
   log(downloaded.warning ? 'Encrypted save downloaded with a metadata compatibility warning' : 'Encrypted save download started',
     downloaded.warning ? 'warn' : 'ok');
   const warningHtml = downloaded.warning
@@ -2636,10 +2645,10 @@ async function encDropOne(files, folderName, aidv) {
   /* Step 3: patch AID if provided, unmount, download encrypted */
   log('Encrypting and downloading...');
   $('ct').innerHTML = '<div class="drop"><div class="dlbl">' + t('status.encrypting', 'Encrypting save...') + '</div></div>';
-  const name = (folderName || 'encrypted_save') + '_enc';
+  const name = prepared.encryptedName || (folderName || 'encrypted_save') + '_enc';
   let dlUrl = '/api/download_new?name=' + encodeURIComponent(name);
   if (aidv) dlUrl += '&aid=' + encodeURIComponent(aidv);
-  const downloaded = await downloadSaveResult(dlUrl, isPS4 ? (name + '_ps4.zip') : name);
+  const downloaded = await downloadSaveResult(dlUrl, isPS4 ? (name + '_ps4.zip') : name + '.zip');
   log(downloaded.warning ? 'Encrypted save downloaded with a metadata compatibility warning' : 'Encrypted save download started',
     downloaded.warning ? 'warn' : 'ok');
   const warningHtml = downloaded.warning

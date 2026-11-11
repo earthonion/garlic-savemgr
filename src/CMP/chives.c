@@ -276,7 +276,7 @@ int chives_parse(const char *json, size_t len, chives_geometry_t *g) {
         return -1;
     unsigned seen = 0;
     for (;;) {
-        char key[64], text[32];
+        char key[64], text[256];
         uint64_t v;
         if (chives_string(&j, key, sizeof(key)) < 0)
             return -1;
@@ -287,6 +287,7 @@ int chives_parse(const char *json, size_t len, chives_geometry_t *g) {
                        : !strcmp(key, "platform")                  ? 2
                        : !strcmp(key, "original_image_size_bytes") ? 4
                        : !strcmp(key, "pfs")                       ? 8
+                       : !strcmp(key, "encrypted_name")            ? 16
                                                                    : 0;
         if (bit && seen & bit)
             return -1;
@@ -305,6 +306,11 @@ int chives_parse(const char *json, size_t len, chives_geometry_t *g) {
         } else if (bit == 8) {
             if (chives_pfs(&j, g) < 0)
                 return -1;
+        } else if (bit == 16) {
+            if (chives_string(&j, g->encrypted_name, sizeof(g->encrypted_name)) < 0 ||
+                (g->encrypted_name[0] &&
+                 (!chives_path_safe(g->encrypted_name) || strchr(g->encrypted_name, '/'))))
+                return -1;
         } else if (chives_skip(&j) < 0)
             return -1;
         chives_ws(&j);
@@ -318,7 +324,7 @@ int chives_parse(const char *json, size_t len, chives_geometry_t *g) {
             return -1;
     }
     chives_ws(&j);
-    return j.p == j.end && seen == 15 && !g->is_ps4 && chives_geometry_valid(g) ? 0 : -1;
+    return j.p == j.end && (seen & 15) == 15 && !g->is_ps4 && chives_geometry_valid(g) ? 0 : -1;
 }
 
 int chives_path_safe(const char *name) {

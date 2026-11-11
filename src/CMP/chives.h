@@ -12,6 +12,7 @@ typedef struct {
     int has_fs_ext;
     uint16_t mode_raw;
     int is_ps4;
+    char encrypted_name[256];
 } chives_geometry_t;
 
 uint16_t chives_le16(const uint8_t *p);

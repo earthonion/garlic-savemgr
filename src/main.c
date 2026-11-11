@@ -161,6 +161,7 @@
  char g_local_copy[MAX_PATH_LEN] = {0};
  static uint8_t g_sealed_key[96] = {0};
  static int g_enc_ps4 = 0;
+ static char g_encrypted_name[256] = {0};
  int g_owner_mount_active = 0;
  static int g_image_fresh = 0;
 
@@ -1544,6 +1545,27 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      return copy_dir_recursive_impl(src,dst,0);
  }
 
+ static uid_t pfs_owner_for_path(const char *relpath) {
+     const char *base = strrchr(relpath,'/');
+     base = base ? base + 1 : relpath;
+     if (!strcmp(base,"memory.dat") ||
+         (!strncmp(relpath,"sce_sys",7) && (relpath[7] == '/' || !relpath[7])))
+         return 0;
+     return 1;
+ }
+
+ static void pfs_chown_parents(const char *dest, const char *name, uid_t owner) {
+     char path[MAX_PATH_LEN];
+     if (snprintf(path,sizeof(path),"%s/%s",dest,name) >= (int)sizeof(path)) return;
+     for (char *p = path + strlen(dest) + 1; *p; p++) {
+         if (*p != '/') continue;
+         *p = 0;
+         mkdir(path,0777);
+         chown(path,owner,0);
+         *p = '/';
+     }
+ }
+
  /* ── Base64 encode/decode ───────────────────────────────────────── */
  static const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -1782,6 +1804,7 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      if (ret >= 0) {
          logprintf("[GarlicMgr] Mounted OK (handle=%d, key_ok=%d)\n", ret, key_ok);
          snprintf(g_mounted_path, sizeof(g_mounted_path), "%s", s->path);
+         snprintf(g_encrypted_name, sizeof(g_encrypted_name), "%s", s->save_name);
          g_mounted = 1;
          g_mounted_idx = idx;
          return 0;
@@ -2161,7 +2184,7 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      if (chives_le64(version) == 1) return 0;
      chives_geometry_t g;
      if (chives_read_image(image, &g) < 0) return -1;
-     char path[MAX_PATH_LEN], title[96], directory[768], format[96];
+     char path[MAX_PATH_LEN], title[96], directory[768], format[96], name[512];
      sfo_info_t sfo = {0};
      snprintf(path,sizeof(path),"%s/sce_sys/param.sfo",mount);
      int real_sfo = ps5param_cached_for_mount(mount) && !strcmp(image, ps5param_cache_image());
@@ -2174,6 +2197,7 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      chives_escape(sfo.title_id,title,sizeof(title));
      chives_escape(sfo.dir_name,directory,sizeof(directory));
      chives_escape(sfo.format,format,sizeof(format));
+     chives_escape(g_encrypted_name,name,sizeof(name));
      garlic_key_capture_t candidate;
      char crypto[GARLIC_KEY_JSON_BYTES] = {0};
      int key_available = 0;
@@ -2187,11 +2211,12 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      int n = snprintf(json,cap,
          "{\n  \"schema_version\": 1,\n  \"platform\": \"%s\",\n"
          "  \"title_id\": \"%s\",\n  \"save_directory\": \"%s\",\n"
-         "  \"save_format\": \"%s\",\n  \"original_image_size_bytes\": %llu,\n"
+         "  \"save_format\": \"%s\",\n  \"encrypted_name\": \"%s\",\n"
+         "  \"original_image_size_bytes\": %llu,\n"
          "  \"pfs\": {\n    \"version\": %llu,\n    \"block_size_bytes\": %u,\n"
          "    \"block_count\": %llu,\n    \"mode_raw\": %u,\n    \"backup_header_count\": %u, \"fs_ext\": %u\n  },\n"
          "  \"sfo\": {\"savedata_blocks\": %llu, \"system_blocks\": %llu}%s%s\n}\n",
-         g.is_ps4 ? "PS4" : "PS5",title,directory,format,
+         g.is_ps4 ? "PS4" : "PS5",title,directory,format,name,
          (unsigned long long)g.original_image_size_bytes,(unsigned long long)g.version,
          g.block_size_bytes,(unsigned long long)g.block_count,(unsigned)g.mode_raw,
          g.backup_header_count,g.fs_ext,(unsigned long long)saved_blocks,
@@ -2200,7 +2225,7 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      return n > 0 && (size_t)n < cap ? n : -1;
  }
  static int chives_write_export(const char *image,const char *mount,const char *dest) {
-     char json[2048],path[MAX_PATH_LEN];
+     char json[3072],path[MAX_PATH_LEN];
      int n = chives_export_json(image,mount,json,sizeof(json));
      if (n < 0) return -1;
      if (!n) return 0;
@@ -2809,28 +2834,72 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      return 0;
  }
 
- static void zip_send(int sock, const char *base, const char *metadata) {
-     zip_entry_t *entries = malloc((MAX_ZIP_ENTRIES + 2) * sizeof(zip_entry_t));
+ static void zip_send(int sock, const char *base, const char *metadata, const char *root) {
+     zip_entry_t *entries = malloc((MAX_ZIP_ENTRIES + 5) * sizeof(zip_entry_t));
      if (!entries) return;
      int count = 0;
      collect_files(base, "", entries, &count);
+     size_t root_len = root && root[0] ? strlen(root) : 0;
+     if (root_len) {
+         for (int i = 0; i < count; i++) {
+             char relative[MAX_PATH_LEN];
+             snprintf(relative,sizeof(relative),"%s",entries[i].name);
+             snprintf(entries[i].name,sizeof(entries[i].name),"%s/%s",root,relative);
+         }
+     }
      int real_sfo = ps5param_cached_for_mount(base);
      if (real_sfo) {
          int found = 0;
-         for (int i = 0; i < count; i++) if (ps5param_is_sfo_name(entries[i].name)) found = 1;
+         for (int i = 0; i < count; i++) {
+             const char *relative = root_len ? entries[i].name + root_len + 1 : entries[i].name;
+             if (ps5param_is_sfo_name(relative)) found = 1;
+         }
          if (!found) {
              memset(&entries[count], 0, sizeof(entries[count]));
-             snprintf(entries[count].name, sizeof(entries[count].name), "sce_sys/param.sfo");
+             snprintf(entries[count].name, sizeof(entries[count].name),
+                      root_len ? "%s/sce_sys/param.sfo" : "sce_sys/param.sfo", root);
              entries[count++].size = ps5param_cache_size();
          }
      }
      if (metadata) {
-         /* Replace a legacy on-disk sidecar with the current virtual record. */
-         for (int i = 0; i < count; i++)
-             if (chives_is_sidecar(entries[i].name)) entries[i--] = entries[--count];
+         for (int i = 0; i < count; i++) {
+             const char *relative = root_len ? entries[i].name + root_len + 1 : entries[i].name;
+             if (chives_is_sidecar(relative)) entries[i--] = entries[--count];
+         }
          memset(&entries[count],0,sizeof(entries[count]));
          snprintf(entries[count].name,sizeof(entries[count].name),"chives.json");
          entries[count++].size = (uint32_t)strlen(metadata);
+     }
+
+     uint8_t original_key[32] = {0};
+     char original_size[32] = {0};
+     char original_image[MAX_PATH_LEN] = {0};
+     if (real_sfo) {
+         const char *image = g_local_copy[0] ? g_local_copy : g_mounted_path;
+         struct stat st;
+         garlic_key_capture_t candidate;
+         uint64_t image_size = 0;
+         int key_result = stat(image,&st) == 0 ? save_key_capture_image(image,&candidate,&image_size) : -1;
+         if (!key_result || key_result == GARLIC_KEY_ERR_EMPTY) {
+             snprintf(original_image,sizeof(original_image),"%s",image);
+             snprintf(original_size,sizeof(original_size),"%lld",(long long)st.st_size);
+             for (int i = 0; i < 32; i++) {
+                 char hex[3] = {candidate.unwrapped_key_hex[i*2],candidate.unwrapped_key_hex[i*2+1],0};
+                 original_key[i] = (uint8_t)strtol(hex,NULL,16);
+             }
+             garlic_key_wipe(&candidate,sizeof(candidate));
+             memset(&entries[count],0,sizeof(entries[count]));
+             snprintf(entries[count].name,sizeof(entries[count].name),"PS5IMAGE");
+             entries[count++].size = (uint32_t)st.st_size;
+             memset(&entries[count],0,sizeof(entries[count]));
+             snprintf(entries[count].name,sizeof(entries[count].name),"PS5KEY");
+             entries[count++].size = sizeof(original_key);
+             memset(&entries[count],0,sizeof(entries[count]));
+             snprintf(entries[count].name,sizeof(entries[count].name),"PS5PARAM_SIZE");
+             entries[count++].size = (uint32_t)strlen(original_size);
+         } else {
+             logprintf("[GarlicMgr] CoW sidecar key capture failed: %d image=%s\n",key_result,image);
+         }
      }
 
      uint32_t offset = 0;
@@ -2838,11 +2907,17 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
          zip_entry_t *e = &entries[i];
          e->offset = offset;
          uint16_t nlen = strlen(e->name);
+         int virtual_metadata = metadata && chives_is_sidecar(e->name);
+         int cow_image = original_image[0] && !strcmp(e->name,"PS5IMAGE");
+         int cow_key = original_image[0] && !strcmp(e->name,"PS5KEY");
+         int cow_size = original_image[0] && !strcmp(e->name,"PS5PARAM_SIZE");
+         const char *relative = root_len && !virtual_metadata && !cow_image && !cow_key && !cow_size
+             ? e->name + root_len + 1 : e->name;
 
          char fullpath[MAX_PATH_LEN];
-         snprintf(fullpath, sizeof(fullpath), "%s/%s", base, e->name);
-         int virtual_metadata = metadata && chives_is_sidecar(e->name);
-         int virtual_sfo = real_sfo && ps5param_is_sfo_name(e->name);
+         if (cow_image) snprintf(fullpath,sizeof(fullpath),"%s",original_image);
+         else snprintf(fullpath, sizeof(fullpath), "%s/%s", base, relative);
+         int virtual_sfo = real_sfo && ps5param_is_sfo_name(relative);
          int fd = -1;
          uint8_t *fdata = NULL;
          if(virtual_metadata){
@@ -2850,6 +2925,12 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
          }else if(virtual_sfo){
              e->size=ps5param_cache_size();
              fdata=malloc(e->size);if(fdata)memcpy(fdata,ps5param_cache_data(),e->size);
+         }else if(cow_key){
+             fdata=malloc(sizeof(original_key));
+             if(fdata)memcpy(fdata,original_key,sizeof(original_key));
+         }else if(cow_size){
+             e->size=(uint32_t)strlen(original_size);
+             fdata=malloc(e->size);if(fdata)memcpy(fdata,original_size,e->size);
          }else{
              fd=open(fullpath,O_RDONLY);
              if(fd>=0&&e->size>0){fdata=malloc(e->size);if(fdata){ssize_t nread=read(fd,fdata,e->size);(void)nread;}close(fd);}
@@ -2897,6 +2978,7 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      memcpy(ecd+16, &cd_offset, 4);
      save_socket_send(sock,ecd,22);
  zip_done:
+     garlic_key_wipe(original_key,sizeof(original_key));
      free(entries);
  }
 
@@ -3960,7 +4042,10 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          }
      }
      if (ret < 0 || !entries) return -1;
-     if (found && image_found && memcmp(g,&image,sizeof(image))) return -1;
+     if (found && image_found) {
+         snprintf(image.encrypted_name,sizeof(image.encrypted_name),"%s",g->encrypted_name);
+         if (memcmp(g,&image,sizeof(image))) return -1;
+     }
      if (!found && image_found) *g=image;
      if (!found && !image_found) {
          off=0;
@@ -4034,17 +4119,47 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
      }
      return 0;
  }
+ static int chives_zip_write_original_image(const uint8_t *data,size_t len,const char *path,
+                                            uint64_t expected_size) {
+     size_t off=0,size;
+     const uint8_t *payload;
+     char name[MAX_PATH_LEN];
+     while (chives_zip_next(data,len,&off,name,sizeof(name),&payload,&size) > 0) {
+         const char *base = strrchr(name,'/');
+         base = base ? base + 1 : name;
+         if (strcmp(base,"PS5IMAGE")) continue;
+         if (size != expected_size) return -1;
+         int fd = open(path,O_CREAT|O_WRONLY|O_TRUNC,0777);
+         if (fd < 0) return -1;
+         size_t done = 0;
+         while (done < size) {
+             ssize_t written = write(fd,payload+done,size-done);
+             if (written <= 0) { close(fd); return -1; }
+             done += (size_t)written;
+         }
+         return close(fd) < 0 ? -1 : 1;
+     }
+     return 0;
+ }
  static int extract_zip(const char *dest, const uint8_t *data, size_t len) {
      static const char sfo_suffix[] = "sce_sys/param.sfo";
-     size_t off=0,size,prefix_len=0;
-     const uint8_t *payload;
-     char name[MAX_PATH_LEN],prefix[MAX_PATH_LEN];
-     int count=0,ret,sfo_entries=0;
+     size_t off=0,size,prefix_len=0,sfo_size=0;
+     const uint8_t *payload,*sfo_payload=NULL;
+     char name[MAX_PATH_LEN],prefix[MAX_PATH_LEN],sfo_name[MAX_PATH_LEN];
+     int count=0,ret,sfo_entries=0,sfo_written=0;
      while ((ret=chives_zip_next(data,len,&off,name,sizeof(name),&payload,&size)) > 0) {
          size_t name_len=strlen(name),suffix_len=sizeof(sfo_suffix)-1;
          if (name_len >= suffix_len && !strcmp(name+name_len-suffix_len,sfo_suffix) &&
              (name_len == suffix_len || name[name_len-suffix_len-1] == '/')) {
-             if (sfo_entries++) return -1;
+             if (sfo_entries &&
+                 (strcmp(name,sfo_name) || size != sfo_size || memcmp(payload,sfo_payload,size)))
+                 return -1;
+             if (!sfo_entries) {
+                 snprintf(sfo_name,sizeof(sfo_name),"%s",name);
+                 sfo_payload=payload;
+                 sfo_size=size;
+             }
+             sfo_entries++;
              prefix_len=name_len-suffix_len;
              memcpy(prefix,name,prefix_len);
              prefix[prefix_len]=0;
@@ -4062,30 +4177,50 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              !strcmp(base,"PS5PARAM_SIZE") || !strcmp(base,"PS5KEY") ||
              !strcmp(base,"PS5IMAGE")) continue;
          if (!size) continue;
+         if (ps5param_cached_for_mount(dest) && !strcmp(name,sfo_name)) continue;
+         if (sfo_entries && !strcmp(name,sfo_name) && sfo_written++) continue;
         if (prefix_len) {
              if (strncmp(name,prefix,prefix_len)) return -1;
              memmove(name,name+prefix_len,strlen(name+prefix_len)+1);
              if (!name[0]) continue;
          }
+         uid_t owner = pfs_owner_for_path(name);
          char path[MAX_PATH_LEN];
          if (snprintf(path,sizeof(path),"%s/%s",dest,name) >= (int)sizeof(path)) return -1;
+         pfs_chown_parents(dest,name,owner);
          if (name[strlen(name)-1] == '/') {
-             recursive_mkdir(path);
+             chown(path,owner,0);
              continue;
          }
-         char *slash=strrchr(path,'/');
-         if (slash) { *slash=0; recursive_mkdir(path); *slash='/'; }
-         int fd=open(path,O_CREAT|O_WRONLY|O_TRUNC,0777);
-         if (fd < 0) return -1;
+         int fd=open(path,O_CREAT|O_WRONLY,0777);
+         if (fd < 0) {
+             logprintf("[GarlicMgr] ZIP open %s failed: uid=%u errno=%d\n",name,(unsigned)owner,errno);
+             return -1;
+         }
          size_t done=0;
          while (done < size) {
              ssize_t wr=write(fd,payload+done,size-done);
-             if (wr <= 0) { close(fd); return -1; }
+             if (wr <= 0) {
+                 logprintf("[GarlicMgr] ZIP write %s failed at %zu/%zu: uid=%u errno=%d\n",
+                           name,done,size,(unsigned)owner,errno);
+                 close(fd);
+                 return -1;
+             }
              done+=(size_t)wr;
          }
-         if (close(fd) < 0) return -1;
+         if (fchown(fd,owner,0) < 0) {
+             logprintf("[GarlicMgr] ZIP fchown %s to %u failed: errno=%d\n",name,(unsigned)owner,errno);
+             close(fd);
+             return -1;
+         }
+         if (close(fd) < 0) {
+             logprintf("[GarlicMgr] ZIP close %s failed: errno=%d\n",name,errno);
+             return -1;
+         }
+         logprintf("[GarlicMgr] ZIP wrote %s (%zu bytes, uid=%u)\n",name,size,(unsigned)owner);
          count++;
      }
+     if (ret < 0) logprintf("[GarlicMgr] ZIP parser failed after %d files\n",count);
      return ret < 0 ? -1 : count;
  }
 
@@ -5905,10 +6040,10 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          return;
      }
 
-     /* GET /api/download -> tar stream */
+     /* GET /api/download -> decrypted ZIP stream */
      if (strcmp(method, "GET") == 0 && strcmp(url, "/api/download") == 0) {
          if (!g_mounted) { http_json(sock, "{\"error\":\"No save mounted\"}"); return; }
-         char metadata[2048];
+         char metadata[3072];
          const char *image = g_local_copy[0] ? g_local_copy : g_mounted_path;
          const char *export_metadata = NULL;
          /* A decrypted USB folder has no mounted image; retain its existing
@@ -5928,7 +6063,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              "Connection: close\r\n"
              "\r\n");
          send(sock, hdr, hlen, 0);
-         zip_send(sock, g_mount_point, export_metadata);
+         zip_send(sock, g_mount_point, export_metadata, g_encrypted_name);
          return;
      }
 
@@ -6381,6 +6516,24 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          body_start += 4;
          size_t body_in_buf = n - (body_start - req);
 
+         g_encrypted_name[0] = 0;
+         char *dec_name = strstr(url, "name=");
+         if (dec_name) {
+             char *r = dec_name + 5, *w = g_encrypted_name;
+             while (*r && *r != '&' && w < g_encrypted_name + sizeof(g_encrypted_name) - 1) {
+                 if (*r == '%' && r[1] && r[2]) {
+                     char hex[3] = {r[1], r[2], 0};
+                     *w++ = (char)strtol(hex, NULL, 16);
+                     r += 3;
+                 } else *w++ = *r++;
+             }
+             *w = 0;
+             if (!chives_path_safe(g_encrypted_name) || strchr(g_encrypted_name, '/')) {
+                 g_encrypted_name[0] = 0;
+                 http_json(sock,"{\"error\":\"Invalid encrypted save name\"}"); return;
+             }
+         }
+
          mkdir("/data/save_files", 0777);
          int is_ps4_dec = (strstr(url, "ps4=1") != NULL);
          const char *tmp = is_ps4_dec ? "/data/save_files/sdimg__tmp_dec" : "/data/save_files/_tmp_dec";
@@ -6590,6 +6743,8 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              free(tar_data);
              http_json(sock,"{\"error\":\"Invalid ZIP or incompatible PS5 save metadata\"}"); return;
          }
+         snprintf(g_encrypted_name,sizeof(g_encrypted_name),"%s",
+                  preserve_geometry ? original.encrypted_name : "");
 
          if (g_mounted && unmount_save() < 0) {
              free(tar_data);
@@ -6609,6 +6764,16 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              img_size = original.block_count * (uint64_t)original.block_size_bytes;
 
          int native_allocation = preserve_geometry && chives_zip_physical_sfo(tar_data,received,&original);
+         int reuse_cow = 0;
+         if (preserve_geometry && original.fs_ext) {
+             reuse_cow = chives_zip_write_original_image(tar_data,received,tmp,img_size);
+             if (reuse_cow <= 0) {
+                 free(tar_data); unlink(tmp);
+                 http_json(sock,"{\"error\":\"CoW encryption requires the original PS5IMAGE; decrypt again with the updated SaveMgr\"}");
+                 return;
+             }
+             goto cow_image_ready;
+         }
 
          /* Step 1: Create file and allocate space (same as mkpfs) */
          int imgfd = open(tmp, O_CREAT | O_TRUNC | O_RDWR, 0777);
@@ -6658,6 +6823,8 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          }
          printf("[GarlicMgr] Formatted PFS image OK\n");
 
+ cow_image_ready:
+
          /* Step 3: Recover the sealed key generated by the native PPR formatter. */
          snprintf(g_mount_point, sizeof(g_mount_point), "/data/mount_sd");
          mkdir(g_mount_point, 0777);
@@ -6690,7 +6857,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          free(tar_data);
          if (files < 0) {
              if (unmount_save() >= 0) unlink(tmp);
-             http_json(sock,"{\"error\":\"Failed to copy ZIP files into the original image capacity\"}"); return;
+             http_json(sock,"{\"error\":\"Failed to copy ZIP files into the save image\"}"); return;
          }
          sync();
          printf("[GarlicMgr] Extracted %d files for encrypt\n", files);
@@ -6747,7 +6914,30 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                  }
                  char sfo_path[MAX_PATH_LEN];
                  snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", g_mount_point);
-                 if (patch_sfo_account(sfo_path, new_aid, NULL) < 0) {
+                 int patch_result;
+                 if (preserve_geometry && original.fs_ext && ps5param_cached_for_mount(g_mount_point)) {
+                     const char *temp = "/data/save_files/_cow_sfo_patch";
+                     int fd = open(temp,O_CREAT|O_WRONLY|O_TRUNC,0755);
+                     if (fd < 0 || write(fd,ps5param_cache_data(),ps5param_cache_size()) != (ssize_t)ps5param_cache_size())
+                         patch_result = -1;
+                     else
+                         patch_result = 0;
+                     if (fd >= 0) close(fd);
+                     if (!patch_result) patch_result = patch_sfo_account(temp,new_aid,NULL);
+                     if (!patch_result) {
+                         static uint8_t updated[0x8000];
+                         fd = open(temp,O_RDONLY);
+                         ssize_t n = fd >= 0 ? read(fd,updated,sizeof(updated)) : -1;
+                         if (fd >= 0) close(fd);
+                         if (n != (ssize_t)ps5param_cache_size() ||
+                             ps5param_cache_replace(updated,(uint32_t)n) < 0)
+                             patch_result = -1;
+                     }
+                     unlink(temp);
+                 } else {
+                     patch_result = patch_sfo_account(sfo_path,new_aid,NULL);
+                 }
+                 if (patch_result < 0) {
                      http_json(sock, "{\"error\":\"Failed to write and verify Account ID in param.sfo\"}"); return;
                  }
              }
@@ -6761,7 +6951,13 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          {
              char root_sfo[MAX_PATH_LEN];
              snprintf(root_sfo, sizeof(root_sfo), "%s/sce_sys/param.sfo", g_mount_point);
-             int sn = read_sfo_file(root_sfo, enc_blob_sfo, sizeof(enc_blob_sfo) - 20);
+             int sn;
+             if (preserve_geometry && original.fs_ext && ps5param_cached_for_mount(g_mount_point)) {
+                 sn = (int)ps5param_cache_size();
+                 memcpy(enc_blob_sfo,ps5param_cache_data(),sn);
+             } else {
+                 sn = read_sfo_file(root_sfo, enc_blob_sfo, sizeof(enc_blob_sfo) - 20);
+             }
              if (sn <= 0) {
                  if (preserve_geometry && original.has_fs_ext && !original.fs_ext) {
                      logprintf("[GarlicMgr] Physical container has no param.sfo; preserving its original layout\n");
@@ -6791,10 +6987,11 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              unlink(tmp);
              http_json(sock, "{\"error\":\"Encrypted image not found\"}"); return;
          }
-         char json[1024],warning[768];
+         char json[2048],warning[768],encrypted_name[512];
          json_escape(ps5param_warning(),warning,sizeof(warning));
-         snprintf(json,sizeof(json),"{\"ok\":true,\"size\":%lld,\"warning\":\"%s\"}",
-                  (long long)est.st_size,warning);
+         chives_escape(g_encrypted_name,encrypted_name,sizeof(encrypted_name));
+         snprintf(json,sizeof(json),"{\"ok\":true,\"size\":%lld,\"warning\":\"%s\",\"encrypted_name\":\"%s\"}",
+                  (long long)est.st_size,warning,encrypted_name);
          http_json(sock, json);
          return;
      }
@@ -6806,40 +7003,37 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          if (stat(tmp, &est) < 0) {
              http_json(sock, "{\"error\":\"No encrypted file\"}"); return;
          }
-         int fd = open(tmp, O_RDONLY);
-         if (fd < 0) {
-             http_json(sock, "{\"error\":\"Cannot read file\"}"); return;
-         }
          char dlname[512] = "encrypted_save";
-         char *np = strstr(url, "name=");
-         if (np) {
-             strncpy(dlname, np + 5, sizeof(dlname) - 1);
-             dlname[sizeof(dlname) - 1] = 0;
-             /* URL-decode */
-             char *r = dlname, *w = dlname;
-             while (*r && *r != '&') {
-                 if (*r == '%' && r[1] && r[2]) {
-                     char hex[3] = {r[1], r[2], 0};
-                     *w++ = (char)strtol(hex, NULL, 16);
-                     r += 3;
-                 } else { *w++ = *r++; }
+         if (g_encrypted_name[0]) {
+             snprintf(dlname,sizeof(dlname),"%s",g_encrypted_name);
+         } else {
+             char *np = strstr(url, "name=");
+             if (np) {
+                 strncpy(dlname, np + 5, sizeof(dlname) - 1);
+                 dlname[sizeof(dlname) - 1] = 0;
+                 char *r = dlname, *w = dlname;
+                 while (*r && *r != '&') {
+                     if (*r == '%' && r[1] && r[2]) {
+                         char hex[3] = {r[1], r[2], 0};
+                         *w++ = (char)strtol(hex, NULL, 16);
+                         r += 3;
+                     } else { *w++ = *r++; }
+                 }
+                 *w = 0;
              }
-             *w = 0;
          }
+         char zip_name[600];
+         snprintf(zip_name,sizeof(zip_name),"%s.zip",dlname);
+         zip_file_t zfiles[1] = {{tmp,dlname}};
          char hdr[1024];
          int hlen = snprintf(hdr, sizeof(hdr),
              "HTTP/1.1 200 OK\r\n"
-             "Content-Type: application/octet-stream\r\n"
+             "Content-Type: application/zip\r\n"
              "Content-Disposition: attachment; filename=\"%s\"\r\n"
-             "Content-Length: %lld\r\n"
              "Access-Control-Allow-Origin: *\r\n"
-             "Connection: close\r\n\r\n", dlname, (long long)est.st_size);
+             "Connection: close\r\n\r\n", zip_name);
          send(sock, hdr, hlen, 0);
-         char *buf = iobuf;
-         ssize_t nr;
-         while ((nr = read(fd, buf, BUF_SIZE)) > 0)
-             send(sock, buf, nr, 0);
-         close(fd);
+         zip_send_files(sock,zfiles,1,iobuf);
          unlink(tmp);
          return;
      }
@@ -6954,13 +7148,14 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          body_start += 4;
          size_t body_in_buf = n - (body_start - req);
 
+         uid_t owner = pfs_owner_for_path(fname);
          char filepath[MAX_PATH_LEN];
          snprintf(filepath, sizeof(filepath), "%s/%s", g_mount_point, fname);
 
          /* Create parent dirs */
          char *slash = filepath + strlen(g_mount_point) + 1;
          while ((slash = strchr(slash, '/')) != NULL) {
-             *slash = 0; mkdir(filepath, 0777); *slash = '/'; slash++;
+             *slash = 0; mkdir(filepath, 0777); chown(filepath,owner,0); *slash = '/'; slash++;
          }
 
          int fd = open(filepath, O_CREAT | O_WRONLY | O_TRUNC, 0777);
@@ -7014,6 +7209,11 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                  native_diag.kind,native_diag.line,native_diag.fresh ? "true" : "false",log_error);
              unlink(filepath);
              http_json(sock,json); return;
+         }
+         if (chown(filepath,owner,0) < 0) {
+             free(log_before.bytes);
+             unlink(filepath);
+             http_json(sock,"{\"error\":\"Cannot assign save file ownership\"}"); return;
          }
          free(log_before.bytes);
          if (!progress.sync_warning) sync();
@@ -7101,6 +7301,8 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                  http_json(sock,"{\"error\":\"Invalid or incompatible chives.json geometry\"}"); return;
              }
          }
+         snprintf(g_encrypted_name,sizeof(g_encrypted_name),"%s",
+                  preserve_geometry ? original.encrypted_name : "");
          if (g_mounted && unmount_save() < 0) {
              http_json(sock,"{\"error\":\"Cannot finalize the previous mount; new image was not created\"}"); return;
          }
@@ -7416,6 +7618,8 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              }
              *w = 0;
          }
+         if (!g_enc_ps4 && g_encrypted_name[0])
+             snprintf(dlname,sizeof(dlname),"%s",g_encrypted_name);
 
          if (g_enc_ps4) {
              /* PS4: zip both sdimg_ image and .bin key together */
@@ -7441,30 +7645,22 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              unlink(tmp_path);
              unlink(bin_tmp);
          } else {
-             /* PS5: stream raw image */
-             int fd = open(tmp_path, O_RDONLY);
-             if (fd < 0) {
-                 unlink(tmp_path);
-                 http_json(sock, "{\"error\":\"Cannot read file\"}"); return;
-             }
+             char zip_name[600];
+             snprintf(zip_name,sizeof(zip_name),"%s.zip",dlname);
+             zip_file_t zfiles[1] = {{tmp_path,dlname}};
              char hdr[2048];
              int hlen = snprintf(hdr, sizeof(hdr),
                  "HTTP/1.1 200 OK\r\n"
-                 "Content-Type: application/octet-stream\r\n"
+                 "Content-Type: application/zip\r\n"
                  "Content-Disposition: attachment; filename=\"%s\"\r\n"
-                 "Content-Length: %lld\r\n"
                  "Access-Control-Allow-Origin: *\r\n"
                  "Access-Control-Expose-Headers: X-Garlic-Warning\r\n"
                  "%s%s%s"
-                 "Connection: close\r\n\r\n", dlname, (long long)st.st_size,
+                 "Connection: close\r\n\r\n", zip_name,
                  ps5param_warning()[0] ? "X-Garlic-Warning: " : "",
                  ps5param_warning(), ps5param_warning()[0] ? "\r\n" : "");
              send(sock, hdr, hlen, 0);
-             char *buf = iobuf;
-             ssize_t nr;
-             while ((nr = read(fd, buf, BUF_SIZE)) > 0)
-                 if(save_socket_send(sock,buf,(size_t)nr)<0)break;
-             close(fd);
+             zip_send_files(sock,zfiles,1,iobuf);
              unlink(tmp_path);
          }
          return;
@@ -9011,7 +9207,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              int ret = mount_save(idx);
              if (ret < 0) continue;
 
-             char metadata[2048];
+             char metadata[3072];
              int metadata_len=chives_export_json(g_local_copy[0] ? g_local_copy : g_mounted_path,
                                                  g_mount_point,metadata,sizeof(metadata));
              if (metadata_len < 0) {
