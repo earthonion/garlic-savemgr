@@ -96,12 +96,49 @@ static void encrypted_name_metadata(void) {
     assert(chives_parse(document, (size_t)length, &geometry) < 0);
 }
 
+static void ownership_metadata(void) {
+    static const char json[] =
+        "{\"schema_version\":1,\"platform\":\"PS5\",%s"
+        "\"original_image_size_bytes\":67108864,\"pfs\":{\"version\":2,"
+        "\"block_size_bytes\":32768,\"block_count\":2048,\"mode_raw\":13,"
+        "\"backup_header_count\":1,\"fs_ext\":0}}";
+    char document[2048];
+    chives_geometry_t geometry;
+    int length = snprintf(document, sizeof(document), json,
+        "\"ownership\":[{\"path\":\"save.dat\",\"uid\":1,\"gid\":0,\"mode\":511},"
+        "{\"path\":\"sce_sys\",\"uid\":0,\"gid\":0,\"mode\":493}],");
+    assert(chives_parse(document, (size_t)length, &geometry) == 0);
+    assert(geometry.ownership_count == 2);
+    assert(geometry.ownership[0].uid == 1 && geometry.ownership[0].gid == 0);
+    assert(geometry.ownership[0].mode == 0777);
+    assert(!strcmp(geometry.ownership[1].path, "sce_sys"));
+    assert(geometry.ownership[1].uid == 0 && geometry.ownership[1].mode == 0755);
+
+    length = snprintf(document, sizeof(document), json, "");
+    assert(chives_parse(document, (size_t)length, &geometry) == 0);
+    assert(geometry.ownership_count == 0);
+
+    length = snprintf(document, sizeof(document), json,
+        "\"ownership\":[{\"path\":\"save.dat\",\"uid\":1,\"gid\":0,\"mode\":511},"
+        "{\"path\":\"save.dat\",\"uid\":1,\"gid\":0,\"mode\":511}],");
+    assert(chives_parse(document, (size_t)length, &geometry) < 0);
+
+    length = snprintf(document, sizeof(document), json,
+        "\"ownership\":[{\"path\":\"../escape\",\"uid\":1,\"gid\":0,\"mode\":511}],");
+    assert(chives_parse(document, (size_t)length, &geometry) < 0);
+
+    length = snprintf(document, sizeof(document), json,
+        "\"ownership\":[{\"path\":\"save.dat\",\"uid\":1,\"gid\":0,\"mode\":4096}],");
+    assert(chives_parse(document, (size_t)length, &geometry) < 0);
+}
+
 int main(void) {
     empty_deflate();
     empty_stored();
     overflowing_deflate();
     oversized_declaration();
     encrypted_name_metadata();
+    ownership_metadata();
     puts("chives ZIP and metadata tests passed");
     return 0;
 }

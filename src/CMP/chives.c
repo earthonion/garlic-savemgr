@@ -266,6 +266,86 @@ static int chives_pfs(chives_json_t *j, chives_geometry_t *g) {
     }
 }
 
+static int chives_ownership(chives_json_t *j, chives_geometry_t *g) {
+    chives_ws(j);
+    if (j->p == j->end || *j->p++ != '[')
+        return -1;
+    chives_ws(j);
+    if (j->p < j->end && *j->p == ']') {
+        j->p++;
+        return 0;
+    }
+    for (;;) {
+        if (g->ownership_count >= CHIVES_MAX_OWNERSHIP)
+            return -1;
+        chives_ownership_t *entry = &g->ownership[g->ownership_count];
+        unsigned seen = 0;
+        chives_ws(j);
+        if (j->p == j->end || *j->p++ != '{')
+            return -1;
+        for (;;) {
+            char key[32];
+            if (chives_string(j, key, sizeof(key)) < 0)
+                return -1;
+            chives_ws(j);
+            if (j->p == j->end || *j->p++ != ':')
+                return -1;
+            unsigned bit = !strcmp(key, "path") ? 1
+                           : !strcmp(key, "uid") ? 2
+                           : !strcmp(key, "gid") ? 4
+                           : !strcmp(key, "mode") ? 8 : 0;
+            if (bit && seen & bit)
+                return -1;
+            seen |= bit;
+            if (bit == 1) {
+                if (chives_string(j, entry->path, sizeof(entry->path)) < 0)
+                    return -1;
+            } else if (bit) {
+                uint64_t value;
+                if (chives_uint(j, &value) < 0)
+                    return -1;
+                if (bit == 2) {
+                    if (value > UINT32_MAX) return -1;
+                    entry->uid = (uint32_t)value;
+                } else if (bit == 4) {
+                    if (value > UINT32_MAX) return -1;
+                    entry->gid = (uint32_t)value;
+                } else {
+                    if (value > 07777) return -1;
+                    entry->mode = (uint16_t)value;
+                }
+            } else if (chives_skip(j) < 0) {
+                return -1;
+            }
+            chives_ws(j);
+            if (j->p == j->end)
+                return -1;
+            if (*j->p == '}') {
+                j->p++;
+                break;
+            }
+            if (*j->p++ != ',')
+                return -1;
+        }
+        if (seen != 15 || !chives_path_safe(entry->path) ||
+            strlen(entry->path) >= sizeof(entry->path) - 1)
+            return -1;
+        for (uint32_t i = 0; i < g->ownership_count; i++)
+            if (!strcmp(g->ownership[i].path, entry->path))
+                return -1;
+        g->ownership_count++;
+        chives_ws(j);
+        if (j->p == j->end)
+            return -1;
+        if (*j->p == ']') {
+            j->p++;
+            return 0;
+        }
+        if (*j->p++ != ',')
+            return -1;
+    }
+}
+
 int chives_parse(const char *json, size_t len, chives_geometry_t *g) {
     if (!len || len > CHIVES_MAX_JSON)
         return -1;
@@ -288,6 +368,7 @@ int chives_parse(const char *json, size_t len, chives_geometry_t *g) {
                        : !strcmp(key, "original_image_size_bytes") ? 4
                        : !strcmp(key, "pfs")                       ? 8
                        : !strcmp(key, "encrypted_name")            ? 16
+                       : !strcmp(key, "ownership")                 ? 32
                                                                    : 0;
         if (bit && seen & bit)
             return -1;
@@ -310,6 +391,9 @@ int chives_parse(const char *json, size_t len, chives_geometry_t *g) {
             if (chives_string(&j, g->encrypted_name, sizeof(g->encrypted_name)) < 0 ||
                 (g->encrypted_name[0] &&
                  (!chives_path_safe(g->encrypted_name) || strchr(g->encrypted_name, '/'))))
+                return -1;
+        } else if (bit == 32) {
+            if (chives_ownership(&j, g) < 0)
                 return -1;
         } else if (chives_skip(&j) < 0)
             return -1;

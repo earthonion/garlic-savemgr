@@ -1545,23 +1545,41 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      return copy_dir_recursive_impl(src,dst,0);
  }
 
- static uid_t pfs_owner_for_path(const char *relpath) {
+ static chives_geometry_t g_pfs_geometry;
+ static int g_pfs_geometry_valid = 0;
+ typedef struct {
+     uid_t uid;
+     gid_t gid;
+     mode_t mode;
+ } pfs_metadata_t;
+ static pfs_metadata_t pfs_metadata_for_path(const char *relpath) {
+     pfs_metadata_t metadata = {.uid = 1, .gid = 0, .mode = 0777};
      const char *base = strrchr(relpath,'/');
      base = base ? base + 1 : relpath;
      if (!strcmp(base,"memory.dat") ||
          (!strncmp(relpath,"sce_sys",7) && (relpath[7] == '/' || !relpath[7])))
-         return 0;
-     return 1;
+         metadata.uid = 0;
+     if (g_pfs_geometry_valid) {
+         for (uint32_t i = 0; i < g_pfs_geometry.ownership_count; i++) {
+             if (!strcmp(relpath,g_pfs_geometry.ownership[i].path)) {
+                 metadata.uid = g_pfs_geometry.ownership[i].uid;
+                 metadata.gid = g_pfs_geometry.ownership[i].gid;
+                 metadata.mode = g_pfs_geometry.ownership[i].mode;
+                 break;
+             }
+         }
+     }
+     return metadata;
  }
 
- static void pfs_chown_parents(const char *dest, const char *name, uid_t owner) {
+ static void pfs_chown_parents(const char *dest, const char *name, pfs_metadata_t metadata) {
      char path[MAX_PATH_LEN];
      if (snprintf(path,sizeof(path),"%s/%s",dest,name) >= (int)sizeof(path)) return;
      for (char *p = path + strlen(dest) + 1; *p; p++) {
          if (*p != '/') continue;
          *p = 0;
-         mkdir(path,0777);
-         chown(path,owner,0);
+         mkdir(path,metadata.mode);
+         chown(path,metadata.uid,metadata.gid);
          *p = '/';
      }
  }
@@ -2171,6 +2189,65 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
      close(fd);
      return v;
  }
+ static int chives_collect_ownership(const char *base, const char *relative,
+                                     chives_geometry_t *g) {
+     char directory[MAX_PATH_LEN];
+     if (relative[0]) snprintf(directory,sizeof(directory),"%s/%s",base,relative);
+     else snprintf(directory,sizeof(directory),"%s",base);
+     DIR *d = opendir(directory);
+     if (!d) return -1;
+     struct dirent *ent;
+     int result = 0;
+     while ((ent = readdir(d))) {
+         if (ent->d_name[0] == '.' && (!ent->d_name[1] ||
+             (ent->d_name[1] == '.' && !ent->d_name[2]))) continue;
+         char child[MAX_PATH_LEN], full[MAX_PATH_LEN];
+         if (relative[0]) snprintf(child,sizeof(child),"%s/%s",relative,ent->d_name);
+         else snprintf(child,sizeof(child),"%s",ent->d_name);
+         if (!chives_path_safe(child) ||
+             snprintf(full,sizeof(full),"%s/%s",directory,ent->d_name) >= (int)sizeof(full)) {
+             result = -1;
+             break;
+         }
+         struct stat st;
+         if (lstat(full,&st) < 0 || g->ownership_count >= CHIVES_MAX_OWNERSHIP) {
+             result = -1;
+             break;
+         }
+         if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) continue;
+         chives_ownership_t *entry = &g->ownership[g->ownership_count++];
+         snprintf(entry->path,sizeof(entry->path),"%s",child);
+         entry->uid = st.st_uid;
+         entry->gid = st.st_gid;
+         entry->mode = st.st_mode & 07777;
+         if (S_ISDIR(st.st_mode) && chives_collect_ownership(directory,child,g) < 0) {
+             result = -1;
+             break;
+         }
+     }
+     closedir(d);
+     return result;
+ }
+ static int chives_append_ownership(char *json, size_t cap, int n, const chives_geometry_t *g) {
+     if (n < 2 || (size_t)n >= cap || !g->ownership_count) return n;
+     n -= 2;
+     int written = snprintf(json+n,cap-n,",\n  \"ownership\": [\n");
+     if (written < 0 || (size_t)written >= cap-n) return -1;
+     n += written;
+     for (uint32_t i = 0; i < g->ownership_count; i++) {
+         char escaped[MAX_PATH_LEN * 2];
+         chives_escape(g->ownership[i].path,escaped,sizeof(escaped));
+         written = snprintf(json+n,cap-n,
+             "    {\"path\":\"%s\",\"uid\":%u,\"gid\":%u,\"mode\":%u}%s\n",
+             escaped,g->ownership[i].uid,g->ownership[i].gid,g->ownership[i].mode,
+             i + 1 == g->ownership_count ? "" : ",");
+         if (written < 0 || (size_t)written >= cap-n) return -1;
+         n += written;
+     }
+     written = snprintf(json+n,cap-n,"  ]\n}\n");
+     if (written < 0 || (size_t)written >= cap-n) return -1;
+     return n + written;
+ }
  static int chives_export_json(const char *image, const char *mount,
                                 char *json, size_t cap) {
      /* PS4 round-tripping stays on the original path: its allocation layout
@@ -2208,6 +2285,7 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
          garlic_key_wipe(&candidate, sizeof(candidate)); return -1;
      }
      garlic_key_wipe(&candidate, sizeof(candidate));
+     if (chives_collect_ownership(mount,"",&g) < 0) return -1;
      int n = snprintf(json,cap,
          "{\n  \"schema_version\": 1,\n  \"platform\": \"%s\",\n"
          "  \"title_id\": \"%s\",\n  \"save_directory\": \"%s\",\n"
@@ -2222,10 +2300,10 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
          g.backup_header_count,g.fs_ext,(unsigned long long)saved_blocks,
          (unsigned long long)system_blocks, crypto[0] ? ",\n  \"crypto\": " : "", crypto);
      garlic_key_wipe(crypto, sizeof(crypto));
-     return n > 0 && (size_t)n < cap ? n : -1;
+     return chives_append_ownership(json,cap,n,&g);
  }
  static int chives_write_export(const char *image,const char *mount,const char *dest) {
-     char json[3072],path[MAX_PATH_LEN];
+     char json[CHIVES_MAX_JSON],path[MAX_PATH_LEN];
      int n = chives_export_json(image,mount,json,sizeof(json));
      if (n < 0) return -1;
      if (!n) return 0;
@@ -4044,6 +4122,8 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
      if (ret < 0 || !entries) return -1;
      if (found && image_found) {
          snprintf(image.encrypted_name,sizeof(image.encrypted_name),"%s",g->encrypted_name);
+         image.ownership_count = g->ownership_count;
+         memcpy(image.ownership,g->ownership,sizeof(image.ownership));
          if (memcmp(g,&image,sizeof(image))) return -1;
      }
      if (!found && image_found) *g=image;
@@ -4184,17 +4264,18 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              memmove(name,name+prefix_len,strlen(name+prefix_len)+1);
              if (!name[0]) continue;
          }
-         uid_t owner = pfs_owner_for_path(name);
+         pfs_metadata_t metadata = pfs_metadata_for_path(name);
          char path[MAX_PATH_LEN];
          if (snprintf(path,sizeof(path),"%s/%s",dest,name) >= (int)sizeof(path)) return -1;
-         pfs_chown_parents(dest,name,owner);
+         pfs_chown_parents(dest,name,metadata);
          if (name[strlen(name)-1] == '/') {
-             chown(path,owner,0);
+             chown(path,metadata.uid,metadata.gid);
+             chmod(path,metadata.mode);
              continue;
          }
-         int fd=open(path,O_CREAT|O_WRONLY,0777);
+         int fd=open(path,O_CREAT|O_WRONLY|O_TRUNC,0777);
          if (fd < 0) {
-             logprintf("[GarlicMgr] ZIP open %s failed: uid=%u errno=%d\n",name,(unsigned)owner,errno);
+             logprintf("[GarlicMgr] ZIP open %s failed: uid=%u errno=%d\n",name,(unsigned)metadata.uid,errno);
              return -1;
          }
          size_t done=0;
@@ -4202,14 +4283,15 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              ssize_t wr=write(fd,payload+done,size-done);
              if (wr <= 0) {
                  logprintf("[GarlicMgr] ZIP write %s failed at %zu/%zu: uid=%u errno=%d\n",
-                           name,done,size,(unsigned)owner,errno);
+                           name,done,size,(unsigned)metadata.uid,errno);
                  close(fd);
                  return -1;
              }
              done+=(size_t)wr;
          }
-         if (fchown(fd,owner,0) < 0) {
-             logprintf("[GarlicMgr] ZIP fchown %s to %u failed: errno=%d\n",name,(unsigned)owner,errno);
+         if (fchown(fd,metadata.uid,metadata.gid) < 0 || fchmod(fd,metadata.mode) < 0) {
+             logprintf("[GarlicMgr] ZIP metadata %s to %u:%u mode=%o failed: errno=%d\n",
+                       name,(unsigned)metadata.uid,(unsigned)metadata.gid,metadata.mode,errno);
              close(fd);
              return -1;
          }
@@ -4217,7 +4299,8 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              logprintf("[GarlicMgr] ZIP close %s failed: errno=%d\n",name,errno);
              return -1;
          }
-         logprintf("[GarlicMgr] ZIP wrote %s (%zu bytes, uid=%u)\n",name,size,(unsigned)owner);
+         logprintf("[GarlicMgr] ZIP wrote %s (%zu bytes, uid=%u gid=%u mode=%o)\n",
+                   name,size,(unsigned)metadata.uid,(unsigned)metadata.gid,metadata.mode);
          count++;
      }
      if (ret < 0) logprintf("[GarlicMgr] ZIP parser failed after %d files\n",count);
@@ -6043,7 +6126,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
      /* GET /api/download -> decrypted ZIP stream */
      if (strcmp(method, "GET") == 0 && strcmp(url, "/api/download") == 0) {
          if (!g_mounted) { http_json(sock, "{\"error\":\"No save mounted\"}"); return; }
-         char metadata[3072];
+         char metadata[CHIVES_MAX_JSON];
          const char *image = g_local_copy[0] ? g_local_copy : g_mounted_path;
          const char *export_metadata = NULL;
          /* A decrypted USB folder has no mounted image; retain its existing
@@ -6743,6 +6826,8 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              free(tar_data);
              http_json(sock,"{\"error\":\"Invalid ZIP or incompatible PS5 save metadata\"}"); return;
          }
+         if (preserve_geometry) g_pfs_geometry = original;
+         g_pfs_geometry_valid = preserve_geometry;
          snprintf(g_encrypted_name,sizeof(g_encrypted_name),"%s",
                   preserve_geometry ? original.encrypted_name : "");
 
@@ -7148,14 +7233,15 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          body_start += 4;
          size_t body_in_buf = n - (body_start - req);
 
-         uid_t owner = pfs_owner_for_path(fname);
+         pfs_metadata_t metadata = pfs_metadata_for_path(fname);
          char filepath[MAX_PATH_LEN];
          snprintf(filepath, sizeof(filepath), "%s/%s", g_mount_point, fname);
 
          /* Create parent dirs */
          char *slash = filepath + strlen(g_mount_point) + 1;
          while ((slash = strchr(slash, '/')) != NULL) {
-             *slash = 0; mkdir(filepath, 0777); chown(filepath,owner,0); *slash = '/'; slash++;
+             *slash = 0; mkdir(filepath, metadata.mode);
+             chown(filepath,metadata.uid,metadata.gid); *slash = '/'; slash++;
          }
 
          int fd = open(filepath, O_CREAT | O_WRONLY | O_TRUNC, 0777);
@@ -7210,10 +7296,10 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              unlink(filepath);
              http_json(sock,json); return;
          }
-         if (chown(filepath,owner,0) < 0) {
+         if (chown(filepath,metadata.uid,metadata.gid) < 0 || chmod(filepath,metadata.mode) < 0) {
              free(log_before.bytes);
              unlink(filepath);
-             http_json(sock,"{\"error\":\"Cannot assign save file ownership\"}"); return;
+             http_json(sock,"{\"error\":\"Cannot assign save file ownership or mode\"}"); return;
          }
          free(log_before.bytes);
          if (!progress.sync_warning) sync();
@@ -7301,6 +7387,8 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                  http_json(sock,"{\"error\":\"Invalid or incompatible chives.json geometry\"}"); return;
              }
          }
+         if (preserve_geometry) g_pfs_geometry = original;
+         g_pfs_geometry_valid = preserve_geometry;
          snprintf(g_encrypted_name,sizeof(g_encrypted_name),"%s",
                   preserve_geometry ? original.encrypted_name : "");
          if (g_mounted && unmount_save() < 0) {
@@ -9207,7 +9295,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              int ret = mount_save(idx);
              if (ret < 0) continue;
 
-             char metadata[3072];
+             char metadata[CHIVES_MAX_JSON];
              int metadata_len=chives_export_json(g_local_copy[0] ? g_local_copy : g_mounted_path,
                                                  g_mount_point,metadata,sizeof(metadata));
              if (metadata_len < 0) {
