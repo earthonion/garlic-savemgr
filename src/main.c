@@ -96,6 +96,14 @@
  #define BACKUP_DEFAULT_LOCAL_DIR "/data/garlic/backups"
  #define BACKUP_DEFAULT_USB_DIR "/mnt/usb0/garlic-backups"
  #define CLOUD_MAX_TITLES 64
+ /* ProsperoEden, the Switch emulator (PPSA99008), keeps its saves as plain files, one folder per
+  * profile and game, in a fixed place on the internal SSD. scan_saves() never lists them (they are
+  * not PS5 save data), so the emulator's own title backs them up, as they are. Its mirror on
+  * ProsperoStore (PPSA99016) is the same emulator under another title, saving in the same place. */
+ #define PE_TITLE_ID "PPSA99008"
+ #define PE_MIRROR_TITLE_ID "PPSA99016"
+ #define PE_SAVE_ROOT "/data/prosperoeden/user/nand/user/save/0000000000000000"
+ #define PE_SAVE_DEPTH 6
 
  /* Mutex for state-mutating operations (mount/unmount/scan) */
  pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -3511,6 +3519,98 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
      return 0;
  }
 
+ static int pe_is_dot(const char *name) {
+     return name[0] == '.' && (!name[1] || (name[1] == '.' && !name[2]));
+ }
+
+ /* title_id is ProsperoEden's, or its mirror's. */
+ static int pe_is_title(const char *title_id) {
+     return strcmp(title_id, PE_TITLE_ID) == 0 || strcmp(title_id, PE_MIRROR_TITLE_ID) == 0;
+ }
+
+ /* Grows the three arrays cloud_collect_title_files() fills, together. */
+ static int pe_grow(zip_file_t **zfiles, char ***names, char ***allocs, int *cap) {
+     int ncap = *cap * 2;
+     zip_file_t *zf = realloc(*zfiles, ncap * sizeof(zip_file_t));
+     if (!zf) return -1;
+     *zfiles = zf;
+     char **nm = realloc(*names, ncap * sizeof(char *));
+     if (!nm) return -1;
+     *names = nm;
+     char **al = realloc(*allocs, ncap * sizeof(char *));
+     if (!al) return -1;
+     *allocs = al;
+     *cap = ncap;
+     return 0;
+ }
+
+ /* Adds every file under dir (rel: its path below PE_SAVE_ROOT) to the emulator's backup, as
+  * <title_id>/<profile>/<game>/<file>. */
+ static void pe_collect_files(const char *title_id, const char *dir, const char *rel, int depth,
+                              zip_file_t **zfiles, char ***names, char ***allocs, int *nfiles,
+                              int *nallocs, int *cap) {
+     DIR *d = opendir(dir);
+     if (!d) return;
+     struct dirent *ent;
+     while ((ent = readdir(d))) {
+         if (pe_is_dot(ent->d_name)) continue;
+         char path[MAX_PATH_LEN], sub[MAX_PATH_LEN];
+         snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+         snprintf(sub, sizeof(sub), "%s%s%s", rel, rel[0] ? "/" : "", ent->d_name);
+         struct stat st;
+         if (stat(path, &st) < 0) continue;
+         if (S_ISDIR(st.st_mode)) {
+             if (depth > 0)
+                 pe_collect_files(title_id, path, sub, depth - 1, zfiles, names, allocs, nfiles,
+                                  nallocs, cap);
+             continue;
+         }
+         if (!S_ISREG(st.st_mode)) continue;
+         if (*nfiles >= *cap && pe_grow(zfiles, names, allocs, cap) < 0) break;
+         char *copy = strdup(path);
+         char *name = malloc(512);
+         if (!copy || !name) { free(copy); free(name); continue; }
+         snprintf(name, 512, "%s/%s", title_id, sub);
+         (*zfiles)[*nfiles].path = copy;
+         (*zfiles)[*nfiles].name = name;
+         /* As with the save names in cloud_collect_title_files(), name only goes in names:
+          * cloud_free_title_files() frees names[0..nfiles). The path copy is what needs a slot
+          * in allocs. */
+         (*names)[*nfiles] = name;
+         (*nfiles)++;
+         (*allocs)[(*nallocs)++] = copy;
+     }
+     closedir(d);
+ }
+
+ /* Adds a hash of each file's path, size and time under dir to sig. Added, not chained, so the
+  * order readdir() returns them in does not change it. */
+ static void pe_signature(const char *dir, const char *rel, int depth, uint64_t *sig) {
+     DIR *d = opendir(dir);
+     if (!d) return;
+     struct dirent *ent;
+     while ((ent = readdir(d))) {
+         if (pe_is_dot(ent->d_name)) continue;
+         char path[MAX_PATH_LEN], sub[MAX_PATH_LEN];
+         snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+         snprintf(sub, sizeof(sub), "%s%s%s", rel, rel[0] ? "/" : "", ent->d_name);
+         struct stat st;
+         if (stat(path, &st) < 0) continue;
+         if (S_ISDIR(st.st_mode)) {
+             if (depth > 0) pe_signature(path, sub, depth - 1, sig);
+             continue;
+         }
+         if (!S_ISREG(st.st_mode)) continue;
+         uint64_t h = 1469598103934665603ULL;
+         const unsigned char *p = (const unsigned char *)sub;
+         while (*p) { h ^= *p++; h *= 1099511628211ULL; }
+         h ^= (uint64_t)st.st_size; h *= 1099511628211ULL;
+         h ^= (uint64_t)st.st_mtime; h *= 1099511628211ULL;
+         *sig += h;
+     }
+     closedir(d);
+ }
+
  static int cloud_collect_title_files(const char *title_id, zip_file_t **out_files,
                                       char ***out_names, char ***out_allocs,
                                       int *out_nfiles, int *out_nallocs,
@@ -3521,9 +3621,11 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
      *out_nfiles = 0;
      *out_nallocs = 0;
 
-     zip_file_t *zfiles = malloc(g_save_count * 2 * sizeof(zip_file_t));
-     char **names = malloc(g_save_count * 2 * sizeof(char *));
-     char **allocs = malloc(g_save_count * sizeof(char *));
+     /* Room for each save and its .bin; the emulator's saves grow the arrays as they need. */
+     int cap = g_save_count * 2 + 16;
+     zip_file_t *zfiles = malloc(cap * sizeof(zip_file_t));
+     char **names = malloc(cap * sizeof(char *));
+     char **allocs = malloc(cap * sizeof(char *));
      if (!zfiles || !names || !allocs) {
          free(zfiles); free(names); free(allocs);
          snprintf(err, err_sz, "Out of memory");
@@ -3566,6 +3668,9 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              }
          }
      }
+     if (pe_is_title(title_id))
+         pe_collect_files(title_id, PE_SAVE_ROOT, "", PE_SAVE_DEPTH, &zfiles, &names, &allocs,
+                          &nfiles, &nallocs, &cap);
 
      if (nfiles == 0) {
          free(zfiles); free(names); free(allocs);
@@ -3723,6 +3828,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          sig ^= (uint64_t)st.st_size; sig *= 1099511628211ULL;
          sig ^= (uint64_t)st.st_mtime; sig *= 1099511628211ULL;
      }
+     if (pe_is_title(title_id)) pe_signature(PE_SAVE_ROOT, "", PE_SAVE_DEPTH, &sig);
      return sig;
  }
 
