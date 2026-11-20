@@ -45,6 +45,7 @@ You can also create the file manually:
     "queue_for_browser_drive": true
   },
   "backup_targets": {
+    "keep_last": 0,
     "local": {
       "enabled": false,
       "path": "/data/garlic/backups"
@@ -91,6 +92,15 @@ Supported destinations:
 - `google_drive` with `"mode": "direct"`: configurable, but disabled in this payload build because the PS5 SDK image exposes `libSceSsl.so` without public SSL headers for a safe HTTPS implementation.
 
 The legacy top-level `provider` field still works, but `backup_targets` can enable multiple destinations at once. Manual and auto title backups package one encrypted/restorable ZIP under `/data/garlic/tmp`, then distribute that same ZIP to every enabled PS5-side destination (`local`, `usb`, `ftp`). Google Drive browser mode remains a browser/queue destination.
+
+### Backup retention (`keep_last`)
+
+Every backup writes a new timestamped ZIP (`<target>/<TitleID>/<user|all>/<YYYYMMDD-HHMMSS>_<rest>.zip`), so old backups pile up. Set `backup_targets.keep_last` (Settings -> Backup Destinations -> "Keep last N backups per title") to limit this:
+
+- `0` (default): keep everything, same as before.
+- `N` (1-1000): after a ZIP is written successfully to the `local` or `usb` target, only the N newest ZIPs of the same series stay in that folder; older ones are deleted and each deletion is logged.
+
+A series is every file in the same folder named `<YYYYMMDD-HHMMSS>_<rest>` with the same `<rest>` as the new file (same title, same user/`all`, same save). Files with other names, `.tmp` files and folders are never touched. The ZIP that was just written is always kept, even if a file with a newer timestamp exists (for example after a clock change); it counts as one of the N. FTP and Google Drive are not pruned. If a POST to `/api/settings/cloud` leaves out `keep_last`, the stored value is kept.
 
 For Google Drive browser mode, the Drive folder ID is required. Folder names like `ps5_saves` are not accepted as IDs. Service accounts do not have storage quota in normal My Drive folders, so they can only upload to Shared Drives or Workspace delegated drives. For a personal My Drive folder, select Browser OAuth Token in Settings and paste a Drive-scoped access token. Settings -> Test Drive Access verifies the selected auth can see and upload to the folder.
 

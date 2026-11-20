@@ -325,6 +325,7 @@
      cloud_file_target_t usb;
      int ftp_enabled;
      int drive_enabled;
+     int keep_last; /* 0 = keep all; N>0 = keep N newest per series (local/USB only) */
  } cloud_targets_config_t;
 
  typedef struct {
@@ -482,6 +483,9 @@
      }
      cfg->targets.ftp_enabled = json_get_object_bool_default(targets, "ftp", "enabled", cfg->targets.ftp_enabled);
      cfg->targets.drive_enabled = json_get_object_bool_default(targets, "google_drive", "enabled", cfg->targets.drive_enabled);
+     cfg->targets.keep_last = json_get_int_default(targets, "keep_last", cfg->targets.keep_last);
+     if (cfg->targets.keep_last < 0) cfg->targets.keep_last = 0;
+     if (cfg->targets.keep_last > 1000) cfg->targets.keep_last = 1000;
  }
 
  static int json_get_watch_titles(const char *json, cloud_config_t *cfg) {
@@ -715,6 +719,7 @@
          "    \"queue_for_browser_drive\": %s\n"
          "  },\n"
          "  \"backup_targets\": {\n"
+         "    \"keep_last\": %d,\n"
          "    \"local\": { \"enabled\": %s, \"path\": \"%s\" },\n"
          "    \"usb\": { \"enabled\": %s, \"path\": \"%s\" },\n"
          "    \"ftp\": { \"enabled\": %s },\n"
@@ -750,6 +755,7 @@
          cfg->auto_backup.poll_seconds,
          cfg->auto_backup.settle_seconds,
          cfg->auto_backup.queue_for_browser_drive ? "true" : "false",
+         cfg->targets.keep_last,
          cfg->targets.local.enabled ? "true" : "false", local_path,
          cfg->targets.usb.enabled ? "true" : "false", usb_path,
          cfg->targets.ftp_enabled ? "true" : "false",
@@ -3337,6 +3343,88 @@ static int cloud_copy_staged_zip_target(const char *stage_path, const char *base
     return 0;
 }
 
+/* Retention for local/USB targets. Applies to the directory holding
+ * written_path, whose basename is "<YYYYMMDD-HHMMSS>_<rest>". Other files in
+ * that directory with the same <rest> form one series; only regular files
+ * whose name matches the timestamp pattern count. The just-written file is
+ * always kept, plus the keep_last-1 newest (by name) other members of the
+ * series; the rest are unlinked. keep_last <= 0 disables pruning. */
+#define BACKUP_STAMP_LEN 15
+
+static int backup_name_has_stamp(const char *name) {
+    for (int i = 0; i < BACKUP_STAMP_LEN; i++) {
+        if (i == 8) {
+            if (name[i] != '-') return 0;
+        } else if (name[i] < '0' || name[i] > '9') {
+            return 0;
+        }
+    }
+    return name[BACKUP_STAMP_LEN] == '_';
+}
+
+static int backup_name_cmp_desc(const void *a, const void *b) {
+    return strcmp(*(const char *const *)b, *(const char *const *)a);
+}
+
+static void cloud_prune_backup_series(const char *written_path, int keep_last) {
+    if (keep_last <= 0 || !written_path || !written_path[0]) return;
+    const char *slash = strrchr(written_path, '/');
+    if (!slash) return;
+    const char *new_name = slash + 1;
+    if (!backup_name_has_stamp(new_name)) return;
+    const char *new_rest = new_name + BACKUP_STAMP_LEN + 1;
+    size_t rest_len = strlen(new_rest);
+    if (rest_len >= 4 && strcmp(new_rest + rest_len - 4, ".tmp") == 0) return;
+
+    char dir[MAX_PATH_LEN];
+    size_t dir_len = (size_t)(slash - written_path);
+    if (dir_len == 0 || dir_len >= sizeof(dir)) return;
+    memcpy(dir, written_path, dir_len);
+    dir[dir_len] = 0;
+
+    DIR *d = opendir(dir);
+    if (!d) {
+        logprintf("[GarlicMgr] Retention: cannot open %s (errno %d: %s)\n", dir, errno, strerror(errno));
+        return;
+    }
+    char **names = NULL;
+    size_t count = 0, cap = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        const char *name = de->d_name;
+        if (strlen(name) <= BACKUP_STAMP_LEN + 1 || !backup_name_has_stamp(name)) continue;
+        if (strcmp(name + BACKUP_STAMP_LEN + 1, new_rest) != 0) continue;
+        if (strcmp(name, new_name) == 0) continue;
+        char path[MAX_PATH_LEN];
+        struct stat st;
+        if ((size_t)snprintf(path, sizeof(path), "%s/%s", dir, name) >= sizeof(path)) continue;
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        if (count == cap) {
+            size_t ncap = cap ? cap * 2 : 16;
+            char **grown = realloc(names, ncap * sizeof(*names));
+            if (!grown) break;
+            names = grown;
+            cap = ncap;
+        }
+        names[count] = strdup(name);
+        if (!names[count]) break;
+        count++;
+    }
+    closedir(d);
+
+    if (count > 1) qsort(names, count, sizeof(*names), backup_name_cmp_desc);
+    for (size_t i = (size_t)(keep_last - 1); i < count; i++) {
+        char path[MAX_PATH_LEN];
+        snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
+        if (unlink(path) == 0)
+            logprintf("[GarlicMgr] Retention: deleted old backup %s (keep_last=%d)\n", path, keep_last);
+        else
+            logprintf("[GarlicMgr] Retention: failed to delete %s (errno %d: %s)\n", path, errno, strerror(errno));
+    }
+    for (size_t i = 0; i < count; i++) free(names[i]);
+    free(names);
+}
+
 static int cloud_queue_staged_zip(const char *stage_path, const char *filename,
                                   char *err, size_t err_sz) {
     mkdir("/data", 0777);
@@ -3941,6 +4029,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                 success_count++;
                 snprintf(all_paths + strlen(all_paths), sizeof(all_paths) - strlen(all_paths),
                          "%slocal:%s", all_paths[0] ? "; " : "", target_path);
+                cloud_prune_backup_series(target_path, cfg.targets.keep_last);
             } else {
                 fail_count++;
                 snprintf(err + strlen(err), sizeof(err) - strlen(err), "%slocal: %s",
@@ -3964,6 +4053,7 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                 success_count++;
                 snprintf(all_paths + strlen(all_paths), sizeof(all_paths) - strlen(all_paths),
                          "%susb:%s", all_paths[0] ? "; " : "", target_path);
+                cloud_prune_backup_series(target_path, cfg.targets.keep_last);
             } else {
                 fail_count++;
                 snprintf(err + strlen(err), sizeof(err) - strlen(err), "%susb: %s",
@@ -4544,6 +4634,9 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          return;
      }
      cloud_merge_secrets(&cfg, oldp);
+     /* Older UIs don't send keep_last; keep the stored value instead of resetting it. */
+     if (!json_find_key(body, "keep_last"))
+         cfg.targets.keep_last = old_cfg.targets.keep_last;
      if (cloud_save_config(&cfg, err, sizeof(err)) < 0) {
          char eesc[512], json[768];
          json_escape(err, eesc, sizeof(eesc));
