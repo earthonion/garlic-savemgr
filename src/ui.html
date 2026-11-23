@@ -4445,8 +4445,7 @@ async function dlZip() {
   bsy = true; renderTB();
   try {
     log('Downloading zip...');
-    const r = await fetch('/api/download');
-    const b = await r.blob();
+    const b = await fetchSaveResult('/api/download');
     const s = si >= 0 ? S[si] : null;
     dl(b, s ? (s.title_id + '_' + s.save_name + '.zip') : 'save.zip');
     log('Downloaded ' + fmtB(b.size), 'ok');

@@ -125,6 +125,37 @@ async function openEncrypt(page) {
   await expect(page.getByRole('button', { name: 'Browse ZIP', exact: true })).toBeVisible();
 }
 
+test('decrypted ZIP download reports a JSON error and can be retried', async ({ page }) => {
+  const message = 'Cannot read original PFS geometry for export';
+  let failExport = true;
+  await openApp(page, {
+    '/api/download': route => failExport
+      ? json(route, { error: message })
+      : route.fulfill({
+        contentType: 'application/zip',
+        body: storedZip([['game.details', 'mapName=gizeh']]),
+      }),
+  });
+  await page.evaluate(() => {
+    S = [{ title_id: 'PPSA26786', save_name: 'sdimg_GAME-SLOT0' }];
+    si = 0;
+    mt = true;
+    renderTB();
+  });
+  const button = page.getByRole('button', { name: 'Download Decrypted Zip', exact: true });
+  const downloads = [];
+  page.on('download', download => downloads.push(download.suggestedFilename()));
+
+  await button.click();
+  await expect(page.locator('#log')).toContainText('Error: ' + message);
+  expect(downloads).toEqual([]);
+
+  failExport = false;
+  const downloaded = page.waitForEvent('download');
+  await button.click();
+  expect((await downloaded).suggestedFilename()).toBe('PPSA26786_sdimg_GAME-SLOT0.zip');
+});
+
 test('batch decrypt preserves HTOS folders without duplicate root sidecars', async ({ page }) => {
   await openApp(page);
   const first = storedZip([
