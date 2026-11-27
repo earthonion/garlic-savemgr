@@ -8135,10 +8135,13 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                   sfo.title_id, sfo.dir_name);
          struct stat dst_st;
          int exists = (stat(dst, &dst_st) == 0) ? 1 : 0;
-         char json[256];
+         char title_id[32], dir_name[256], main_title[512], json[1024];
+         json_escape(sfo.title_id, title_id, sizeof(title_id));
+         json_escape(sfo.dir_name, dir_name, sizeof(dir_name));
+         json_escape(sfo.main_title, main_title, sizeof(main_title));
          snprintf(json, sizeof(json),
                   "{\"exists\":%s,\"title_id\":\"%s\",\"dir_name\":\"%s\",\"main_title\":\"%s\"}",
-                  exists ? "true" : "false", sfo.title_id, sfo.dir_name, sfo.main_title);
+                  exists ? "true" : "false", title_id, dir_name, main_title);
          http_json(sock, json);
          return;
      }
@@ -8437,10 +8440,14 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                  sqlite3_close(db);
              }
 
-             char json[1024];
+             char title_id[32], dir_name[256], main_title[512], warning[2048], json[4096];
+             json_escape(sfo.title_id, title_id, sizeof(title_id));
+             json_escape(sfo.dir_name, dir_name, sizeof(dir_name));
+             json_escape(sfo.main_title, main_title, sizeof(main_title));
+             json_escape(owner_warning, warning, sizeof(warning));
              snprintf(json, sizeof(json),
                       "{\"ok\":true,\"title_id\":\"%s\",\"dir_name\":\"%s\",\"main_title\":\"%s\",\"warning\":\"%s\"}",
-                      sfo.title_id, sfo.dir_name, sfo.main_title, owner_warning);
+                      title_id, dir_name, main_title, warning);
              http_json(sock, json);
              return;
          }
@@ -8909,10 +8916,14 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              sqlite3_close(db);
          }
 
-         char json[1024];
+         char title_id[32], dir_name[256], main_title[512], warning[2048], json[4096];
+         json_escape(sfo.title_id, title_id, sizeof(title_id));
+         json_escape(sfo.dir_name, dir_name, sizeof(dir_name));
+         json_escape(sfo.main_title, main_title, sizeof(main_title));
+         json_escape(owner_warning, warning, sizeof(warning));
          snprintf(json, sizeof(json),
                   "{\"ok\":true,\"title_id\":\"%s\",\"dir_name\":\"%s\",\"main_title\":\"%s\",\"warning\":\"%s\"}",
-                  sfo.title_id, sfo.dir_name, sfo.main_title, owner_warning);
+                  title_id, dir_name, main_title, warning);
          http_json(sock, json);
          return;
      }
@@ -9205,10 +9216,11 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
              printf("[GarlicMgr] import: cannot open savedata.db: %s\n", sqlite3_errmsg(db));
              if (db) sqlite3_close(db);
              /* Save is already copied, just DB update failed */
-             char json[1024];
+             char warning[2048], json[4096];
+             json_escape(owner_warning, warning, sizeof(warning));
              snprintf(json, sizeof(json),
                       "{\"ok\":true,\"warning\":\"Save imported but DB update failed. %s\","
-                      "\"title_id\":\"%s\",\"dir_name\":\"%s\"}", owner_warning, sfo.title_id, sfo.dir_name);
+                      "\"title_id\":\"%s\",\"dir_name\":\"%s\"}", warning, sfo.title_id, sfo.dir_name);
              http_json(sock, json);
              return;
          }
@@ -9317,12 +9329,16 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
          }
          sqlite3_close(db);
 
-         char json[1024];
+         char title_id[32], dir_name[256], main_title[512], warning[2048], json[4096];
+         json_escape(sfo.title_id, title_id, sizeof(title_id));
+         json_escape(sfo.dir_name, dir_name, sizeof(dir_name));
+         json_escape(sfo.main_title, main_title, sizeof(main_title));
+         json_escape(owner_warning, warning, sizeof(warning));
          snprintf(json, sizeof(json),
                   "{\"ok\":true,\"title_id\":\"%s\",\"dir_name\":\"%s\","
                   "\"main_title\":\"%s\",\"exists\":%s,\"warning\":\"%s\"}",
-                  sfo.title_id, sfo.dir_name, sfo.main_title,
-                  exists ? "true" : "false", owner_warning);
+                  title_id, dir_name, main_title,
+                  exists ? "true" : "false", warning);
          http_json(sock, json);
          return;
      }
