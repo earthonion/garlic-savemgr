@@ -31,6 +31,7 @@
 
  #include <ps5/kernel.h>
  #include "sqlite3.h"
+ #include "json_escape.h"
  #include "CMP/ps5param.h"
  #include "CMP/pfs_rebuild.h"
  #include "CMP/lifecycle.h"
@@ -523,29 +524,6 @@
  static int is_redacted_secret(const char *s) {
      if (!s || !s[0]) return 1;
      return strcmp(s, "********") == 0 || strcmp(s, "__KEEP__") == 0;
- }
-
- static void json_escape(const char *in, char *out, size_t out_sz) {
-     size_t n = 0;
-     if (!out_sz) return;
-     for (const unsigned char *p = (const unsigned char *)in; p && *p && n + 1 < out_sz; p++) {
-         if ((*p == '"' || *p == '\\') && n + 2 < out_sz) {
-             out[n++] = '\\';
-             out[n++] = (char)*p;
-         } else if (*p == '\n' && n + 2 < out_sz) {
-             out[n++] = '\\';
-             out[n++] = 'n';
-         } else if (*p == '\r' && n + 2 < out_sz) {
-             out[n++] = '\\';
-             out[n++] = 'r';
-         } else if (*p == '\t' && n + 2 < out_sz) {
-             out[n++] = '\\';
-             out[n++] = 't';
-         } else if (*p >= 0x20) {
-             out[n++] = (char)*p;
-         }
-     }
-     out[n] = 0;
  }
 
  static int read_file_limited(const char *path, char **out, size_t max_len) {
@@ -6984,11 +6962,14 @@ static int cloud_upload_zip_file(const cloud_config_t *cfg, const char *remote_d
                 sfo.title_id, sfo.dir_name,
                 (unsigned long long)sfo.account_id, (unsigned long long)user_aid, match, exists);
 
-         char json[512];
+         char title_id[32], dir_name[256], main_title[512], json[2048];
+         json_escape(sfo.title_id, title_id, sizeof(title_id));
+         json_escape(sfo.dir_name, dir_name, sizeof(dir_name));
+         json_escape(sfo.main_title, main_title, sizeof(main_title));
          snprintf(json, sizeof(json),
                   "{\"ok\":true,\"title_id\":\"%s\",\"dir_name\":\"%s\",\"main_title\":\"%s\","
                   "\"save_aid\":\"%016llX\",\"user_aid\":\"%016llX\",\"match\":%s,\"exists\":%s}",
-                  sfo.title_id, sfo.dir_name, sfo.main_title,
+                  title_id, dir_name, main_title,
                   (unsigned long long)sfo.account_id, (unsigned long long)user_aid,
                   match ? "true" : "false", exists ? "true" : "false");
          http_json(sock, json);
