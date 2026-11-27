@@ -2234,7 +2234,7 @@ static void cloud_set_step(int progress, const char *active, const char *remote)
          entry->uid = st.st_uid;
          entry->gid = st.st_gid;
          entry->mode = st.st_mode & 07777;
-         if (S_ISDIR(st.st_mode) && chives_collect_ownership(directory,child,g) < 0) {
+         if (S_ISDIR(st.st_mode) && chives_collect_ownership(base,child,g) < 0) {
              result = -1;
              break;
          }
